@@ -17,6 +17,14 @@ class AnimaLoRASaver(
     (loaders/lora_pipeline.py) that knows how to load weights in
     diffusers' standard PeftAdapterMixin convention, so we save the
     state dict directly without any custom key-remapping pass.
+
+    For ComfyUI compatibility, the saved file uses diffusers naming
+    (``transformer.transformer_blocks.<i>.attn1.to_q.lora_up.weight``)
+    which ComfyUI's stock LoraLoader will NOT match against an Anima
+    model loaded via UNETLoader (that one uses native naming
+    ``net.blocks.<i>.self_attn.q_proj.weight``). Run
+    ``scripts/util/convert_anima_lora_diffusers_to_native.py`` on the
+    saved file to produce a ComfyUI-loadable variant.
     """
 
     def __init__(self):
