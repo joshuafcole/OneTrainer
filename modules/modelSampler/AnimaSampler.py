@@ -124,12 +124,14 @@ class AnimaSampler(BaseModelSampler):
 
             # ---- 1. text encoding (Qwen3 + AnimaTextConditioner) -----------
             self.model.text_encoder_to(self.train_device)
+            self.model.text_conditioner_to(self.train_device)
             prompt_embeds, negative_prompt_embeds = self.__encode_prompts(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 cfg_enabled=cfg_enabled,
             )
             self.model.text_encoder_to(self.temp_device)
+            self.model.text_conditioner_to(self.temp_device)
             torch_gc()
 
             # ---- 2. latent noise -------------------------------------------

@@ -73,6 +73,8 @@ class ModelTab:
             self.__setup_hi_dream_ui(base_frame)
         elif self.train_config.model_type.is_ernie():
             self.__setup_ernie_ui(base_frame)
+        elif self.train_config.model_type.is_anima():
+            self.__setup_anima_ui(base_frame)
 
     def __setup_stable_diffusion_ui(self, frame):
         row = 0
@@ -155,6 +157,31 @@ class ModelTab:
         )
 
     def __setup_z_image_ui(self, frame):
+        row = 0
+        row = self.__create_base_dtype_components(frame, row)
+        row = self.__create_base_components(
+            frame,
+            row,
+            has_transformer=True,
+            allow_override_transformer=True,
+            has_text_encoder_1=True,
+            has_vae=True,
+        )
+        row = self.__create_output_components(
+            frame,
+            row,
+            allow_safetensors=True,
+            allow_diffusers=self.train_config.training_method == TrainingMethod.FINE_TUNE,
+            allow_legacy_safetensors=self.train_config.training_method == TrainingMethod.LORA,
+        )
+
+    def __setup_anima_ui(self, frame):
+        # Same component layout as Z-Image: a single
+        # text-encoder slot (Qwen3), a VAE (AutoencoderKLQwenImage), and
+        # an overridable transformer (CosmosTransformer3DModel). The
+        # T5 tokenizer + AnimaTextConditioner live alongside but have no
+        # user-overridable file slot of their own; they come bundled in
+        # the diffusers pipeline directory.
         row = 0
         row = self.__create_base_dtype_components(frame, row)
         row = self.__create_base_components(

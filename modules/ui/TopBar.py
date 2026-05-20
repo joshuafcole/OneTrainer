@@ -138,7 +138,8 @@ class TopBar:
         elif self.train_config.model_type.is_qwen() \
              or self.train_config.model_type.is_z_image() \
              or self.train_config.model_type.is_flux_2() \
-             or self.train_config.model_type.is_ernie():
+             or self.train_config.model_type.is_ernie() \
+             or self.train_config.model_type.is_anima():
             values = [
                 ("Fine Tune", TrainingMethod.FINE_TUNE),
                 ("LoRA", TrainingMethod.LORA),

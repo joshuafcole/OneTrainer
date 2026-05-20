@@ -93,6 +93,15 @@ def _get_model_defaults(model_type) -> dict:
             "diffusion_steps": 28,
             "cfg_scale": 4.0,
         })
+    elif model_type.is_anima():
+        # 25 steps + cfg 4.0 are the AnimaAutoBlocks defaults
+        # (ClassifierFreeGuidance default guidance_scale=4.0).
+        defaults.update({
+            "width": 1024,
+            "height": 1024,
+            "diffusion_steps": 25,
+            "cfg_scale": 4.0,
+        })
     elif model_type.is_hunyuan_video():
         defaults.update({
             "width": 848,

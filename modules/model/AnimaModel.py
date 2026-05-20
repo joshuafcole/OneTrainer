@@ -108,16 +108,18 @@ class AnimaModel(BaseModel):
         self.vae.to(device=device)
 
     def text_encoder_to(self, device: torch.device):
-        # Qwen3 + AnimaTextConditioner move together: the conditioner
-        # consumes Qwen3 hidden states and feeds the transformer's
-        # cross-attention, so it lives next to the text encoder, not
-        # the transformer.
+        # Move ONLY Qwen3. The text_conditioner has its own to(); training
+        # needs the conditioner on the train device every step (cached
+        # qwen_hidden_states -> conditioner -> transformer), while Qwen3
+        # itself stays on the temp device when latent_caching is on.
         if self.text_encoder is not None:
             if self.text_encoder_offload_conductor is not None and \
                     self.text_encoder_offload_conductor.layer_offload_activated():
                 self.text_encoder_offload_conductor.to(device)
             else:
                 self.text_encoder.to(device=device)
+
+    def text_conditioner_to(self, device: torch.device):
         if self.text_conditioner is not None:
             self.text_conditioner.to(device=device)
 
@@ -134,6 +136,7 @@ class AnimaModel(BaseModel):
     def to(self, device: torch.device):
         self.vae_to(device)
         self.text_encoder_to(device)
+        self.text_conditioner_to(device)
         self.transformer_to(device)
 
     def eval(self):
@@ -248,8 +251,11 @@ class AnimaModel(BaseModel):
                     output_hidden_states=False,
                 )
                 qwen_hidden_states = qwen_out.last_hidden_state
-                # Zero out padding (matches encoders.py:135).
-                qwen_hidden_states = qwen_hidden_states * tokens_mask_qwen.to(qwen_hidden_states).unsqueeze(-1)
+
+        # Always mask -- cached qwen_hidden_states may be stored unmasked
+        # (the mgds EncodeQwenText module returns the raw layer output).
+        # Matches encoders.py:135.
+        qwen_hidden_states = qwen_hidden_states * tokens_mask_qwen.to(qwen_hidden_states).unsqueeze(-1)
 
         # ---- stage C: AnimaTextConditioner -------------------------------------
         # The conditioner is a frozen, trained adapter. Move inputs onto
