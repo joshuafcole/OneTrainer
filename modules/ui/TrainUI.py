@@ -593,6 +593,23 @@ class TrainUI(ctk.CTk):
         if not self.tabview:
             return
 
+        # A preset can change model_type and training_method, which means
+        # widgets that depend on the active Setup class (notably the
+        # layer-filter dropdowns in ModelTab + TrainingTab, which are
+        # bound to setup_cls.LAYER_PRESETS) must rebind to the new class.
+        # change_model_type does this; we have to too, otherwise a preset
+        # whose layer_filter_preset name happens to exist under the
+        # *previous* model's LAYER_PRESETS will silently overwrite the
+        # loaded layer_filter via the preset-dropdown var trace.
+        if self.model_tab:
+            self.model_tab.refresh_ui()
+
+        if self.training_tab:
+            self.training_tab.refresh_ui()
+
+        if self.lora_tab:
+            self.lora_tab.refresh_ui()
+
         if self.additional_embeddings_tab:
             self.additional_embeddings_tab.refresh_ui()
 

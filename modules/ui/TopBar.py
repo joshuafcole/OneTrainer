@@ -102,6 +102,7 @@ class TopBar:
                 ("QwenImage", ModelType.QWEN),
                 ("Z-Image", ModelType.Z_IMAGE),
                 ("Ernie Image", ModelType.ERNIE),
+                ("Anima", ModelType.ANIMA),
             ],
             ui_state=self.ui_state,
             var_name="model_type",
