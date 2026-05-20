@@ -55,9 +55,18 @@ class BaseAnimaSetup(
     # CosmosTransformerBlock: each block has attn1 (self), attn2 (cross),
     # ff (feedforward), and three adaln modulation blocks. Cosmos puts
     # everything under transformer_blocks.<i>.<part>.
+    #
+    # detail is the broadest LoRA surface short of `blocks`/`full`: it
+    # adds the adaln modulations (norm1/2/3.linear_1/2) on top of
+    # attn-mlp so style-heavy LoRAs have access to the per-block
+    # conditioning offsets. Roughly 1.4x the parameter count of
+    # attn-mlp at the same rank.
     LAYER_PRESETS = {
         "full": [],
         "blocks": ["transformer_blocks"],
+        "detail": {'patterns': ["^(?=.*attn)(?!.*norm).*",
+                                "^(?=.*ff\\.net).*",
+                                "^(?=.*norm[123]\\.linear).*"], 'regex': True},
         "attn-mlp": {'patterns': ["^(?=.*attn)(?!.*norm).*",
                                   "^(?=.*ff\\.net).*"], 'regex': True},
         "attn-only": {'patterns': ["^(?=.*attn)(?!.*norm).*"], 'regex': True},

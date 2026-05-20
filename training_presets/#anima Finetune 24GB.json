@@ -1,0 +1,50 @@
+{
+    "base_model_name": "D:/models/diffusers/anima/anima-base-v1.0",
+    "batch_size": 2,
+    "learning_rate": 1e-5,
+    "model_type": "ANIMA",
+    "training_method": "FINE_TUNE",
+    "resolution": "512",
+    "epochs": 100,
+    "backup_after": 5,
+    "output_model_destination": "models/anima_finetune",
+    "output_model_format": "DIFFUSERS",
+    "transformer": {
+        "train": true,
+        "weight_dtype": "BFLOAT_16"
+    },
+    "text_encoder": {
+        "train": false,
+        "weight_dtype": "BFLOAT_16"
+    },
+    "vae": {
+        "weight_dtype": "FLOAT_32"
+    },
+    "train_dtype": "BFLOAT_16",
+    "output_dtype": "BFLOAT_16",
+    "compile": true,
+    "dataloader_threads": 2,
+    "timestep_distribution": "LOGIT_NORMAL",
+    "timestep_shift": 3.0,
+    "dynamic_timestep_shifting": false,
+    "latent_caching": true,
+    "optimizer": {
+        "optimizer": "ADAFACTOR"
+    },
+    "optimizer_defaults": {
+        "ADAFACTOR": {
+            "optimizer": "ADAFACTOR",
+            "fused_back_pass": true,
+            "beta1": null,
+            "clip_threshold": 1.0,
+            "decay_rate": -0.8,
+            "eps": 1e-30,
+            "eps2": 0.001,
+            "relative_step": false,
+            "scale_parameter": false,
+            "stochastic_rounding": true,
+            "warmup_init": false,
+            "weight_decay": 0.0
+        }
+    }
+}
