@@ -1,0 +1,76 @@
+{
+    "base_model_name": "D:/models/diffusers/anima/anima-base-v1.0",
+    "batch_size": 2,
+    "learning_rate": 1.0,
+    "learning_rate_scheduler": "CONSTANT",
+    "learning_rate_warmup_steps": 0,
+    "model_type": "ANIMA",
+    "training_method": "LORA",
+    "resolution": "512",
+    "epochs": 100,
+    "backup_after": 10,
+    "output_model_destination": "models/anima_lora.safetensors",
+    "output_model_format": "SAFETENSORS",
+    "transformer": {
+        "train": true,
+        "weight_dtype": "FLOAT_8"
+    },
+    "text_encoder": {
+        "train": false,
+        "weight_dtype": "BFLOAT_16"
+    },
+    "vae": {
+        "weight_dtype": "FLOAT_32"
+    },
+    "train_dtype": "BFLOAT_16",
+    "weight_dtype": "BFLOAT_16",
+    "output_dtype": "BFLOAT_16",
+    "lora_rank": 16,
+    "lora_alpha": 1.0,
+    "lora_weight_dtype": "BFLOAT_16",
+    "layer_filter": "^(?=.*attn)(?!.*norm).*,^(?=.*ff\\.net).*",
+    "layer_filter_preset": "attn-mlp",
+    "layer_filter_regex": true,
+    "quantization": {
+        "layer_filter": "transformer_blocks",
+        "layer_filter_preset": "blocks"
+    },
+    "dataloader_threads": 2,
+    "timestep_distribution": "LOGIT_NORMAL",
+    "timestep_shift": 3.0,
+    "dynamic_timestep_shifting": false,
+    "compile": true,
+    "latent_caching": true,
+    "optimizer": {
+        "optimizer": "PRODIGY_PLUS_SCHEDULE_FREE"
+    },
+    "optimizer_defaults": {
+        "PRODIGY_PLUS_SCHEDULE_FREE": {
+            "optimizer": "PRODIGY_PLUS_SCHEDULE_FREE",
+            "beta1": 0.9,
+            "beta2": 0.999,
+            "beta3": null,
+            "eps": 1e-8,
+            "weight_decay": 0.0,
+            "d0": 1e-6,
+            "d_coef": 1.0,
+            "split_groups": true,
+            "split_groups_mean": true,
+            "factored": true,
+            "factored_fp32": true,
+            "use_stableadamw": true,
+            "use_cautious": true,
+            "use_adopt": false,
+            "use_schedulefree": true,
+            "use_orthograd": false,
+            "d_limiter": true,
+            "prodigy_steps": 0,
+            "use_speed": false,
+            "weight_decay_by_lr": true,
+            "use_bias_correction": false,
+            "schedulefree_c": 0.0,
+            "fused_back_pass": true,
+            "stochastic_rounding": true
+        }
+    }
+}

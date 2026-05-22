@@ -1,0 +1,62 @@
+{
+    "base_model_name": "D:/models/diffusers/anima/anima-base-v1.0",
+    "batch_size": 2,
+    "learning_rate": 1.5e-4,
+    "learning_rate_scheduler": "COSINE",
+    "learning_rate_warmup_steps": 200,
+    "learning_rate_min_factor": 0.0,
+    "model_type": "ANIMA",
+    "training_method": "LORA",
+    "resolution": "512",
+    "epochs": 100,
+    "backup_after": 10,
+    "output_model_destination": "models/anima_lora.safetensors",
+    "output_model_format": "SAFETENSORS",
+    "transformer": {
+        "train": true,
+        "weight_dtype": "FLOAT_8"
+    },
+    "text_encoder": {
+        "train": false,
+        "weight_dtype": "BFLOAT_16"
+    },
+    "vae": {
+        "weight_dtype": "FLOAT_32"
+    },
+    "train_dtype": "BFLOAT_16",
+    "weight_dtype": "BFLOAT_16",
+    "output_dtype": "BFLOAT_16",
+    "lora_rank": 16,
+    "lora_alpha": 1.0,
+    "lora_weight_dtype": "BFLOAT_16",
+    "layer_filter": "^(?=.*attn)(?!.*norm).*,^(?=.*ff\\.net).*",
+    "layer_filter_preset": "attn-mlp",
+    "layer_filter_regex": true,
+    "quantization": {
+        "layer_filter": "transformer_blocks",
+        "layer_filter_preset": "blocks"
+    },
+    "dataloader_threads": 2,
+    "timestep_distribution": "LOGIT_NORMAL",
+    "timestep_shift": 3.0,
+    "dynamic_timestep_shifting": false,
+    "compile": true,
+    "latent_caching": true,
+    "optimizer": {
+        "optimizer": "CAME"
+    },
+    "optimizer_defaults": {
+        "CAME": {
+            "optimizer": "CAME",
+            "beta1": 0.9,
+            "beta2": 0.999,
+            "beta3": 0.9999,
+            "eps": 1e-30,
+            "eps2": 1e-16,
+            "weight_decay": 1e-3,
+            "stochastic_rounding": true,
+            "use_cautious": true,
+            "fused_back_pass": true
+        }
+    }
+}
