@@ -16,6 +16,7 @@ from mgds.pipelineModules.DecodeTokens import DecodeTokens
 from mgds.pipelineModules.DecodeVAE import DecodeVAE
 from mgds.pipelineModules.EncodeQwenText import EncodeQwenText
 from mgds.pipelineModules.EncodeVAE import EncodeVAE
+from mgds.pipelineModules.MapData import MapData
 from mgds.pipelineModules.RescaleImageChannels import RescaleImageChannels
 from mgds.pipelineModules.SampleVAEDistribution import SampleVAEDistribution
 from mgds.pipelineModules.SaveImage import SaveImage
@@ -69,6 +70,16 @@ class AnimaBaseDataLoader(
             mode='mean',
         )
 
+        # Substitute any TI placeholder string with its generated tokens
+        # before tokenizing. The Qwen2 tokenizer has these registered; the
+        # T5 tokenizer falls back to its normal subword split (Qwen3-only
+        # injection). Mirrors AnimaModel.encode_text so the tokens produced
+        # here line up with what sampling produces.
+        add_embeddings_to_prompt = MapData(
+            in_name='prompt', out_name='prompt',
+            map_fn=model.add_text_encoder_embeddings_to_prompt,
+        )
+
         # Two tokenizers, one prompt: matches the upstream
         # AnimaTextEncoderStep which tokenizes the same string twice
         # (Qwen2 BPE vs. T5 SentencePiece) and feeds both into the
@@ -108,19 +119,28 @@ class AnimaBaseDataLoader(
 
         modules = [
             rescale_image, encode_image, image_sample,
+            add_embeddings_to_prompt,
             tokenize_qwen, tokenize_t5,
-            encode_qwen,
         ]
+        # When training a TI embedding, Qwen3 must run live at step time
+        # (under grad), so skip pre-computing/caching its hidden states.
+        if not config.train_text_encoder_or_embedding():
+            modules.append(encode_qwen)
         return modules
 
     def _cache_modules(self, config: TrainConfig, model: AnimaModel, model_setup: BaseAnimaSetup):
         image_split_names = ['latent_image', 'original_resolution', 'crop_offset']
         image_aggregate_names = ['crop_resolution', 'image_path']
-        text_split_names = [
-            'tokens_qwen', 'tokens_mask_qwen',
-            'tokens_t5', 'tokens_mask_t5',
-            'text_encoder_hidden_state',
-        ]
+        # When training a TI embedding, nothing text-side is cached: tokens
+        # are re-derived live each step and Qwen3 runs under grad so the
+        # trainable token vectors receive gradients.
+        text_split_names = []
+        if not config.train_text_encoder_or_embedding():
+            text_split_names = [
+                'tokens_qwen', 'tokens_mask_qwen',
+                'tokens_t5', 'tokens_mask_t5',
+                'text_encoder_hidden_state',
+            ]
         sort_names = image_aggregate_names + image_split_names + [
             'prompt',
             'tokens_qwen', 'tokens_mask_qwen',
@@ -136,7 +156,7 @@ class AnimaBaseDataLoader(
             text_split_names=text_split_names,
             sort_names=sort_names,
             config=config,
-            text_caching=True,
+            text_caching=not config.train_text_encoder_or_embedding(),
         )
 
     def _output_modules(self, config: TrainConfig, model: AnimaModel, model_setup: BaseAnimaSetup):
@@ -145,9 +165,12 @@ class AnimaBaseDataLoader(
             'prompt',
             'tokens_qwen', 'tokens_mask_qwen',
             'tokens_t5', 'tokens_mask_t5',
-            'text_encoder_hidden_state',
             'original_resolution', 'crop_resolution', 'crop_offset',
         ]
+        # text_encoder_hidden_state only exists when not training an
+        # embedding (otherwise Qwen3 runs live in predict()).
+        if not config.train_text_encoder_or_embedding():
+            output_names.append('text_encoder_hidden_state')
 
         return self._output_modules_from_out_names(
             model, model_setup,

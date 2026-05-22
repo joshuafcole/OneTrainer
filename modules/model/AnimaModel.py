@@ -1,7 +1,9 @@
+import math
 from contextlib import nullcontext
 from random import Random
 
-from modules.model.BaseModel import BaseModel
+from modules.model.BaseModel import BaseModel, BaseModelEmbedding
+from modules.module.AdditionalEmbeddingWrapper import AdditionalEmbeddingWrapper
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.util.enum.DataType import DataType
 from modules.util.enum.ModelType import ModelType
@@ -17,7 +19,6 @@ from diffusers import (
     DiffusionPipeline,
     FlowMatchEulerDiscreteScheduler,
 )
-from diffusers.modular_pipelines import ModularPipeline
 from diffusers.modular_pipelines.anima import AnimaAutoBlocks
 from transformers import Qwen2TokenizerFast, Qwen3Model, T5TokenizerFast
 
@@ -25,6 +26,26 @@ from transformers import Qwen2TokenizerFast, Qwen3Model, T5TokenizerFast
 # the value the upstream pipeline ships with is 512. Match it so cached
 # embeddings line up with what sampling will produce.
 PROMPT_MAX_LENGTH = 512
+
+
+class AnimaModelEmbedding:
+    def __init__(
+            self,
+            uuid: str,
+            text_encoder_vector: Tensor | None,
+            placeholder: str,
+            is_output_embedding: bool,
+    ):
+        # Anima injects textual-inversion tokens into the Qwen3 word
+        # embedding table only (the T5 path is tokenizer-only and its
+        # table lives inside the frozen AnimaTextConditioner, so it is
+        # left untouched -- the concept lives in the Qwen3 stream).
+        self.text_encoder_embedding = BaseModelEmbedding(
+            uuid=uuid,
+            placeholder=placeholder,
+            vector=text_encoder_vector,
+            is_output_embedding=is_output_embedding,
+        )
 
 
 class AnimaModel(BaseModel):
@@ -65,6 +86,12 @@ class AnimaModel(BaseModel):
     text_encoder_offload_conductor: LayerOffloadConductor | None
     transformer_offload_conductor: LayerOffloadConductor | None
 
+    # persistent embedding training data. TI tokens attach to the Qwen3
+    # word embedding table (model.text_encoder.get_input_embeddings()).
+    embedding: AnimaModelEmbedding | None
+    additional_embeddings: list[AnimaModelEmbedding] | None
+    embedding_wrapper: AdditionalEmbeddingWrapper | None
+
     # persistent lora training data. Only the Cosmos transformer is
     # LoRA-targeted; AnimaTextConditioner is frozen (it's a learned
     # adapter from Qwen3 hidden states to Cosmos cross-attention input
@@ -96,6 +123,10 @@ class AnimaModel(BaseModel):
         self.text_encoder_offload_conductor = None
         self.transformer_offload_conductor = None
 
+        self.embedding = None
+        self.additional_embeddings = []
+        self.embedding_wrapper = None
+
         self.transformer_lora = None
         self.lora_state_dict = None
 
@@ -103,6 +134,17 @@ class AnimaModel(BaseModel):
         return [a for a in [
             self.transformer_lora,
         ] if a is not None]
+
+    def all_embeddings(self) -> list[AnimaModelEmbedding]:
+        return self.additional_embeddings \
+               + ([self.embedding] if self.embedding is not None else [])
+
+    def all_text_encoder_embeddings(self) -> list[BaseModelEmbedding]:
+        return [embedding.text_encoder_embedding for embedding in self.additional_embeddings] \
+               + ([self.embedding.text_encoder_embedding] if self.embedding is not None else [])
+
+    def add_text_encoder_embeddings_to_prompt(self, prompt: str) -> str:
+        return self._add_embeddings_to_prompt(self.all_text_encoder_embeddings(), prompt)
 
     def vae_to(self, device: torch.device):
         self.vae.to(device=device)
@@ -216,11 +258,19 @@ class AnimaModel(BaseModel):
             # is doable but not what other OneTrainer models do.
             raise NotImplementedError("text encoder dropout is not supported for Anima yet")
 
-        # ---- stage A: tokenize -------------------------------------------------
-        if tokens_qwen is None and text is not None:
+        # Replace any textual-inversion placeholder strings with their
+        # generated tokens before tokenizing. Only the Qwen2 tokenizer has
+        # these tokens registered (Qwen3-only injection); the T5 tokenizer
+        # falls back to its normal subword split for them, which is fine --
+        # the trained concept lives in the Qwen3 stream, and the same
+        # substitution runs at sample time so train/inference stay aligned.
+        if text is not None:
             if isinstance(text, str):
                 text = [text]
+            text = [self.add_text_encoder_embeddings_to_prompt(t) for t in text]
 
+        # ---- stage A: tokenize -------------------------------------------------
+        if tokens_qwen is None and text is not None:
             qwen_inputs = self.tokenizer(
                 text,
                 max_length=PROMPT_MAX_LENGTH,
@@ -297,3 +347,24 @@ class AnimaModel(BaseModel):
         """Network-output latents -> VAE decoder input space."""
         mean, std = self._latents_mean_std(latents)
         return latents * std + mean
+
+    def calculate_timestep_shift(self, latent_height: int, latent_width: int) -> float:
+        # Cosmos Predict2's FlowMatchEulerDiscreteScheduler ships with
+        # base_image_seq_len=256, max_image_seq_len=4096, base_shift=0.5,
+        # max_shift=1.15 and time_shift_type="exponential" -- the same
+        # linear-in-mu, exp-out formula as Flux/SD3. shift values at the
+        # common training resolutions: ~1.88 (512), ~3.16 (1024), ~7.51 (1536).
+        assert self.noise_scheduler is not None and self.transformer is not None
+        cfg = self.noise_scheduler.config
+        base_seq = cfg['base_image_seq_len']
+        max_seq = cfg['max_image_seq_len']
+        base_shift = cfg['base_shift']
+        max_shift = cfg['max_shift']
+        patch_size = self.transformer.config['patch_size']
+        patch_h, patch_w = patch_size[-2], patch_size[-1]
+
+        image_seq_len = (latent_width // patch_w) * (latent_height // patch_h)
+        m = (max_shift - base_shift) / (max_seq - base_seq)
+        b = base_shift - m * base_seq
+        mu = image_seq_len * m + b
+        return math.exp(mu)

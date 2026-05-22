@@ -42,6 +42,19 @@ class AnimaLoRASaver(
             state_dict |= model.transformer_lora.state_dict()
         if model.lora_state_dict is not None:
             state_dict |= model.lora_state_dict
+
+        # Bundle TI embeddings into the LoRA file so inference tools
+        # (ComfyUI etc.) get the trigger token alongside the adapter.
+        # Anima injects only into the Qwen3 stream, hence the "qwen" key.
+        if model.additional_embeddings and model.train_config.bundle_additional_embeddings:
+            for embedding in model.additional_embeddings:
+                placeholder = embedding.text_encoder_embedding.placeholder
+
+                if embedding.text_encoder_embedding.vector is not None:
+                    state_dict[f"bundle_emb.{placeholder}.qwen"] = embedding.text_encoder_embedding.vector
+                if embedding.text_encoder_embedding.output_vector is not None:
+                    state_dict[f"bundle_emb.{placeholder}.qwen_out"] = embedding.text_encoder_embedding.output_vector
+
         return state_dict
 
     def save(

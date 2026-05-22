@@ -3,6 +3,7 @@ import traceback
 
 from modules.model.AnimaModel import AnimaModel
 from modules.model.BaseModel import BaseModel
+from modules.modelLoader.anima.AnimaEmbeddingLoader import AnimaEmbeddingLoader
 from modules.modelLoader.GenericFineTuneModelLoader import make_fine_tune_model_loader
 from modules.modelLoader.GenericLoRAModelLoader import make_lora_model_loader
 from modules.modelLoader.mixin.HFModelLoaderMixin import HFModelLoaderMixin
@@ -279,7 +280,7 @@ AnimaLoRAModelLoader = make_lora_model_loader(
     model_class=AnimaModel,
     model_loader_class=AnimaModelLoader,
     lora_loader_class=AnimaLoRALoader,
-    embedding_loader_class=None,
+    embedding_loader_class=AnimaEmbeddingLoader,
 )
 
 AnimaFineTuneModelLoader = make_fine_tune_model_loader(
