@@ -28,6 +28,10 @@ from modules.modelSetup.mixin.ModelSetupFlowMatchingMixin import ModelSetupFlowM
 from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
 from modules.module.AdditionalEmbeddingWrapper import AdditionalEmbeddingWrapper
+from modules.util.checkpointing_util import (
+    enable_checkpointing_for_cosmos_transformer,
+    enable_checkpointing_for_qwen3_encoder_layers,
+)
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dtype_util import create_autocast_context
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -78,17 +82,22 @@ class BaseAnimaSetup(
             model: AnimaModel,
             config: TrainConfig,
     ):
-        # CosmosTransformer3DModel supports gradient checkpointing via the
-        # standard PeftAdapterMixin method. No specialized offload
-        # conductor (yet) -- the layerwise-offload integration can be
-        # added by a future patch following the
-        # enable_checkpointing_for_z_image_transformer pattern.
+        # Gradient checkpointing goes through OneTrainer's conductor-based
+        # wrappers (not the diffusers built-in) so that CPU_OFFLOADED can
+        # stream the frozen Cosmos transformer's weights -- and optionally
+        # its activations -- to system RAM via the LayerOffloadConductor.
+        # Plain ON leaves the conductor inert (recompute only); offloading
+        # only activates when gradient_checkpointing.offload() is set and
+        # layer_offload_fraction > 0 (weights) / enable_activation_offloading
+        # (activations). The conductor's checkpoint wrapper also handles
+        # blocks with no trainable params, which is the LoRA/TI case where
+        # the transformer is frozen but gradient still flows through it.
         if config.gradient_checkpointing.enabled():
-            if hasattr(model.transformer, "enable_gradient_checkpointing"):
-                model.transformer.enable_gradient_checkpointing()
-            if model.text_encoder is not None and \
-                    hasattr(model.text_encoder, "gradient_checkpointing_enable"):
-                model.text_encoder.gradient_checkpointing_enable()
+            model.transformer_offload_conductor = \
+                enable_checkpointing_for_cosmos_transformer(model.transformer, config)
+            if model.text_encoder is not None:
+                model.text_encoder_offload_conductor = \
+                    enable_checkpointing_for_qwen3_encoder_layers(model.text_encoder, config)
 
         model.autocast_context, model.train_dtype = create_autocast_context(
             self.train_device,

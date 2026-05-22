@@ -387,6 +387,21 @@ def enable_checkpointing_for_z_image_transformer(
     ])
 
 
+def enable_checkpointing_for_cosmos_transformer(
+        model: nn.Module,
+        config: TrainConfig,
+) -> LayerOffloadConductor:
+    # Cosmos (Anima's backbone) is a cross-attention DiT: each
+    # CosmosTransformerBlock reads a constant encoder_hidden_states as
+    # cross-attn context and only the hidden_states stream flows
+    # block-to-block. So -- like Sana, and unlike the joint Flux/Qwen
+    # blocks that mutate encoder_hidden_states -- only "hidden_states" is
+    # offloaded as a per-layer activation.
+    return enable_checkpointing(model, config, config.compile, [
+        (model.transformer_blocks, ["hidden_states"]),
+    ])
+
+
 def enable_checkpointing_for_sana_transformer(
         model: nn.Module,
         config: TrainConfig,
