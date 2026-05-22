@@ -224,14 +224,18 @@ class TrainingTab:
         self.__create_layer_frame(column_2, 3)
 
     def __setup_anima_ui(self, column_0, column_1, column_2):
-        # Same layout as Z-Image -- single text-encoder column, no
-        # clip-skip (last hidden state from Qwen3 is what feeds the
-        # conditioner), no per-step embedding training. The scheduler
-        # has a static shift=3.0 baked in; dynamic shifting is exposed
-        # as a UI toggle for users who want to override the per-image
-        # shift via aspect-bucketing.
+        # Single text-encoder column, no clip-skip (Qwen3's last hidden
+        # state feeds the conditioner) and the encoder itself isn't
+        # trainable. Unlike Z-Image it DOES get the embedding frame:
+        # Anima supports textual-inversion embedding training (the pure
+        # EMBEDDING method, plus additional embeddings alongside LoRA),
+        # so the embedding LR / norm-preservation controls must be shown.
+        # The scheduler has a static shift=3.0 baked in; dynamic shifting
+        # is a UI toggle for overriding the per-image shift via
+        # aspect-bucketing.
         self.__create_base_frame(column_0, 0)
         self.__create_text_encoder_frame(column_0, 1, supports_clip_skip=False, supports_training=False)
+        self.__create_embedding_frame(column_0, 2)
 
         self.__create_base2_frame(column_1, 0)
         self.__create_transformer_frame(column_1, 1, supports_guidance_scale=False, supports_force_attention_mask=False)
