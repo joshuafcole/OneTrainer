@@ -1,0 +1,67 @@
+{
+    "__comment__": "Recommended starting point for PURE textual-inversion (embedding-only) training on Anima -- no LoRA adapter. The token is trained directly in the Qwen3 word-embedding table; transformer/conditioner/Qwen3/VAE stay frozen, so the whole concept must live in the placeholder. Set 'placeholder' to your trigger and bump 'token_count'/'initial_embedding_text' per the notes below.",
+    "base_model_name": "D:/models/diffusers/anima/anima-base-v1.0",
+    "batch_size": 4,
+    "learning_rate": 3.0e-4,
+    "learning_rate_scheduler": "COSINE",
+    "learning_rate_warmup_steps": 50,
+    "learning_rate_min_factor": 0.1,
+    "model_type": "ANIMA",
+    "training_method": "EMBEDDING",
+    "resolution": "512",
+    "epochs": 100,
+    "backup_after": 10,
+    "backup_after_unit": "EPOCH",
+    "output_model_destination": "models/anima_embedding.safetensors",
+    "output_model_format": "SAFETENSORS",
+    "transformer": {
+        "train": false,
+        "weight_dtype": "FLOAT_8"
+    },
+    "text_encoder": {
+        "train": false,
+        "train_embedding": true,
+        "weight_dtype": "BFLOAT_16"
+    },
+    "vae": {
+        "weight_dtype": "FLOAT_32"
+    },
+    "train_dtype": "BFLOAT_16",
+    "weight_dtype": "BFLOAT_16",
+    "output_dtype": "FLOAT_32",
+    "gradient_checkpointing": "ON",
+    "embedding_learning_rate": 3.0e-3,
+    "preserve_embedding_norm": false,
+    "embedding_weight_dtype": "FLOAT_32",
+    "embedding": {
+        "uuid": "anima-ti-embedding-main",
+        "model_name": "",
+        "placeholder": "<embedding>",
+        "train": true,
+        "stop_training_after": null,
+        "stop_training_after_unit": "NEVER",
+        "token_count": 4,
+        "initial_embedding_text": "*",
+        "is_output_embedding": false
+    },
+    "additional_embeddings": [],
+    "dataloader_threads": 2,
+    "timestep_distribution": "LOGIT_NORMAL",
+    "timestep_shift": 3.0,
+    "dynamic_timestep_shifting": true,
+    "compile": false,
+    "latent_caching": true,
+    "optimizer": {
+        "optimizer": "ADAMW"
+    },
+    "optimizer_defaults": {
+        "ADAMW": {
+            "optimizer": "ADAMW",
+            "beta1": 0.9,
+            "beta2": 0.999,
+            "eps": 1e-8,
+            "weight_decay": 0.0,
+            "stochastic_rounding": false
+        }
+    }
+}
