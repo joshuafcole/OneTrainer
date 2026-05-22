@@ -26,7 +26,12 @@ class ModelSetupEmbeddingMixin(metaclass=ABCMeta):
             self,
             tokenizer: PreTrainedTokenizer,
     ):
-        if tokenizer:
+        # Fast (Rust-backed) tokenizers such as Qwen2TokenizerFast don't expose the
+        # slow-tokenizer internals used below (_added_tokens_decoder / _added_tokens_encoder
+        # / _update_trie); their added tokens live in the backend tokenizer. They're loaded
+        # fresh each run with no learned-embedding tokens to strip, so this cleanup is a no-op
+        # for them, and add_tokens() is idempotent on re-entry.
+        if tokenizer and hasattr(tokenizer, "_added_tokens_decoder"):
             added_tokens = list(filter(lambda item: not item[1].special, tokenizer._added_tokens_decoder.items()))
             for key, added_token in added_tokens:
                 tokenizer._added_tokens_decoder.pop(key)
