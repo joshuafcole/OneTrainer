@@ -34,7 +34,6 @@ import torch
 import numpy as np
 from tqdm import tqdm
 
-
 # Matches the pipeline-side default that the AnimaAutoBlocks image_processor
 # is configured with. Tied to the AutoencoderKLQwenImage four-stage dim_mult
 # (2^3 = 8 spatial downsamples).
@@ -43,11 +42,11 @@ VAE_SCALE_FACTOR = 8
 
 class AnimaSampler(BaseModelSampler):
     def __init__(
-            self,
-            train_device: torch.device,
-            temp_device: torch.device,
-            model: AnimaModel,
-            model_type: ModelType,
+        self,
+        train_device: torch.device,
+        temp_device: torch.device,
+        model: AnimaModel,
+        model_type: ModelType,
     ):
         super().__init__(train_device, temp_device)
 
@@ -59,11 +58,11 @@ class AnimaSampler(BaseModelSampler):
 
     @torch.no_grad()
     def __encode_prompts(
-            self,
-            prompt: str,
-            negative_prompt: str,
-            cfg_enabled: bool,
-            text_encoder_sequence_length: int | None = None,
+        self,
+        prompt: str,
+        negative_prompt: str,
+        cfg_enabled: bool,
+        text_encoder_sequence_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Encode positive and (optionally) negative prompts.
 
@@ -93,18 +92,18 @@ class AnimaSampler(BaseModelSampler):
 
     @torch.no_grad()
     def __sample_base(
-            self,
-            prompt: str,
-            negative_prompt: str,
-            height: int,
-            width: int,
-            seed: int,
-            random_seed: bool,
-            diffusion_steps: int,
-            cfg_scale: float,
-            noise_scheduler: NoiseScheduler,
-            text_encoder_sequence_length: int | None = None,
-            on_update_progress: Callable[[int, int], None] = lambda _, __: None,
+        self,
+        prompt: str,
+        negative_prompt: str,
+        height: int,
+        width: int,
+        seed: int,
+        random_seed: bool,
+        diffusion_steps: int,
+        cfg_scale: float,
+        noise_scheduler: NoiseScheduler,
+        text_encoder_sequence_length: int | None = None,
+        on_update_progress: Callable[[int, int], None] = lambda _, __: None,
     ) -> ModelSamplerOutput:
         with self.model.autocast_context:
             generator = torch.Generator(device=self.train_device)
@@ -116,6 +115,7 @@ class AnimaSampler(BaseModelSampler):
             # Use a fresh scheduler instance per call so multi-sample runs
             # don't share mutable scheduler state (begin_index, sigmas).
             import copy
+
             scheduler = copy.deepcopy(self.model.noise_scheduler)
             image_processor = self.pipeline.image_processor
             transformer = self.model.transformer
@@ -148,9 +148,7 @@ class AnimaSampler(BaseModelSampler):
                 device=self.train_device,
                 dtype=torch.float32,
             )
-            padding_mask = latent_image.new_zeros(
-                (1, 1, height, width), dtype=self.model.train_dtype.torch_dtype()
-            )
+            padding_mask = latent_image.new_zeros((1, 1, height, width), dtype=self.model.train_dtype.torch_dtype())
 
             # ---- 3. timesteps via flow-matching sigmas --------------------
             # Mirrors AnimaSetTimestepsStep in before_denoise.py: linear
@@ -167,9 +165,9 @@ class AnimaSampler(BaseModelSampler):
                 # Normalized timestep per AnimaLoopBeforeDenoiser:
                 #   t / scheduler.config.num_train_timesteps
                 # broadcast to (B,) and cast to model dtype.
-                t_norm = (timestep.expand(latent_image.shape[0])
-                          / scheduler.config.num_train_timesteps
-                          ).to(self.model.train_dtype.torch_dtype())
+                t_norm = (timestep.expand(latent_image.shape[0]) / scheduler.config.num_train_timesteps).to(
+                    self.model.train_dtype.torch_dtype()
+                )
 
                 noise_pred = transformer(
                     hidden_states=latent_model_input,
@@ -190,7 +188,10 @@ class AnimaSampler(BaseModelSampler):
                     noise_pred = noise_pred_uncond + cfg_scale * (noise_pred - noise_pred_uncond)
 
                 latent_image = scheduler.step(
-                    noise_pred, timestep, latent_image, return_dict=False,
+                    noise_pred,
+                    timestep,
+                    latent_image,
+                    return_dict=False,
                 )[0]
 
                 on_update_progress(i + 1, len(timesteps))
@@ -204,7 +205,7 @@ class AnimaSampler(BaseModelSampler):
             # vae.decode returns (B, C, T=1, H, W); strip the T axis for
             # the image_processor which wants (B, C, H, W).
             image = vae.decode(latents, return_dict=False)[0][:, :, 0]
-            image = image_processor.postprocess(image, output_type='pil')
+            image = image_processor.postprocess(image, output_type="pil")
 
             self.model.vae_to(self.temp_device)
             torch_gc()
@@ -215,14 +216,14 @@ class AnimaSampler(BaseModelSampler):
             )
 
     def sample(
-            self,
-            sample_config: SampleConfig,
-            destination: str,
-            image_format: ImageFormat | None = None,
-            video_format: VideoFormat | None = None,
-            audio_format: AudioFormat | None = None,
-            on_sample: Callable[[ModelSamplerOutput], None] = lambda _: None,
-            on_update_progress: Callable[[int, int], None] = lambda _, __: None,
+        self,
+        sample_config: SampleConfig,
+        destination: str,
+        image_format: ImageFormat | None = None,
+        video_format: VideoFormat | None = None,
+        audio_format: AudioFormat | None = None,
+        on_sample: Callable[[ModelSamplerOutput], None] = lambda _: None,
+        on_update_progress: Callable[[int, int], None] = lambda _, __: None,
     ):
         sampler_output = self.__sample_base(
             prompt=sample_config.prompt,
@@ -242,8 +243,11 @@ class AnimaSampler(BaseModelSampler):
         )
 
         self.save_sampler_output(
-            sampler_output, destination,
-            image_format, video_format, audio_format,
+            sampler_output,
+            destination,
+            image_format,
+            video_format,
+            audio_format,
         )
 
         on_sample(sampler_output)
