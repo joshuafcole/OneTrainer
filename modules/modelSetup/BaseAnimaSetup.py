@@ -300,6 +300,7 @@ class BaseAnimaSetup(
                 tokens_t5=batch["tokens_t5"],
                 tokens_mask_t5=batch["tokens_mask_t5"],
                 text_encoder_dropout_probability=None,
+                text_encoder_sequence_length=config.text_encoder_sequence_length,
             )
 
             # ---- latents ---------------------------------------------------

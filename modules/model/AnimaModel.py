@@ -252,6 +252,7 @@ class AnimaModel(BaseModel):
         tokens_mask_t5: Tensor = None,
         text_encoder_dropout_probability: float | None = None,
         qwen_hidden_states: Tensor = None,
+        text_encoder_sequence_length: int | None = None,
     ) -> Tensor:
         """Produce the Cosmos transformer's encoder_hidden_states from a prompt.
 
@@ -304,11 +305,13 @@ class AnimaModel(BaseModel):
             text_qwen = [self.add_text_encoder_embeddings_to_prompt(t) for t in text]
             text_t5 = [self.add_t5_embeddings_to_prompt(t) for t in text]
 
+        max_length = text_encoder_sequence_length if text_encoder_sequence_length else PROMPT_MAX_LENGTH
+
         # ---- stage A: tokenize -------------------------------------------------
         if tokens_qwen is None and text_qwen is not None:
             qwen_inputs = self.tokenizer(
                 text_qwen,
-                max_length=PROMPT_MAX_LENGTH,
+                max_length=max_length,
                 padding="max_length",
                 truncation=True,
                 return_tensors="pt",
@@ -319,7 +322,7 @@ class AnimaModel(BaseModel):
         if tokens_t5 is None and text_t5 is not None:
             t5_inputs = self.t5_tokenizer(
                 text_t5,
-                max_length=PROMPT_MAX_LENGTH,
+                max_length=max_length,
                 padding="max_length",
                 truncation=True,
                 return_tensors="pt",
@@ -334,6 +337,7 @@ class AnimaModel(BaseModel):
                     input_ids=tokens_qwen,
                     attention_mask=tokens_mask_qwen,
                     output_hidden_states=False,
+                    use_cache=False,
                 )
                 qwen_hidden_states = qwen_out.last_hidden_state
 

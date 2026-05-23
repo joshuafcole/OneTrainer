@@ -234,7 +234,9 @@ class TrainingTab:
         # is a UI toggle for overriding the per-image shift via
         # aspect-bucketing.
         self.__create_base_frame(column_0, 0)
-        self.__create_text_encoder_frame(column_0, 1, supports_clip_skip=False, supports_training=False)
+        self.__create_text_encoder_frame(
+            column_0, 1, supports_clip_skip=False, supports_training=False, supports_sequence_length=True
+        )
         self.__create_embedding_frame(column_0, 2)
 
         self.__create_base2_frame(column_1, 0)

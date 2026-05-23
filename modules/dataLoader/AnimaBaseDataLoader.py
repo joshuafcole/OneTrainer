@@ -96,19 +96,20 @@ class AnimaBaseDataLoader(
         # twice (Qwen2 BPE vs. T5 SentencePiece) and feeds both into the
         # conditioner.  No chat template -- Anima trained on plain
         # prompts, unlike Z-Image.
+        max_token_length = config.text_encoder_sequence_length or PROMPT_MAX_LENGTH
         tokenize_qwen = Tokenize(
             in_name="prompt_qwen",
             tokens_out_name="tokens_qwen",
             mask_out_name="tokens_mask_qwen",
             tokenizer=model.tokenizer,
-            max_token_length=PROMPT_MAX_LENGTH,
+            max_token_length=max_token_length,
         )
         tokenize_t5 = Tokenize(
             in_name="prompt_t5",
             tokens_out_name="tokens_t5",
             mask_out_name="tokens_mask_t5",
             tokenizer=model.t5_tokenizer,
-            max_token_length=PROMPT_MAX_LENGTH,
+            max_token_length=max_token_length,
         )
 
         if config.dataloader_threads > 1:

@@ -63,6 +63,7 @@ class AnimaSampler(BaseModelSampler):
             prompt: str,
             negative_prompt: str,
             cfg_enabled: bool,
+            text_encoder_sequence_length: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Encode positive and (optionally) negative prompts.
 
@@ -76,6 +77,7 @@ class AnimaSampler(BaseModelSampler):
             text=prompt,
             batch_size=1,
             train_device=self.train_device,
+            text_encoder_sequence_length=text_encoder_sequence_length,
         )
 
         negative_prompt_embeds = None
@@ -84,6 +86,7 @@ class AnimaSampler(BaseModelSampler):
                 text=negative_prompt if negative_prompt is not None else "",
                 batch_size=1,
                 train_device=self.train_device,
+                text_encoder_sequence_length=text_encoder_sequence_length,
             )
 
         return prompt_embeds, negative_prompt_embeds
@@ -100,6 +103,7 @@ class AnimaSampler(BaseModelSampler):
             diffusion_steps: int,
             cfg_scale: float,
             noise_scheduler: NoiseScheduler,
+            text_encoder_sequence_length: int | None = None,
             on_update_progress: Callable[[int, int], None] = lambda _, __: None,
     ) -> ModelSamplerOutput:
         with self.model.autocast_context:
@@ -129,6 +133,7 @@ class AnimaSampler(BaseModelSampler):
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 cfg_enabled=cfg_enabled,
+                text_encoder_sequence_length=text_encoder_sequence_length,
             )
             self.model.text_encoder_to(self.temp_device)
             self.model.text_conditioner_to(self.temp_device)
@@ -232,6 +237,7 @@ class AnimaSampler(BaseModelSampler):
             diffusion_steps=sample_config.diffusion_steps,
             cfg_scale=sample_config.cfg_scale,
             noise_scheduler=sample_config.noise_scheduler,
+            text_encoder_sequence_length=sample_config.text_encoder_1_sequence_length,
             on_update_progress=on_update_progress,
         )
 
