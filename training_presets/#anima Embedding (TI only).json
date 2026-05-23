@@ -31,6 +31,7 @@
     "output_dtype": "FLOAT_32",
     "gradient_checkpointing": "ON",
     "embedding_learning_rate": 3.0e-3,
+    "t5_embedding_learning_rate": 3.0e-4,
     "preserve_embedding_norm": false,
     "embedding_weight_dtype": "FLOAT_32",
     "embedding": {

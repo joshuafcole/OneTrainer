@@ -34,8 +34,8 @@ class AnimaLoRASaver(
         return None
 
     def _get_state_dict(
-            self,
-            model: AnimaModel,
+        self,
+        model: AnimaModel,
     ) -> dict[str, Tensor]:
         state_dict = {}
         if model.transformer_lora is not None:
@@ -45,7 +45,8 @@ class AnimaLoRASaver(
 
         # Bundle TI embeddings into the LoRA file so inference tools
         # (ComfyUI etc.) get the trigger token alongside the adapter.
-        # Anima injects only into the Qwen3 stream, hence the "qwen" key.
+        # Anima injects into both the Qwen3 word-embedding table ("qwen")
+        # and the T5 input-embedding table inside AnimaTextConditioner ("t5").
         if model.additional_embeddings and model.train_config.bundle_additional_embeddings:
             for embedding in model.additional_embeddings:
                 placeholder = embedding.text_encoder_embedding.placeholder
@@ -54,14 +55,16 @@ class AnimaLoRASaver(
                     state_dict[f"bundle_emb.{placeholder}.qwen"] = embedding.text_encoder_embedding.vector
                 if embedding.text_encoder_embedding.output_vector is not None:
                     state_dict[f"bundle_emb.{placeholder}.qwen_out"] = embedding.text_encoder_embedding.output_vector
+                if embedding.t5_embedding is not None and embedding.t5_embedding.vector is not None:
+                    state_dict[f"bundle_emb.{placeholder}.t5"] = embedding.t5_embedding.vector
 
         return state_dict
 
     def save(
-            self,
-            model: AnimaModel,
-            output_model_format: ModelFormat,
-            output_model_destination: str,
-            dtype: torch.dtype | None,
+        self,
+        model: AnimaModel,
+        output_model_format: ModelFormat,
+        output_model_destination: str,
+        dtype: torch.dtype | None,
     ):
         self._save(model, output_model_format, output_model_destination, dtype)

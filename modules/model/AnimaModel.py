@@ -30,21 +30,30 @@ PROMPT_MAX_LENGTH = 512
 
 class AnimaModelEmbedding:
     def __init__(
-            self,
-            uuid: str,
-            text_encoder_vector: Tensor | None,
-            placeholder: str,
-            is_output_embedding: bool,
+        self,
+        uuid: str,
+        text_encoder_vector: Tensor | None,
+        t5_vector: Tensor | None,
+        placeholder: str,
+        is_output_embedding: bool,
     ):
-        # Anima injects textual-inversion tokens into the Qwen3 word
-        # embedding table only (the T5 path is tokenizer-only and its
-        # table lives inside the frozen AnimaTextConditioner, so it is
-        # left untouched -- the concept lives in the Qwen3 stream).
+        # Anima injects textual-inversion tokens into both the Qwen3 word
+        # embedding table (model.text_encoder.get_input_embeddings()) and
+        # the T5 input embedding table (model.text_conditioner.embed).
+        # Each encoder gets its own trainable vector with its own
+        # placeholder string -- the substitution path is per-encoder so
+        # the two tokenizers can register independent token ids.
         self.text_encoder_embedding = BaseModelEmbedding(
             uuid=uuid,
             placeholder=placeholder,
             vector=text_encoder_vector,
             is_output_embedding=is_output_embedding,
+        )
+        self.t5_embedding = BaseModelEmbedding(
+            uuid=uuid,
+            placeholder=placeholder,
+            vector=t5_vector,
+            is_output_embedding=False,
         )
 
 
@@ -64,9 +73,11 @@ class AnimaModel(BaseModel):
       latents (B,16,1,H,W) + encoder_hidden_states ---> CosmosTransformer3DModel ---> noise_pred
       latents ---> AutoencoderKLQwenImage.decode ---> image
 
-    Note that T5 is **tokenizer-only** -- the T5 input_ids are looked up
-    in an embedding table that lives inside AnimaTextConditioner. There
-    is no T5 encoder model to load.
+    Note that there is no T5 encoder model to load -- the T5 input_ids
+    are looked up in an embedding table that lives inside
+    AnimaTextConditioner (model.text_conditioner.embed). Textual
+    inversion injects trainable rows into both the Qwen3 word embedding
+    table and that T5 embedding table.
     """
 
     # base model data
@@ -86,11 +97,14 @@ class AnimaModel(BaseModel):
     text_encoder_offload_conductor: LayerOffloadConductor | None
     transformer_offload_conductor: LayerOffloadConductor | None
 
-    # persistent embedding training data. TI tokens attach to the Qwen3
-    # word embedding table (model.text_encoder.get_input_embeddings()).
+    # persistent embedding training data. TI tokens attach to both the
+    # Qwen3 word embedding table (model.text_encoder.get_input_embeddings())
+    # and the T5 input embedding table (model.text_conditioner.embed),
+    # with separate trainable vectors and a separate wrapper per encoder.
     embedding: AnimaModelEmbedding | None
     additional_embeddings: list[AnimaModelEmbedding] | None
     embedding_wrapper: AdditionalEmbeddingWrapper | None
+    t5_embedding_wrapper: AdditionalEmbeddingWrapper | None
 
     # persistent lora training data. Only the Cosmos transformer is
     # LoRA-targeted; AnimaTextConditioner is frozen (it's a learned
@@ -101,8 +115,8 @@ class AnimaModel(BaseModel):
     lora_state_dict: dict | None
 
     def __init__(
-            self,
-            model_type: ModelType,
+        self,
+        model_type: ModelType,
     ):
         super().__init__(
             model_type=model_type,
@@ -126,25 +140,38 @@ class AnimaModel(BaseModel):
         self.embedding = None
         self.additional_embeddings = []
         self.embedding_wrapper = None
+        self.t5_embedding_wrapper = None
 
         self.transformer_lora = None
         self.lora_state_dict = None
 
     def adapters(self) -> list[LoRAModuleWrapper]:
-        return [a for a in [
-            self.transformer_lora,
-        ] if a is not None]
+        return [
+            a
+            for a in [
+                self.transformer_lora,
+            ]
+            if a is not None
+        ]
 
     def all_embeddings(self) -> list[AnimaModelEmbedding]:
-        return self.additional_embeddings \
-               + ([self.embedding] if self.embedding is not None else [])
+        return self.additional_embeddings + ([self.embedding] if self.embedding is not None else [])
 
     def all_text_encoder_embeddings(self) -> list[BaseModelEmbedding]:
-        return [embedding.text_encoder_embedding for embedding in self.additional_embeddings] \
-               + ([self.embedding.text_encoder_embedding] if self.embedding is not None else [])
+        return [embedding.text_encoder_embedding for embedding in self.additional_embeddings] + (
+            [self.embedding.text_encoder_embedding] if self.embedding is not None else []
+        )
+
+    def all_t5_embeddings(self) -> list[BaseModelEmbedding]:
+        return [embedding.t5_embedding for embedding in self.additional_embeddings] + (
+            [self.embedding.t5_embedding] if self.embedding is not None else []
+        )
 
     def add_text_encoder_embeddings_to_prompt(self, prompt: str) -> str:
         return self._add_embeddings_to_prompt(self.all_text_encoder_embeddings(), prompt)
+
+    def add_t5_embeddings_to_prompt(self, prompt: str) -> str:
+        return self._add_embeddings_to_prompt(self.all_t5_embeddings(), prompt)
 
     def vae_to(self, device: torch.device):
         self.vae.to(device=device)
@@ -155,8 +182,10 @@ class AnimaModel(BaseModel):
         # qwen_hidden_states -> conditioner -> transformer), while Qwen3
         # itself stays on the temp device when latent_caching is on.
         if self.text_encoder is not None:
-            if self.text_encoder_offload_conductor is not None and \
-                    self.text_encoder_offload_conductor.layer_offload_activated():
+            if (
+                self.text_encoder_offload_conductor is not None
+                and self.text_encoder_offload_conductor.layer_offload_activated()
+            ):
                 self.text_encoder_offload_conductor.to(device)
             else:
                 self.text_encoder.to(device=device)
@@ -166,8 +195,10 @@ class AnimaModel(BaseModel):
             self.text_conditioner.to(device=device)
 
     def transformer_to(self, device: torch.device):
-        if self.transformer_offload_conductor is not None and \
-                self.transformer_offload_conductor.layer_offload_activated():
+        if (
+            self.transformer_offload_conductor is not None
+            and self.transformer_offload_conductor.layer_offload_activated()
+        ):
             self.transformer_offload_conductor.to(device)
         else:
             self.transformer.to(device=device)
@@ -210,17 +241,17 @@ class AnimaModel(BaseModel):
         return pipe
 
     def encode_text(
-            self,
-            train_device: torch.device,
-            batch_size: int = 1,
-            rand: Random | None = None,
-            text: str | list[str] = None,
-            tokens_qwen: Tensor = None,
-            tokens_mask_qwen: Tensor = None,
-            tokens_t5: Tensor = None,
-            tokens_mask_t5: Tensor = None,
-            text_encoder_dropout_probability: float | None = None,
-            qwen_hidden_states: Tensor = None,
+        self,
+        train_device: torch.device,
+        batch_size: int = 1,
+        rand: Random | None = None,
+        text: str | list[str] = None,
+        tokens_qwen: Tensor = None,
+        tokens_mask_qwen: Tensor = None,
+        tokens_t5: Tensor = None,
+        tokens_mask_t5: Tensor = None,
+        text_encoder_dropout_probability: float | None = None,
+        qwen_hidden_states: Tensor = None,
     ) -> Tensor:
         """Produce the Cosmos transformer's encoder_hidden_states from a prompt.
 
@@ -258,34 +289,38 @@ class AnimaModel(BaseModel):
             # is doable but not what other OneTrainer models do.
             raise NotImplementedError("text encoder dropout is not supported for Anima yet")
 
-        # Replace any textual-inversion placeholder strings with their
-        # generated tokens before tokenizing. Only the Qwen2 tokenizer has
-        # these tokens registered (Qwen3-only injection); the T5 tokenizer
-        # falls back to its normal subword split for them, which is fine --
-        # the trained concept lives in the Qwen3 stream, and the same
-        # substitution runs at sample time so train/inference stay aligned.
+        # Replace textual-inversion placeholder strings with their per-
+        # encoder generated tokens before tokenizing. Each encoder gets
+        # its own substitution (mirrors Flux's two-encoder TI): the Qwen3
+        # placeholder strings only have ids in model.tokenizer, the T5
+        # placeholder strings only have ids in model.t5_tokenizer. The
+        # same substitution runs at sample time so train/inference stay
+        # aligned.
+        text_qwen = None
+        text_t5 = None
         if text is not None:
             if isinstance(text, str):
                 text = [text]
-            text = [self.add_text_encoder_embeddings_to_prompt(t) for t in text]
+            text_qwen = [self.add_text_encoder_embeddings_to_prompt(t) for t in text]
+            text_t5 = [self.add_t5_embeddings_to_prompt(t) for t in text]
 
         # ---- stage A: tokenize -------------------------------------------------
-        if tokens_qwen is None and text is not None:
+        if tokens_qwen is None and text_qwen is not None:
             qwen_inputs = self.tokenizer(
-                text,
+                text_qwen,
                 max_length=PROMPT_MAX_LENGTH,
-                padding='max_length',
+                padding="max_length",
                 truncation=True,
                 return_tensors="pt",
             )
             tokens_qwen = qwen_inputs.input_ids.to(self.text_encoder.device)
             tokens_mask_qwen = qwen_inputs.attention_mask.to(self.text_encoder.device)
 
-        if tokens_t5 is None and text is not None:
+        if tokens_t5 is None and text_t5 is not None:
             t5_inputs = self.t5_tokenizer(
-                text,
+                text_t5,
                 max_length=PROMPT_MAX_LENGTH,
-                padding='max_length',
+                padding="max_length",
                 truncation=True,
                 return_tensors="pt",
             )
@@ -334,8 +369,12 @@ class AnimaModel(BaseModel):
     def _latents_mean_std(self, latents: Tensor) -> tuple[Tensor, Tensor]:
         # (1, z_dim, 1, 1, 1) so we broadcast against (B, z_dim, T, H, W).
         z_dim = self.vae.config.z_dim
-        mean = torch.tensor(self.vae.config.latents_mean, device=latents.device, dtype=latents.dtype).view(1, z_dim, 1, 1, 1)
-        std = torch.tensor(self.vae.config.latents_std, device=latents.device, dtype=latents.dtype).view(1, z_dim, 1, 1, 1)
+        mean = torch.tensor(self.vae.config.latents_mean, device=latents.device, dtype=latents.dtype).view(
+            1, z_dim, 1, 1, 1
+        )
+        std = torch.tensor(self.vae.config.latents_std, device=latents.device, dtype=latents.dtype).view(
+            1, z_dim, 1, 1, 1
+        )
         return mean, std
 
     def scale_latents(self, latents: Tensor) -> Tensor:
@@ -356,11 +395,11 @@ class AnimaModel(BaseModel):
         # common training resolutions: ~1.88 (512), ~3.16 (1024), ~7.51 (1536).
         assert self.noise_scheduler is not None and self.transformer is not None
         cfg = self.noise_scheduler.config
-        base_seq = cfg['base_image_seq_len']
-        max_seq = cfg['max_image_seq_len']
-        base_shift = cfg['base_shift']
-        max_shift = cfg['max_shift']
-        patch_size = self.transformer.config['patch_size']
+        base_seq = cfg["base_image_seq_len"]
+        max_seq = cfg["max_image_seq_len"]
+        base_shift = cfg["base_shift"]
+        max_shift = cfg["max_shift"]
+        patch_size = self.transformer.config["patch_size"]
         patch_h, patch_w = patch_size[-2], patch_size[-1]
 
         image_seq_len = (latent_width // patch_w) * (latent_height // patch_h)

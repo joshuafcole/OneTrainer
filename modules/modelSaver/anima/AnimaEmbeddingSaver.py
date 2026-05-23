@@ -10,25 +10,24 @@ import torch
 from torch import Tensor
 
 
-class AnimaEmbeddingSaver(
-    EmbeddingSaverMixin
-):
+class AnimaEmbeddingSaver(EmbeddingSaverMixin):
     """Save Anima TI embeddings as standalone files.
 
     Used for OneTrainer's INTERNAL backups (so a run can resume with the
     trained token intact) and for the non-bundled save path. The Qwen3
-    word-embedding vector is stored under the "qwen" key; published LoRA
-    files instead bundle it via AnimaLoRASaver (bundle_emb.<ph>.qwen).
+    word-embedding vector is stored under "qwen" and the T5 input
+    embedding vector under "t5"; published LoRA files instead bundle
+    them via AnimaLoRASaver (bundle_emb.<ph>.qwen, bundle_emb.<ph>.t5).
     """
 
     def __init__(self):
         super().__init__()
 
     def _to_state_dict(
-            self,
-            embedding: AnimaModelEmbedding | None,
-            embedding_state_dict: dict[str, Tensor] | None,
-            dtype: torch.dtype | None,
+        self,
+        embedding: AnimaModelEmbedding | None,
+        embedding_state_dict: dict[str, Tensor] | None,
+        dtype: torch.dtype | None,
     ):
         state_dict = copy(embedding_state_dict) if embedding_state_dict is not None else {}
 
@@ -37,18 +36,23 @@ class AnimaEmbeddingSaver(
                 state_dict["qwen"] = embedding.text_encoder_embedding.vector.to(device="cpu", dtype=dtype)
             if embedding.text_encoder_embedding.output_vector is not None:
                 state_dict["qwen_out"] = embedding.text_encoder_embedding.output_vector.to(device="cpu", dtype=dtype)
+            if embedding.t5_embedding.vector is not None:
+                state_dict["t5"] = embedding.t5_embedding.vector.to(device="cpu", dtype=dtype)
 
         return state_dict
 
     def save_single(
-            self,
-            model: AnimaModel,
-            output_model_format: ModelFormat,
-            output_model_destination: str,
-            dtype: torch.dtype | None,
+        self,
+        model: AnimaModel,
+        output_model_format: ModelFormat,
+        output_model_destination: str,
+        dtype: torch.dtype | None,
     ):
-        embedding_uuid = list(model.embedding_state_dicts.keys())[0] if model.embedding is None \
+        embedding_uuid = (
+            list(model.embedding_state_dicts.keys())[0]
+            if model.embedding is None
             else model.embedding.text_encoder_embedding.uuid
+        )
 
         embedding = model.embedding
         embedding_state = list(model.embedding_state_dicts.values())[0]
@@ -72,14 +76,15 @@ class AnimaEmbeddingSaver(
                 )
 
     def save_multiple(
-            self,
-            model: AnimaModel,
-            output_model_format: ModelFormat,
-            output_model_destination: str,
-            dtype: torch.dtype | None,
+        self,
+        model: AnimaModel,
+        output_model_format: ModelFormat,
+        output_model_destination: str,
+        dtype: torch.dtype | None,
     ):
-        embedding_uuids = set(model.embedding_state_dicts.keys() \
-                              | {x.text_encoder_embedding.uuid for x in model.additional_embeddings})
+        embedding_uuids = set(
+            model.embedding_state_dicts.keys() | {x.text_encoder_embedding.uuid for x in model.additional_embeddings}
+        )
 
         if model.embedding is not None:
             embedding_uuids.discard(model.embedding.text_encoder_embedding.uuid)
@@ -93,8 +98,9 @@ class AnimaEmbeddingSaver(
             if embedding is None and embedding_state is None:
                 continue
 
-            embedding_name = safe_filename(embedding.text_encoder_embedding.placeholder,
-                                           allow_spaces=False, max_length=None)
+            embedding_name = safe_filename(
+                embedding.text_encoder_embedding.placeholder, allow_spaces=False, max_length=None
+            )
 
             match output_model_format:
                 case ModelFormat.DIFFUSERS:

@@ -68,19 +68,19 @@ class BaseAnimaSetup(
     LAYER_PRESETS = {
         "full": [],
         "blocks": ["transformer_blocks"],
-        "detail": {'patterns': ["^(?=.*attn)(?!.*norm).*",
-                                "^(?=.*ff\\.net).*",
-                                "^(?=.*norm[123]\\.linear).*"], 'regex': True},
-        "attn-mlp": {'patterns': ["^(?=.*attn)(?!.*norm).*",
-                                  "^(?=.*ff\\.net).*"], 'regex': True},
-        "attn-only": {'patterns': ["^(?=.*attn)(?!.*norm).*"], 'regex': True},
-        "cross-attn": {'patterns': ["^(?=.*attn2)(?!.*norm).*"], 'regex': True},
+        "detail": {
+            "patterns": ["^(?=.*attn)(?!.*norm).*", "^(?=.*ff\\.net).*", "^(?=.*norm[123]\\.linear).*"],
+            "regex": True,
+        },
+        "attn-mlp": {"patterns": ["^(?=.*attn)(?!.*norm).*", "^(?=.*ff\\.net).*"], "regex": True},
+        "attn-only": {"patterns": ["^(?=.*attn)(?!.*norm).*"], "regex": True},
+        "cross-attn": {"patterns": ["^(?=.*attn2)(?!.*norm).*"], "regex": True},
     }
 
     def setup_optimizations(
-            self,
-            model: AnimaModel,
-            config: TrainConfig,
+        self,
+        model: AnimaModel,
+        config: TrainConfig,
     ):
         # Gradient checkpointing goes through OneTrainer's conductor-based
         # wrappers (not the diffusers built-in) so that CPU_OFFLOADED can
@@ -93,11 +93,11 @@ class BaseAnimaSetup(
         # blocks with no trainable params, which is the LoRA/TI case where
         # the transformer is frozen but gradient still flows through it.
         if config.gradient_checkpointing.enabled():
-            model.transformer_offload_conductor = \
-                enable_checkpointing_for_cosmos_transformer(model.transformer, config)
+            model.transformer_offload_conductor = enable_checkpointing_for_cosmos_transformer(model.transformer, config)
             if model.text_encoder is not None:
-                model.text_encoder_offload_conductor = \
-                    enable_checkpointing_for_qwen3_encoder_layers(model.text_encoder, config)
+                model.text_encoder_offload_conductor = enable_checkpointing_for_qwen3_encoder_layers(
+                    model.text_encoder, config
+                )
 
         model.autocast_context, model.train_dtype = create_autocast_context(
             self.train_device,
@@ -139,37 +139,63 @@ class BaseAnimaSetup(
         quantize_layers(model.transformer, self.train_device, model.train_dtype, config)
 
     def _setup_embeddings(
-            self,
-            model: AnimaModel,
-            config: TrainConfig,
+        self,
+        model: AnimaModel,
+        config: TrainConfig,
     ):
-        # TI tokens are injected into the Qwen3 word embedding table only.
-        # Output embeddings aren't supported for Anima yet (no
-        # create_output_embedding_fn), which is fine -- additional
-        # embeddings used alongside LoRA are always input embeddings.
+        # TI tokens are injected into both the Qwen3 word embedding table
+        # and the T5 input embedding table (inside the frozen
+        # AnimaTextConditioner). Output embeddings aren't supported for
+        # Anima yet (no create_output_embedding_fn), which is fine --
+        # additional embeddings used alongside LoRA are always input
+        # embeddings.
         additional_embeddings = []
         for embedding_config in config.all_embedding_configs():
-            embedding_state = model.embedding_state_dicts.get(embedding_config.uuid, None)
-            if embedding_state is None:
+            saved_state = model.embedding_state_dicts.get(embedding_config.uuid, None)
+
+            # Qwen3 vector: seed from the host vocab via the configured
+            # initial_embedding_text, or load from checkpoint.
+            qwen_state = None
+            if saved_state is not None:
+                qwen_state = saved_state.get("qwen_out", saved_state.get("qwen", None))
+            if qwen_state is None:
                 with model.autocast_context:
-                    embedding_state = self._create_new_embedding(
+                    qwen_state = self._create_new_embedding(
                         model,
                         embedding_config,
                         model.tokenizer,
                         model.text_encoder,
                     )
-            else:
-                embedding_state = embedding_state.get("qwen_out", embedding_state.get("qwen", None))
-
-            if embedding_state is not None:
-                embedding_state = embedding_state.to(
+            if qwen_state is not None:
+                qwen_state = qwen_state.to(
                     dtype=model.text_encoder.get_input_embeddings().weight.dtype,
+                    device=self.train_device,
+                ).detach()
+
+            # T5 vector: no host-vocab seeding (the conditioner wasn't
+            # trained to consume placeholder strings on the T5 side).
+            # Load from checkpoint when resuming, otherwise init with
+            # small Gaussian noise rescaled to the median T5 row norm.
+            t5_state = None
+            if saved_state is not None:
+                t5_state = saved_state.get("t5", None)
+            if t5_state is None and model.text_conditioner is not None and embedding_config.token_count is not None:
+                t5_state = self._create_noise_embedding(
+                    host_embedding=model.text_conditioner.embed,
+                    token_count=embedding_config.token_count,
+                    dtype=model.text_conditioner.embed.weight.dtype,
+                    device=self.train_device,
+                )
+            if t5_state is not None:
+                t5_state = t5_state.to(
+                    dtype=model.text_conditioner.embed.weight.dtype,
                     device=self.train_device,
                 ).detach()
 
             embedding = AnimaModelEmbedding(
                 embedding_config.uuid,
-                embedding_state,
+                qwen_state,
+                t5_state,
                 embedding_config.placeholder,
                 embedding_config.is_output_embedding,
             )
@@ -182,11 +208,13 @@ class BaseAnimaSetup(
 
         if model.tokenizer is not None:
             self._add_embeddings_to_tokenizer(model.tokenizer, model.all_text_encoder_embeddings())
+        if model.t5_tokenizer is not None:
+            self._add_embeddings_to_tokenizer(model.t5_tokenizer, model.all_t5_embeddings())
 
     def _setup_embedding_wrapper(
-            self,
-            model: AnimaModel,
-            config: TrainConfig,
+        self,
+        model: AnimaModel,
+        config: TrainConfig,
     ):
         if model.tokenizer is not None and model.text_encoder is not None:
             model.embedding_wrapper = AdditionalEmbeddingWrapper(
@@ -198,28 +226,50 @@ class BaseAnimaSetup(
         if model.embedding_wrapper is not None:
             model.embedding_wrapper.hook_to_module()
 
+        if model.t5_tokenizer is not None and model.text_conditioner is not None:
+            model.t5_embedding_wrapper = AdditionalEmbeddingWrapper(
+                tokenizer=model.t5_tokenizer,
+                orig_module=model.text_conditioner.embed,
+                embeddings=model.all_t5_embeddings(),
+            )
+
+        if model.t5_embedding_wrapper is not None:
+            model.t5_embedding_wrapper.hook_to_module()
+
     def _setup_embeddings_requires_grad(
-            self,
-            model: AnimaModel,
-            config: TrainConfig,
+        self,
+        model: AnimaModel,
+        config: TrainConfig,
     ):
         if model.text_encoder is not None:
-            for embedding, embedding_config in zip(model.all_text_encoder_embeddings(),
-                                                   config.all_embedding_configs(), strict=True):
-                train_embedding = \
-                    embedding_config.train \
-                    and config.text_encoder.train_embedding \
+            for embedding, embedding_config in zip(
+                model.all_text_encoder_embeddings(), config.all_embedding_configs(), strict=True
+            ):
+                train_embedding = (
+                    embedding_config.train
+                    and config.text_encoder.train_embedding
                     and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
+                )
+                embedding.requires_grad_(train_embedding)
+        if model.text_conditioner is not None:
+            for embedding, embedding_config in zip(
+                model.all_t5_embeddings(), config.all_embedding_configs(), strict=True
+            ):
+                train_embedding = (
+                    embedding_config.train
+                    and config.text_encoder.train_embedding
+                    and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
+                )
                 embedding.requires_grad_(train_embedding)
 
     def predict(
-            self,
-            model: AnimaModel,
-            batch: dict,
-            config: TrainConfig,
-            train_progress: TrainProgress,
-            *,
-            deterministic: bool = False,
+        self,
+        model: AnimaModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        *,
+        deterministic: bool = False,
     ) -> dict:
         with model.autocast_context:
             batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
@@ -240,14 +290,15 @@ class BaseAnimaSetup(
             # the Cosmos cross-attention consumes.
             encoder_hidden_states = model.encode_text(
                 train_device=self.train_device,
-                batch_size=batch['latent_image'].shape[0],
+                batch_size=batch["latent_image"].shape[0],
                 rand=rand,
-                tokens_qwen=batch['tokens_qwen'],
-                qwen_hidden_states=batch.get('text_encoder_hidden_state')
-                if not config.train_text_encoder_or_embedding() else None,
-                tokens_mask_qwen=batch['tokens_mask_qwen'],
-                tokens_t5=batch['tokens_t5'],
-                tokens_mask_t5=batch['tokens_mask_t5'],
+                tokens_qwen=batch["tokens_qwen"],
+                qwen_hidden_states=batch.get("text_encoder_hidden_state")
+                if not config.train_text_encoder_or_embedding()
+                else None,
+                tokens_mask_qwen=batch["tokens_mask_qwen"],
+                tokens_t5=batch["tokens_t5"],
+                tokens_mask_t5=batch["tokens_mask_t5"],
                 text_encoder_dropout_probability=None,
             )
 
@@ -255,7 +306,7 @@ class BaseAnimaSetup(
             # vae_frame_dim=True in the dataloader gives us 5D
             # (B, C, T=1, H_lat, W_lat); defend against 4D in case a future
             # caching path strips T.
-            latent_image = batch['latent_image']
+            latent_image = batch["latent_image"]
             if latent_image.ndim == 4:
                 latent_image = latent_image.unsqueeze(2)
 
@@ -270,12 +321,13 @@ class BaseAnimaSetup(
             # by default, matching the scheduler's own shift field).
             if config.dynamic_timestep_shifting:
                 shift = model.calculate_timestep_shift(
-                    scaled_latent_image.shape[-2], scaled_latent_image.shape[-1],
+                    scaled_latent_image.shape[-2],
+                    scaled_latent_image.shape[-1],
                 )
             else:
                 shift = config.timestep_shift
             timestep = self._get_timestep_discrete(
-                model.noise_scheduler.config['num_train_timesteps'],
+                model.noise_scheduler.config["num_train_timesteps"],
                 deterministic,
                 generator,
                 scaled_latent_image.shape[0],
@@ -296,8 +348,7 @@ class BaseAnimaSetup(
             # resolution (vae_scale_factor * latent dims) -- the
             # transformer resizes it internally.
             t_norm = (
-                timestep.to(dtype=model.train_dtype.torch_dtype())
-                / model.noise_scheduler.config.num_train_timesteps
+                timestep.to(dtype=model.train_dtype.torch_dtype()) / model.noise_scheduler.config.num_train_timesteps
             )
             latent_input = scaled_noisy_latent_image.to(dtype=model.train_dtype.torch_dtype())
 
@@ -320,16 +371,16 @@ class BaseAnimaSetup(
 
             flow = latent_noise - scaled_latent_image
             model_output_data = {
-                'loss_type': 'target',
-                'timestep': timestep,
-                'predicted': predicted_flow,
-                'target': flow,
+                "loss_type": "target",
+                "timestep": timestep,
+                "predicted": predicted_flow,
+                "target": flow,
             }
 
             if config.debug_mode:
                 with torch.no_grad():
                     predicted_scaled_latent_image = scaled_noisy_latent_image - predicted_flow * sigma
-                    self._save_tokens("7-prompt", batch['tokens_qwen'], model.tokenizer, config, train_progress)
+                    self._save_tokens("7-prompt", batch["tokens_qwen"], model.tokenizer, config, train_progress)
                     self._save_latent("1-noise", latent_noise, config, train_progress)
                     self._save_latent("2-noisy_image", scaled_noisy_latent_image, config, train_progress)
                     self._save_latent("3-predicted_flow", predicted_flow, config, train_progress)
@@ -340,11 +391,11 @@ class BaseAnimaSetup(
         return model_output_data
 
     def calculate_loss(
-            self,
-            model: AnimaModel,
-            batch: dict,
-            data: dict,
-            config: TrainConfig,
+        self,
+        model: AnimaModel,
+        batch: dict,
+        data: dict,
+        config: TrainConfig,
     ) -> Tensor:
         return self._flow_matching_losses(
             batch=batch,
