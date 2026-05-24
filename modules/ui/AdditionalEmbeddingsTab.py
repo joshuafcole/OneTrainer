@@ -22,6 +22,22 @@ class AdditionalEmbeddingsTab(ConfigList):
             show_toggle_button=True
         )
 
+        # Bundle toggle: when on, additional embeddings are saved inside the
+        # LoRA .safetensors as `bundle_emb.<placeholder>.<encoder>` keys; when
+        # off, each embedding is written to a separate standalone file in
+        # `{lora_path}_embeddings/`. Off is what you want if you plan to reuse
+        # the embedding in a future training run, since the loader cannot
+        # extract bundled tensors back out.
+        components.label(
+            self.top_frame, 0, 4, "Bundle Embeddings",
+            tooltip=(
+                "Bundle additional embeddings into the LoRA output file rather"
+                " than saving them as separate files. Disable if you plan to"
+                " reuse these embeddings in another training run."
+            ),
+        )
+        components.switch(self.top_frame, 0, 5, ui_state, "bundle_additional_embeddings")
+
     def refresh_ui(self):
         if self.element_list is not None:
             self.element_list.destroy()
