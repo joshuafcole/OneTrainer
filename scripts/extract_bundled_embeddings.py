@@ -22,7 +22,6 @@ from pathlib import Path
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-
 BUNDLE_PREFIX = "bundle_emb."
 
 
@@ -33,7 +32,7 @@ def extract(lora_path: Path, out_dir: Path) -> list[Path]:
         for key in f.keys():
             if not key.startswith(BUNDLE_PREFIX):
                 continue
-            remainder = key[len(BUNDLE_PREFIX):]
+            remainder = key[len(BUNDLE_PREFIX) :]
             placeholder, _, encoder_key = remainder.partition(".")
             if not encoder_key:
                 print(f"  skipping malformed key: {key}")
