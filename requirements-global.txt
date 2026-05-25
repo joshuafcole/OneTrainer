@@ -35,7 +35,10 @@ pooch==1.8.2
 open-clip-torch==2.32.0
 
 # data loader
--e git+https://github.com/Nerogar/mgds.git@9320a69#egg=mgds
+# Editable install of our mgds fork as a sibling clone (../mgds), instead of the
+# upstream VCS pin, so local changes persist across updates and aren't reset to a
+# fixed commit. origin=joshuafcole/mgds, upstream=Nerogar/mgds (forked at 9320a69).
+-e ../mgds
 
 # optimizers
 dadaptation==3.2 # dadaptation optimizers
