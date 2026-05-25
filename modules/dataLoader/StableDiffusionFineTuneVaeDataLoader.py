@@ -2,6 +2,11 @@ import os
 import re
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
+from modules.dataLoader.mixin.DataLoaderText2ImageMixin import (
+    BUCKET_KEEP_NAME,
+    BUCKET_REPEAT_NAME,
+    parse_bucket_tiers,
+)
 from modules.model.StableDiffusionModel import StableDiffusionModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util import factory, path_util
@@ -110,9 +115,14 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             target_frames_in_name='settings.target_frames',
             frame_dim_enabled=False,
             target_resolutions_override_in_name='concept.image.resolution_override',
+            bucket_aspect_tolerance=config.aspect_ratio_bucket_tolerance,
             scale_resolution_out_name='scale_resolution',
             crop_resolution_out_name='crop_resolution',
-            possible_resolutions_out_name='possible_resolutions'
+            possible_resolutions_out_name='possible_resolutions',
+            batch_size=config.batch_size,
+            min_bucket_tiers=parse_bucket_tiers(config.aspect_ratio_bucket_min_tiers),
+            keep_out_name=BUCKET_KEEP_NAME,
+            repeat_out_name=BUCKET_REPEAT_NAME,
         )
 
         single_aspect_calculation = SingleAspectCalculation(
@@ -187,6 +197,12 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
 
         sort_names = ['concept']
 
+        # Cache AspectBucketing's rebalancing tags exactly like crop_resolution
+        # (cache-only aggregates). In the non-cached path there is no reordering
+        # module here, so the sorter reads them directly from AspectBucketing.
+        if config.aspect_ratio_bucketing:
+            aggregate_names = aggregate_names + [BUCKET_KEEP_NAME, BUCKET_REPEAT_NAME]
+
         def before_cache_fun():
             self._setup_cache_device(model, self.train_device, self.temp_device, config)
 
@@ -221,10 +237,12 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
 
         image_sample = SampleVAEDistribution(in_name='latent_image_distribution', out_name='latent_image', mode='mean')
 
+        keep_in_name = BUCKET_KEEP_NAME if config.aspect_ratio_bucketing else None
+        repeat_in_name = BUCKET_REPEAT_NAME if config.aspect_ratio_bucketing else None
         if config.latent_caching:
-            batch_sorting = AspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size)
+            batch_sorting = AspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size, keep_in_name=keep_in_name, repeat_in_name=repeat_in_name)
         else:
-            batch_sorting = InlineAspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size)
+            batch_sorting = InlineAspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size, keep_in_name=keep_in_name, repeat_in_name=repeat_in_name)
 
         output = OutputPipelineModule(names=output_names)
 

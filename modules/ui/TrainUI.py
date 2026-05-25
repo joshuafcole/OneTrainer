@@ -16,6 +16,7 @@ from tkinter import filedialog, messagebox
 
 import scripts.generate_debug_report
 from modules.ui.AdditionalEmbeddingsTab import AdditionalEmbeddingsTab
+from modules.ui.BucketTierParamsWindow import BucketTierParamsWindow
 from modules.ui.CaptionUI import CaptionUI
 from modules.ui.CloudTab import CloudTab
 from modules.ui.ConceptTab import ConceptTab
@@ -358,6 +359,15 @@ class TrainUI(ctk.CTk):
                          tooltip="Aspect ratio bucketing enables training on images with different aspect ratios")
         components.switch(frame, 0, 1, self.ui_state, "aspect_ratio_bucketing")
 
+        components.label(frame, 0, 3, "Bucket Tolerance",
+                 tooltip="Collapses nearby aspect buckets onto the same crop resolution. 0 keeps the current exact bucket set; higher values are looser and can help fill batches.")
+        components.entry(frame, 0, 4, self.ui_state, "aspect_ratio_bucket_tolerance")
+
+        # min bucket size tiers
+        components.label(frame, 1, 3, "Min Bucket Tiers",
+                 tooltip="Configure how aspect buckets too small to fill a batch are handled (drop / donate / borrow / repeat). Empty = upstream behavior (sparse buckets are dropped).")
+        components.button(frame, 1, 4, "configure tiers", self.__open_bucket_tier_params_window)
+
         # latent caching
         components.label(frame, 1, 0, "Latent Caching",
                          tooltip="Caching of intermediate training data that can be re-used between epochs")
@@ -370,6 +380,10 @@ class TrainUI(ctk.CTk):
 
         frame.pack(fill="both", expand=1)
         return frame
+
+    def __open_bucket_tier_params_window(self):
+        window = BucketTierParamsWindow(self, self.train_config, self.ui_state)
+        self.wait_window(window)
 
     def create_concepts_tab(self, master):
         return ConceptTab(master, self.train_config, self.ui_state)

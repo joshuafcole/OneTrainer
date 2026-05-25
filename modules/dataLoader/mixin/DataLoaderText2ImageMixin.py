@@ -49,10 +49,36 @@ from mgds.pipelineModules.SelectRandomText import SelectRandomText
 from mgds.pipelineModules.ShuffleTags import ShuffleTags
 from mgds.pipelineModules.SingleAspectCalculation import SingleAspectCalculation
 from mgds.pipelineModules.VariationSorting import VariationSorting
+from mgds.util.bucketRebalancing import BORROW_MOVE, BucketTier
 
 import torch
 
 from diffusers import AutoencoderKL
+
+# Field names carrying AspectBucketing's per-item rebalancing decisions through
+# the pipeline. Treated like crop_resolution: cached as DiskCache aggregates and
+# carried by VariationSorting, so they reach the batch sorter in both modes.
+BUCKET_KEEP_NAME = 'bucket_keep'
+BUCKET_REPEAT_NAME = 'bucket_repeat'
+
+
+def parse_bucket_tiers(tier_dicts: list[dict[str, str]] | None) -> list[BucketTier]:
+    """Convert UI/config tier dicts into typed BucketTier rules.
+
+    Each dict has string values (a ConfigList constraint): ``max_size``,
+    ``strategy``, and an optional ``mode`` (borrow only). Rows missing a strategy
+    or max_size are skipped (incomplete UI rows); invalid strategies raise via
+    BucketTier validation, surfacing the config error to the user.
+    """
+    tiers: list[BucketTier] = []
+    for tier_dict in tier_dicts or []:
+        strategy = (tier_dict.get('strategy') or '').strip().lower()
+        max_size_str = (tier_dict.get('max_size') or '').strip()
+        if not strategy or not max_size_str:
+            continue
+        mode = (tier_dict.get('mode') or '').strip().lower() or BORROW_MOVE
+        tiers.append(BucketTier(max_size=int(max_size_str), strategy=strategy, mode=mode))
+    return tiers
 
 
 class DataLoaderText2ImageMixin(metaclass=ABCMeta):
@@ -154,6 +180,11 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     def _aspect_bucketing_in(self, config: TrainConfig, aspect_bucketing_quantization: int, frame_dim_enabled:bool=False):
         calc_aspect = CalcAspect(image_in_name='image', resolution_out_name='original_resolution')
 
+        # Match the batch sorter's effective batch size so rebalanced buckets fill
+        # to a whole number of batches (see _output_modules_from_out_names).
+        world_size = multi.world_size() if config.multi_gpu else 1
+        batch_size = config.batch_size * world_size
+
         aspect_bucketing_quantization = AspectBucketing(
             quantization=aspect_bucketing_quantization,
             resolution_in_name='original_resolution',
@@ -162,9 +193,14 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             target_resolutions_override_in_name='concept.image.resolution_override',
             target_frames_in_name='settings.target_frames',
             frame_dim_enabled=frame_dim_enabled,
+            bucket_aspect_tolerance=config.aspect_ratio_bucket_tolerance,
             scale_resolution_out_name='scale_resolution',
             crop_resolution_out_name='crop_resolution',
-            possible_resolutions_out_name='possible_resolutions'
+            possible_resolutions_out_name='possible_resolutions',
+            batch_size=batch_size,
+            min_bucket_tiers=parse_bucket_tiers(config.aspect_ratio_bucket_min_tiers),
+            keep_out_name=BUCKET_KEEP_NAME,
+            repeat_out_name=BUCKET_REPEAT_NAME,
         )
 
         single_aspect_calculation = SingleAspectCalculation(
@@ -301,11 +337,15 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         )
 
         world_size = multi.world_size() if config.multi_gpu else 1  #world_size can be 1 for validation dataloader, even if multi.world_size() returns > 1
+        # Honor AspectBucketing's rebalancing tags (drop / identical-repeat) when
+        # bucketing is on; None preserves upstream behavior otherwise.
+        keep_in_name = BUCKET_KEEP_NAME if config.aspect_ratio_bucketing else None
+        repeat_in_name = BUCKET_REPEAT_NAME if config.aspect_ratio_bucketing else None
         if config.latent_caching:
-            batch_sorting = AspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size * world_size)
+            batch_sorting = AspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size * world_size, keep_in_name=keep_in_name, repeat_in_name=repeat_in_name)
             distributed_sampler = DistributedSampler(names=sort_names, world_size=world_size, rank=multi.rank())
         else:
-            batch_sorting = InlineAspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size * world_size)
+            batch_sorting = InlineAspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size * world_size, keep_in_name=keep_in_name, repeat_in_name=repeat_in_name)
             distributed_sampler = InlineDistributedSampler(names=sort_names, world_size=world_size, rank=multi.rank())
 
         output = OutputPipelineModule(names=output_names)
@@ -337,6 +377,15 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     ):
         image_cache_dir = os.path.join(config.cache_dir, "image")
         text_cache_dir = os.path.join(config.cache_dir, "text")
+
+        # Carry AspectBucketing's rebalancing tags alongside crop_resolution: as
+        # image-cache aggregates (restored after caching) and in sort_names (so
+        # VariationSorting carries them when caching is off). The batch sorter
+        # reads them at the end of the pipeline.
+        if config.aspect_ratio_bucketing:
+            bucket_tag_names = [BUCKET_KEEP_NAME, BUCKET_REPEAT_NAME]
+            image_aggregate_names = list(image_aggregate_names) + bucket_tag_names
+            sort_names = list(sort_names) + bucket_tag_names
 
         if before_cache_image_fun is None:
             def prepare_vae():
