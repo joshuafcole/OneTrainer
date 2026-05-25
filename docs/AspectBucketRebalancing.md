@@ -345,3 +345,25 @@ therefore fully prevents drops only with a **single budget**. With multiple budg
 shrinking per-budget remainders), while **repeat** and **borrow** only *reduce*
 per-budget remainder drops rather than eliminate them. Guaranteeing per-budget
 batches would require changing the out-of-scope random budget assignment.
+
+### cinema-studio rehearsal integration
+The rehearsal launch config (cinema-studio) exposes this surface so a run can be
+configured without editing JSON by hand:
+- `rehearsal-schema/models.py` — `BucketTier` CamelModel (typed `max_size: int`;
+  `strategy` / `mode` literals). `RunConfigSummary.bucket_tiers` (read) and
+  `TrainingPlan.bucket_tiers` (write).
+- `scanner/config_read.py::read_bucket_tiers` — parses OT's
+  `aspect_ratio_bucket_min_tiers` (string→int boundary), tolerant of garbage.
+- `launcher/config_builder.py` — `apply_overrides` writes the tiers **wholesale**
+  (`None` inherits the base; a list, incl. `[]`, replaces it — tiers are anonymous
+  rules the loader re-sorts, so no sparse per-index channel); diff labels read
+  "Tier N · …".
+- `launcher/config_introspect.py` — `aspect_ratio_bucketing` + `…_tolerance`
+  scalars added to the relevance map (group `data`, warm) so they ride the generic
+  override channel.
+- Frontend `rehearsal/components/bucket-tier-row.tsx` + the "Aspect-ratio buckets"
+  section in `configure-panel.tsx` (toggle + tolerance via the generic field
+  renderer; tiers via a whole-list override editor). TS types regenerated through
+  freight-depot.
+- Verified: 253 rehearsal-agent tests (10 new), pyright/ruff clean, frontend
+  typecheck + 357 studio tests, codegen `--check` matches.
