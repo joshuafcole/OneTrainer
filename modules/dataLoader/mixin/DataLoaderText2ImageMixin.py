@@ -16,6 +16,7 @@ from modules.util.TrainProgress import TrainProgress
 from mgds.OutputPipelineModule import OutputPipelineModule
 from mgds.pipelineModules.AspectBatchSorting import AspectBatchSorting
 from mgds.pipelineModules.AspectBucketing import AspectBucketing
+from mgds.pipelineModules.AspectBucketRebalance import AspectBucketRebalance
 from mgds.pipelineModules.CalcAspect import CalcAspect
 from mgds.pipelineModules.CapitalizeTags import CapitalizeTags
 from mgds.pipelineModules.CollectPaths import CollectPaths
@@ -49,7 +50,7 @@ from mgds.pipelineModules.SelectRandomText import SelectRandomText
 from mgds.pipelineModules.ShuffleTags import ShuffleTags
 from mgds.pipelineModules.SingleAspectCalculation import SingleAspectCalculation
 from mgds.pipelineModules.VariationSorting import VariationSorting
-from mgds.util.bucketRebalancing import BORROW_MOVE, BucketTier
+from mgds.util.bucketRebalancing import BORROW, BORROW_COPY, BORROW_MOVE, BucketTier
 
 import torch
 
@@ -60,6 +61,17 @@ from diffusers import AutoencoderKL
 # carried by VariationSorting, so they reach the batch sorter in both modes.
 BUCKET_KEEP_NAME = 'bucket_keep'
 BUCKET_REPEAT_NAME = 'bucket_repeat'
+# Per-row aspect override emitted by AspectBucketRebalance (borrow-copy mode) and
+# consumed by AspectBucketing. Unlike keep/repeat it is read mid-pipeline (before
+# the crop), so it is neither cached nor carried to the sorter.
+BUCKET_OVERRIDE_NAME = 'bucket_override_aspect'
+
+
+def has_copy_tier(tiers: list[BucketTier]) -> bool:
+    """True if any tier asks for borrow-copy, which needs the upstream re-crop /
+    row-duplication planner (AspectBucketRebalance). Other strategies stay inline
+    in AspectBucketing."""
+    return any(tier.strategy == BORROW and tier.mode == BORROW_COPY for tier in tiers)
 
 
 def parse_bucket_tiers(tier_dicts: list[dict[str, str]] | None) -> list[BucketTier]:
@@ -185,6 +197,14 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         world_size = multi.world_size() if config.multi_gpu else 1
         batch_size = config.batch_size * world_size
 
+        # When borrow-copy is configured, the upstream AspectBucketRebalance module
+        # (see _bucket_rebalance_modules) owns all planning and mints the duplicate
+        # rows; AspectBucketing then runs as a consumer -- it snaps each row to the
+        # supplied override aspect and plans nothing itself. Otherwise it plans
+        # inline from the tiers, exactly as before.
+        tiers = parse_bucket_tiers(config.aspect_ratio_bucket_min_tiers)
+        consumer_mode = has_copy_tier(tiers)
+
         aspect_bucketing_quantization = AspectBucketing(
             quantization=aspect_bucketing_quantization,
             resolution_in_name='original_resolution',
@@ -198,9 +218,10 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             crop_resolution_out_name='crop_resolution',
             possible_resolutions_out_name='possible_resolutions',
             batch_size=batch_size,
-            min_bucket_tiers=parse_bucket_tiers(config.aspect_ratio_bucket_min_tiers),
-            keep_out_name=BUCKET_KEEP_NAME,
-            repeat_out_name=BUCKET_REPEAT_NAME,
+            min_bucket_tiers=[] if consumer_mode else tiers,
+            keep_out_name=None if consumer_mode else BUCKET_KEEP_NAME,
+            repeat_out_name=None if consumer_mode else BUCKET_REPEAT_NAME,
+            override_aspect_in_name=BUCKET_OVERRIDE_NAME if consumer_mode else None,
         )
 
         single_aspect_calculation = SingleAspectCalculation(
@@ -221,6 +242,39 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             modules.append(single_aspect_calculation)
 
         return modules
+
+    def _bucket_rebalance_modules(self, config: TrainConfig, aspect_bucketing_quantization: int):
+        """Path-stage rebalancing planner, inserted only when borrow-copy is asked
+        for. It reads aspect ratios from file headers, plans every rung's fate, and
+        appends re-cropped duplicate rows for borrow-copy *before* images load --
+        so each copy becomes a first-class item the disk cache encodes at the borrow
+        crop. Empty (no module) for every other configuration => unchanged pipeline.
+        """
+        tiers = parse_bucket_tiers(config.aspect_ratio_bucket_min_tiers)
+        if not (config.aspect_ratio_bucketing and has_copy_tier(tiers)):
+            return []
+
+        world_size = multi.world_size() if config.multi_gpu else 1
+        batch_size = config.batch_size * world_size
+
+        rebalance = AspectBucketRebalance(
+            path_in_name='image_path',
+            concept_in_name='concept',
+            target_resolution_in_name='settings.target_resolution',
+            enable_target_resolutions_override_in_name='concept.image.enable_resolution_override',
+            target_resolutions_override_in_name='concept.image.resolution_override',
+            quantization=aspect_bucketing_quantization,
+            bucket_aspect_tolerance=config.aspect_ratio_bucket_tolerance,
+            batch_size=batch_size,
+            min_bucket_tiers=tiers,
+            image_extensions=path_util.supported_image_extensions(),
+            path_out_name='image_path',
+            concept_out_name='concept',
+            keep_out_name=BUCKET_KEEP_NAME,
+            repeat_out_name=BUCKET_REPEAT_NAME,
+            override_aspect_out_name=BUCKET_OVERRIDE_NAME,
+        )
+        return [rebalance]
 
     def _crop_modules(self, config: TrainConfig):
         inputs = ['image']
@@ -400,10 +454,10 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         image_disk_cache = DiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations',
                                      balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'],
-                                     group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
+                                     group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun, cache_label='image latents')
 
         text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
+                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun, cache_label='text embeddings')
 
         modules = []
 
@@ -440,6 +494,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             supports_inpainting: bool=True, #TODO many models probably don't support inpainting, but this has been enabled in most dataloaders before refactoring, too
     ):
         enumerate_input = self._enumerate_input_modules(config, allow_videos=allow_video_files)
+        bucket_rebalance = self._bucket_rebalance_modules(config, aspect_bucketing_quantization)
         load_input = self._load_input_modules(config, model.train_dtype, vae_frame_dim=vae_frame_dim)
         mask_augmentation = self._mask_augmentation_modules(config)
         aspect_bucketing_in = self._aspect_bucketing_in(config, aspect_bucketing_quantization, frame_dim_enabled)
@@ -457,6 +512,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             config,
             [
                 enumerate_input,
+                bucket_rebalance,
                 load_input,
                 mask_augmentation,
                 aspect_bucketing_in,

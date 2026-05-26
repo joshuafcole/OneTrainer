@@ -1,9 +1,10 @@
 # Aspect-Bucket Population Rebalancing — Plan
 
-**Status:** Phases 1 & 2 implemented (see §11). Phase 3 deferred.
+**Status:** Phases 1 & 2 implemented; Phase 3 `borrow-copy` implemented (see §11).
+Variation-aware `repeat` still deferred.
 **Scope:** `mgds` (sibling editable clone at `../mgds`, origin=joshuafcole/mgds) + OneTrainer `modules/`
 **Owner:** Joshua
-**Last updated:** 2026-05-25
+**Last updated:** 2026-05-26
 
 Working reference for making sparse-bucket handling explicit and configurable in the
 **budget-based** resolution mode (comma-separated integer pixel budgets, e.g.
@@ -134,15 +135,17 @@ p < 10 → borrow (mode=move|copy)
 | **donate** | reassign items to nearest surviving rung; rung dissolves | resolution remap | `AspectBucketing` | 2 |
 | **borrow (move)** | rung survives; pull nearest neighbor items (re-cropped here) to fill target; donors capped to stay viable | resolution remap | `AspectBucketing` | 2 |
 | **repeat (identical)** | oversample the rung's own members to fill target | multiset (+) | sorter (`repeat` tag) | 2 |
-| **borrow (copy)** | like move, but neighbor also stays in its home rung (shared) | multiset (+) + re-crop | needs upstream re-crop/dup mechanism | 3 |
+| **borrow (copy)** | like move, but neighbor also stays in its home rung (shared) | multiset (+) + re-crop | `AspectBucketRebalance` (path-stage row dup) | 3 ✅ |
 | **repeat (varied)** | oversample with *distinct* augmentation variants | multiset (+) + re-aug | needs upstream dup / variation-system integration | 3 |
 
 Rationale for the 2/3 split: **move**/**donate** are pure resolution remaps (no length
 change) → clean in `AspectBucketing`. **drop**/**identical-repeat** are length changes
 at the blessed end-of-pipeline location → small, backward-compatible sorter flags.
-**copy**/**varied-repeat** need re-cropped duplicates inserted mid-pipeline (before
-crop/augmentation), which fights MGDS's structure; they share one mechanism → deferred
-to Phase 3 together.
+**copy** needs a re-cropped *duplicate*: realized as a genuine extra **row** minted at
+the path stage (`AspectBucketRebalance`, before images load), so it flows through
+load→crop→encode→cache as a first-class item and the disk cache encodes it at the borrow
+crop — no cache changes, works at any `image_variations` (see §11). **varied-repeat**
+still needs variation-system integration → remains deferred.
 
 ### 3.3 Fill target (saving a rung)
 For **borrow**/**repeat**, fill up to the smallest multiple of `batch_size` that is ≥
@@ -278,8 +281,9 @@ remainder loss); seeded tie-breaking.
 - **Phase 2 (core):** tier framework + `drop`, `donate`, `borrow-move`,
   `repeat-identical`, batch-aligned fill, `keep`/`repeat` sorter tags, full config +
   wiring + unit tests.
-- **Phase 3 (follow-on):** `borrow-copy` + variation-aware `repeat` via a shared
-  re-crop/duplicate mechanism (or integration with the variations/cache system).
+- **Phase 3 (follow-on):** `borrow-copy` ✅ done via path-stage row duplication
+  (`AspectBucketRebalance`); variation-aware `repeat` still pending (needs the
+  variations/augmentation system).
 
 ---
 
@@ -336,6 +340,53 @@ remainder loss); seeded tie-breaking.
 import + config round-trip + `parse_bucket_tiers` + no circular import. **Not yet
 run:** end-to-end GPU training (field-flow through DiskCache, histogram output,
 formerly-dropped images now trained) — the manual CUDA+VAE smoke test from §7.
+
+### Phase 3: borrow-copy (implemented)
+
+The architectural blocker for copy was that an extra re-cropped instance of a donor
+needs a *length increase before the crop*, where MGDS only blesses the sorter
+(post-crop, too late to re-crop) or the variations/cache system. The realization
+makes the copy a **genuine extra dataset row** minted at the path stage, so the disk
+cache encodes it at the borrow crop with **no cache changes** and **independent of
+`image_variations`** (the open question that gated the design).
+
+**mgds (`../mgds`, branch `feat/bucket-rebalancing`):**
+- `util/bucketRebalancing.py` — `plan_rebalance` gains `RebalancePlan.copies`
+  (`(item, aspect)` pairs). `borrow`+`mode=copy` fills the borrow rung from the
+  nearest KEEP rungs *without* depleting them (no viability floor, no override on the
+  donor) — each donor original is re-cropped into the borrow rung as a duplicate.
+  The bucket-ladder construction (`build_bucket_resolutions`, `collapse_close_aspects`,
+  `quantize_resolution`, `ASPECT_LADDER`, `reference_rung_aspects`) is extracted here
+  as the single source of truth shared with `AspectBucketing`.
+- `pipelineModules/AspectBucketRebalance.py` *(new)* — path-stage planner + row
+  duplicator. Reads EXIF-corrected aspects from file headers (cheap, no decode),
+  runs `plan_rebalance`, emits per-row `keep`/`repeat`/`override_aspect` tags, and
+  **appends a duplicate (`image_path`,`concept`) row per copy** tagged with the borrow
+  aspect. Non-image/unreadable files opt out and pass through.
+- `pipelineModules/AspectBucketing.py` — gains a **consumer mode**
+  (`override_aspect_in_name`): when set it does no planning and just snaps each row to
+  the supplied aspect. Bucket building now delegates to the shared util.
+
+**OneTrainer (`modules/`):**
+- `dataLoader/mixin/DataLoaderText2ImageMixin.py` — `BUCKET_OVERRIDE_NAME`,
+  `has_copy_tier()`. `_bucket_rebalance_modules()` inserts `AspectBucketRebalance`
+  (right after path enumeration, before image load) **only when a copy tier is
+  configured**; `_aspect_bucketing_in` then runs `AspectBucketing` in consumer mode.
+  Non-copy configs are byte-for-byte unchanged (module not inserted, inline planning).
+- `dataLoader/StableDiffusionFineTuneVaeDataLoader.py` — same wiring (quantization 8).
+- UI / rehearsal schema needed **no change**: `mode` already offered `move`/`copy`.
+
+**Design notes:** planning here reads file-header aspects (EXIF-corrected to mirror
+`LoadImage`) rather than decoded tensors; they agree for all normal images, and any
+rung-boundary disagreement is marginal and never fatal. Copy donors are distinct
+within a borrow rung (max diversity); donors are never depleted. Video items are not
+rebalanced under copy mode (image-dimension planner) — a documented scope limit.
+
+**Verified:** mgds unit tests (26/26, incl. 4 new copy tests), e2e tests (6/6, incl.
+a full `AspectBucketRebalance → AspectBucketing(consumer) → AspectBatchSorting` chain
+over real image files proving copies fill the borrow batch without depleting donors),
+`pyright` clean on the planner + new module, `ruff` clean, OneTrainer import +
+`has_copy_tier` gating. **Not yet run:** end-to-end GPU training with a copy tier.
 
 ### Multi-budget effectiveness caveat
 Budget assignment is uniform-random per item (§1.4), so a rung's items **split

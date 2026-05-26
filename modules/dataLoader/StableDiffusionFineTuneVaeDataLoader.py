@@ -4,7 +4,9 @@ import re
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import (
     BUCKET_KEEP_NAME,
+    BUCKET_OVERRIDE_NAME,
     BUCKET_REPEAT_NAME,
+    has_copy_tier,
     parse_bucket_tiers,
 )
 from modules.model.StableDiffusionModel import StableDiffusionModel
@@ -19,6 +21,7 @@ from modules.util.TrainProgress import TrainProgress
 from mgds.OutputPipelineModule import OutputPipelineModule
 from mgds.pipelineModules.AspectBatchSorting import AspectBatchSorting
 from mgds.pipelineModules.AspectBucketing import AspectBucketing
+from mgds.pipelineModules.AspectBucketRebalance import AspectBucketRebalance
 from mgds.pipelineModules.CalcAspect import CalcAspect
 from mgds.pipelineModules.CollectPaths import CollectPaths
 from mgds.pipelineModules.DecodeVAE import DecodeVAE
@@ -107,6 +110,11 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
     def __aspect_bucketing_in(self, config: TrainConfig):
         calc_aspect = CalcAspect(image_in_name='image', resolution_out_name='original_resolution')
 
+        # Borrow-copy moves planning + row duplication upstream into
+        # AspectBucketRebalance; this module then just consumes the per-row aspect.
+        tiers = parse_bucket_tiers(config.aspect_ratio_bucket_min_tiers)
+        consumer_mode = has_copy_tier(tiers)
+
         aspect_bucketing = AspectBucketing(
             quantization=8,
             resolution_in_name='original_resolution',
@@ -120,9 +128,10 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             crop_resolution_out_name='crop_resolution',
             possible_resolutions_out_name='possible_resolutions',
             batch_size=config.batch_size,
-            min_bucket_tiers=parse_bucket_tiers(config.aspect_ratio_bucket_min_tiers),
-            keep_out_name=BUCKET_KEEP_NAME,
-            repeat_out_name=BUCKET_REPEAT_NAME,
+            min_bucket_tiers=[] if consumer_mode else tiers,
+            keep_out_name=None if consumer_mode else BUCKET_KEEP_NAME,
+            repeat_out_name=None if consumer_mode else BUCKET_REPEAT_NAME,
+            override_aspect_in_name=BUCKET_OVERRIDE_NAME if consumer_mode else None,
         )
 
         single_aspect_calculation = SingleAspectCalculation(
@@ -143,6 +152,31 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             modules.append(single_aspect_calculation)
 
         return modules
+
+    def __bucket_rebalance_modules(self, config: TrainConfig):
+        # Path-stage borrow-copy planner; empty unless a copy tier is configured.
+        tiers = parse_bucket_tiers(config.aspect_ratio_bucket_min_tiers)
+        if not (config.aspect_ratio_bucketing and has_copy_tier(tiers)):
+            return []
+
+        rebalance = AspectBucketRebalance(
+            path_in_name='image_path',
+            concept_in_name='concept',
+            target_resolution_in_name='settings.target_resolution',
+            enable_target_resolutions_override_in_name='concept.image.enable_resolution_override',
+            target_resolutions_override_in_name='concept.image.resolution_override',
+            quantization=8,
+            bucket_aspect_tolerance=config.aspect_ratio_bucket_tolerance,
+            batch_size=config.batch_size,
+            min_bucket_tiers=tiers,
+            image_extensions=path_util.supported_image_extensions(),
+            path_out_name='image_path',
+            concept_out_name='concept',
+            keep_out_name=BUCKET_KEEP_NAME,
+            repeat_out_name=BUCKET_REPEAT_NAME,
+            override_aspect_out_name=BUCKET_OVERRIDE_NAME,
+        )
+        return [rebalance]
 
     def __crop_modules(self, config: TrainConfig):
         inputs = ['image']
@@ -207,7 +241,7 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             self._setup_cache_device(model, self.train_device, self.temp_device, config)
 
         disk_cache = DiskCache(cache_dir=config.cache_dir, split_names=split_names, aggregate_names=aggregate_names, variations_in_name='concept.image_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                               variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_fun)
+                               variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_fun, cache_label='vae latents')
         variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'],
                                group_enabled_in_name='concept.enabled')
 
@@ -282,6 +316,7 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             is_validation: bool = False,
     ):
         enumerate_input = self.__enumerate_input_modules(config)
+        bucket_rebalance = self.__bucket_rebalance_modules(config)
         load_input = self.__load_input_modules(config)
         mask_augmentation = self.__mask_augmentation_modules(config)
         aspect_bucketing_in = self.__aspect_bucketing_in(config)
@@ -297,6 +332,7 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             config,
             [
                 enumerate_input,
+                bucket_rebalance,
                 load_input,
                 mask_augmentation,
                 aspect_bucketing_in,
