@@ -58,7 +58,7 @@ class AnimaEmbeddingSetup(
                 "embeddings",
             )
 
-        if config.text_encoder.train_embedding and model.text_conditioner is not None:
+        if config.train_t5_embedding and config.text_encoder.train_embedding and model.text_conditioner is not None:
             # Fallback chain: explicit t5_embedding_learning_rate wins; otherwise
             # 0.1x the explicit Qwen LR; otherwise null, which inherits the
             # base learning_rate just like a null embedding_learning_rate does
@@ -103,7 +103,7 @@ class AnimaEmbeddingSetup(
         # promotion is safe.
         if model.text_encoder is not None:
             model.text_encoder.get_input_embeddings().to(dtype=config.embedding_weight_dtype.torch_dtype())
-        if model.text_conditioner is not None:
+        if model.text_conditioner is not None and config.train_t5_embedding:
             model.text_conditioner.embed.to(dtype=config.embedding_weight_dtype.torch_dtype())
 
         self._remove_added_embeddings_from_tokenizer(model.tokenizer)

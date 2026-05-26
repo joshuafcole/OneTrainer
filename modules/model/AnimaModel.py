@@ -171,7 +171,15 @@ class AnimaModel(BaseModel):
         return self._add_embeddings_to_prompt(self.all_text_encoder_embeddings(), prompt)
 
     def add_t5_embeddings_to_prompt(self, prompt: str) -> str:
-        return self._add_embeddings_to_prompt(self.all_t5_embeddings(), prompt)
+        # Only substitute embeddings that actually have a T5-side vector.
+        # When T5-side training is off (the default), the t5_embedding has
+        # no vector and an empty joint_text_tokens; substituting it would
+        # strip the placeholder string from the prompt. Skipping it leaves
+        # the placeholder to tokenize naturally on the T5 side -- the same
+        # thing ComfyUI's Anima encoder does, since it never injects a
+        # T5-side TI vector.
+        active = [embedding for embedding in self.all_t5_embeddings() if embedding.vector is not None]
+        return self._add_embeddings_to_prompt(active, prompt)
 
     def vae_to(self, device: torch.device):
         self.vae.to(device=device)

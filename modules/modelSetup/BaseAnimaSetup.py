@@ -172,20 +172,26 @@ class BaseAnimaSetup(
                     device=self.train_device,
                 ).detach()
 
-            # T5 vector: no host-vocab seeding (the conditioner wasn't
-            # trained to consume placeholder strings on the T5 side).
-            # Load from checkpoint when resuming, otherwise init with
-            # small Gaussian noise rescaled to the median T5 row norm.
+            # T5 vector: only built when T5-side training is enabled. The
+            # default (config.train_t5_embedding off) leaves T5 untouched so
+            # the trained concept is reproducible in ComfyUI, whose Anima
+            # encoder doesn't inject T5-side embeddings -- the placeholder is
+            # left to tokenize naturally on the T5 side. When enabled, there
+            # is no host-vocab seeding (the conditioner wasn't trained to
+            # consume placeholder strings on the T5 side): load from
+            # checkpoint when resuming, otherwise init with small Gaussian
+            # noise rescaled to the median T5 row norm.
             t5_state = None
-            if saved_state is not None:
-                t5_state = saved_state.get("t5", None)
-            if t5_state is None and model.text_conditioner is not None and embedding_config.token_count is not None:
-                t5_state = self._create_noise_embedding(
-                    host_embedding=model.text_conditioner.embed,
-                    token_count=embedding_config.token_count,
-                    dtype=model.text_conditioner.embed.weight.dtype,
-                    device=self.train_device,
-                )
+            if config.train_t5_embedding and model.text_conditioner is not None:
+                if saved_state is not None:
+                    t5_state = saved_state.get("t5", None)
+                if t5_state is None and embedding_config.token_count is not None:
+                    t5_state = self._create_noise_embedding(
+                        host_embedding=model.text_conditioner.embed,
+                        token_count=embedding_config.token_count,
+                        dtype=model.text_conditioner.embed.weight.dtype,
+                        device=self.train_device,
+                    )
             if t5_state is not None:
                 t5_state = t5_state.to(
                     dtype=model.text_conditioner.embed.weight.dtype,
@@ -208,7 +214,10 @@ class BaseAnimaSetup(
 
         if model.tokenizer is not None:
             self._add_embeddings_to_tokenizer(model.tokenizer, model.all_text_encoder_embeddings())
-        if model.t5_tokenizer is not None:
+        # Only register T5 placeholder tokens when T5-side training is on.
+        # Off (the default) leaves the placeholder to tokenize naturally,
+        # matching ComfyUI's Anima encoder.
+        if model.t5_tokenizer is not None and config.train_t5_embedding:
             self._add_embeddings_to_tokenizer(model.t5_tokenizer, model.all_t5_embeddings())
 
     def _setup_embedding_wrapper(
@@ -226,7 +235,12 @@ class BaseAnimaSetup(
         if model.embedding_wrapper is not None:
             model.embedding_wrapper.hook_to_module()
 
-        if model.t5_tokenizer is not None and model.text_conditioner is not None:
+        # The T5 wrapper hooks trainable rows into the conditioner's embed
+        # table. Skip it entirely when T5-side training is off (the default):
+        # there are no T5 vectors to splice in, and leaving the table
+        # unhooked is what makes the placeholder tokenize naturally for
+        # ComfyUI parity.
+        if model.t5_tokenizer is not None and model.text_conditioner is not None and config.train_t5_embedding:
             model.t5_embedding_wrapper = AdditionalEmbeddingWrapper(
                 tokenizer=model.t5_tokenizer,
                 orig_module=model.text_conditioner.embed,
@@ -251,7 +265,9 @@ class BaseAnimaSetup(
                     and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
                 )
                 embedding.requires_grad_(train_embedding)
-        if model.text_conditioner is not None:
+        # T5-side vectors only exist when train_t5_embedding is on; otherwise
+        # they're None (no injection) and there is nothing to flag.
+        if model.text_conditioner is not None and config.train_t5_embedding:
             for embedding, embedding_config in zip(
                 model.all_t5_embeddings(), config.all_embedding_configs(), strict=True
             ):

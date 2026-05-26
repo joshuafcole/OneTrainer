@@ -11,6 +11,9 @@ and asserts that:
   - the data loader runs Qwen3 live (text cache disabled for embedding runs)
   - the setup injects the placeholder token into the Qwen3 word table and
     leaves the transformer / conditioner / Qwen3 / VAE frozen
+  - with train_t5_embedding off (the default), the T5 side is left entirely
+    untouched (no T5 vector, no hooked wrapper) so the trained token is
+    reproducible in ComfyUI, whose Anima encoder doesn't inject T5 embeddings
   - **the trained token vector's norm actually moves across training** --
     i.e. gradients reach the embedding (the open question from the joint
     embedding+LoRA work) -- with no LoRA adapter to mask a dead embedding
@@ -138,6 +141,11 @@ def _build_train_config(concepts_path: Path, samples_path: Path) -> TrainConfig:
     # embedding runs so Qwen3 runs live under grad.
     cfg.latent_caching = True
     cfg.text_encoder.train_embedding = True
+    # New default: the T5-side TI vector is NOT trained, so the trained token
+    # lives entirely in the Qwen3 table and the result is reproducible in
+    # ComfyUI (whose Anima encoder doesn't inject T5-side embeddings). The
+    # T5 side tokenizes the placeholder string naturally instead.
+    cfg.train_t5_embedding = False
     cfg.text_encoder.dropout_probability = 0.0
     cfg.timestep_distribution = TimestepDistribution.LOGIT_NORMAL
     cfg.dynamic_timestep_shifting = False
@@ -193,6 +201,16 @@ def main() -> int:
     t0 = time.perf_counter()
     trainer.start()
     print(f"    start() returned in {time.perf_counter() - t0:.1f}s")
+
+    # With train_t5_embedding off (the default), the T5 side must be left
+    # entirely untouched: no T5 vector, no hooked wrapper. The concept lives
+    # only in the Qwen3 token so the result is usable directly in ComfyUI.
+    if trainer.model.embedding.t5_embedding.vector is not None:
+        print("    FAIL: a T5-side vector was created even though train_t5_embedding is off.")
+        return 4
+    if trainer.model.t5_embedding_wrapper is not None:
+        print("    FAIL: a T5 embedding wrapper was hooked even though train_t5_embedding is off.")
+        return 4
 
     norm_before = _embedding_vector_norm(trainer)
     print(f"    embedding norm before training: {norm_before:.6f}")

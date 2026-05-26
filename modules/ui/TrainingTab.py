@@ -761,25 +761,38 @@ class TrainingTab:
         )
         components.entry(frame, 0, 1, self.ui_state, "embedding_learning_rate")
 
-        # t5 embedding learning rate (Anima)
+        # train t5 embedding (Anima)
         components.label(
             frame,
             1,
             0,
-            "T5 Embeddings Learning Rate",
-            tooltip="Anima only: learning rate for the T5-side TI vector. If empty, defaults to 0.1x the embedding learning rate.",
+            "Train T5 Embedding",
+            tooltip="Anima only: also train a T5-side TI vector. Off by default because "
+            "ComfyUI's Anima encoder doesn't inject T5-side embeddings, so a model trained "
+            "with this on can't reproduce its concept there. Leave off for ComfyUI parity.",
         )
-        components.entry(frame, 1, 1, self.ui_state, "t5_embedding_learning_rate")
+        components.switch(frame, 1, 1, self.ui_state, "train_t5_embedding")
 
-        # preserve embedding norm
+        # t5 embedding learning rate (Anima)
         components.label(
             frame,
             2,
             0,
+            "T5 Embeddings Learning Rate",
+            tooltip="Anima only: learning rate for the T5-side TI vector (only used when "
+            "Train T5 Embedding is on). If empty, defaults to 0.1x the embedding learning rate.",
+        )
+        components.entry(frame, 2, 1, self.ui_state, "t5_embedding_learning_rate")
+
+        # preserve embedding norm
+        components.label(
+            frame,
+            3,
+            0,
             "Preserve Embedding Norm",
             tooltip="Rescales each trained embedding to the median embedding norm",
         )
-        components.switch(frame, 2, 1, self.ui_state, "preserve_embedding_norm")
+        components.switch(frame, 3, 1, self.ui_state, "preserve_embedding_norm")
 
     def __create_unet_frame(self, master, row):
         frame = ctk.CTkFrame(master=master, corner_radius=5)

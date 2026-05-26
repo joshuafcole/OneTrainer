@@ -511,6 +511,7 @@ class TrainConfig(BaseConfig):
     # embedding
     embedding_learning_rate: float
     t5_embedding_learning_rate: float | None
+    train_t5_embedding: bool
     preserve_embedding_norm: bool
     embedding: TrainEmbeddingConfig
     additional_embeddings: list[TrainEmbeddingConfig]
@@ -1155,6 +1156,12 @@ class TrainConfig(BaseConfig):
         # embedding
         data.append(("embedding_learning_rate", None, float, True))
         data.append(("t5_embedding_learning_rate", None, float, True))
+        # Anima only: train the second (T5-side) TI vector inside the frozen
+        # AnimaTextConditioner. Defaults off because ComfyUI's Anima encoder
+        # doesn't inject T5-side embeddings -- a model trained with this on
+        # can't reproduce its concept in ComfyUI. With it off, the T5 side
+        # just tokenizes the placeholder string naturally, matching ComfyUI.
+        data.append(("train_t5_embedding", False, bool, False))
         data.append(("preserve_embedding_norm", False, bool, False))
         data.append(("embedding", TrainEmbeddingConfig.default_values(), TrainEmbeddingConfig, False))
         data.append(("additional_embeddings", [], list[TrainEmbeddingConfig], False))
