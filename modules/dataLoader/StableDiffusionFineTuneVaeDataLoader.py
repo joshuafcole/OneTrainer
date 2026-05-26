@@ -49,11 +49,11 @@ import torch
 
 class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
     def _setup_cache_device(
-            self,
-            model: StableDiffusionModel,
-            train_device: torch.device,
-            temp_device: torch.device,
-            config: TrainConfig,
+        self,
+        model: StableDiffusionModel,
+        train_device: torch.device,
+        temp_device: torch.device,
+        config: TrainConfig,
     ):
         model.to(self.temp_device)
 
@@ -66,23 +66,47 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         supported_extensions = path_util.supported_image_extensions()
 
         collect_paths = CollectPaths(
-            concept_in_name='concept', path_in_name='path', include_subdirectories_in_name='concept.include_subdirectories', enabled_in_name='enabled',
-            path_out_name='image_path', concept_out_name='concept',
-            extensions=supported_extensions, include_postfix=None, exclude_postfix=['-masklabel']
+            concept_in_name="concept",
+            path_in_name="path",
+            include_subdirectories_in_name="concept.include_subdirectories",
+            enabled_in_name="enabled",
+            path_out_name="image_path",
+            concept_out_name="concept",
+            extensions=supported_extensions,
+            include_postfix=None,
+            exclude_postfix=["-masklabel"],
         )
 
-        mask_path = ModifyPath(in_name='image_path', out_name='mask_path', postfix='-masklabel', extension='.png')
+        # mask_path is derived after the rebalance (see __derive_path_modules) so it
+        # covers AspectBucketRebalance's minted borrow-copy rows rather than IndexError
+        # when one is served.
+        return [collect_paths]
 
-        modules = [collect_paths]
-
+    def __derive_path_modules(self, config: TrainConfig) -> list:
+        """image_path-derived sibling paths, built after the rebalance so they cover
+        its minted borrow-copy rows (each resolving to its source image's paths)."""
+        mask_path = ModifyPath(in_name="image_path", out_name="mask_path", postfix="-masklabel", extension=".png")
+        modules = []
         if config.masked_training:
             modules.append(mask_path)
-
         return modules
 
     def __load_input_modules(self, config: TrainConfig) -> list:
-        load_image = LoadImage(path_in_name='image_path', image_out_name='image', range_min=-1.0, range_max=1.0, supported_extensions=path_util.supported_image_extensions())
-        load_mask = LoadImage(path_in_name='mask_path', image_out_name='latent_mask', range_min=0, range_max=1, channels=1, supported_extensions=path_util.supported_image_extensions())
+        load_image = LoadImage(
+            path_in_name="image_path",
+            image_out_name="image",
+            range_min=-1.0,
+            range_max=1.0,
+            supported_extensions=path_util.supported_image_extensions(),
+        )
+        load_mask = LoadImage(
+            path_in_name="mask_path",
+            image_out_name="latent_mask",
+            range_min=0,
+            range_max=1,
+            channels=1,
+            supported_extensions=path_util.supported_image_extensions(),
+        )
 
         modules = [load_image]
 
@@ -92,13 +116,19 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         return modules
 
     def __mask_augmentation_modules(self, config: TrainConfig) -> list:
-        inputs = ['image']
+        inputs = ["image"]
 
-        lowest_resolution = min([int(x.strip()) for x in re.split(r'\D', config.resolution) if x.strip() != ''])
+        lowest_resolution = min([int(x.strip()) for x in re.split(r"\D", config.resolution) if x.strip() != ""])
 
-        random_mask_rotate_crop = RandomMaskRotateCrop(mask_name='latent_mask', additional_names=inputs, min_size=lowest_resolution,
-                                                       min_padding_percent=10, max_padding_percent=30, max_rotate_angle=20,
-                                                       enabled_in_name='concept.image.enable_random_circular_mask_shrink')
+        random_mask_rotate_crop = RandomMaskRotateCrop(
+            mask_name="latent_mask",
+            additional_names=inputs,
+            min_size=lowest_resolution,
+            min_padding_percent=10,
+            max_padding_percent=30,
+            max_rotate_angle=20,
+            enabled_in_name="concept.image.enable_random_circular_mask_shrink",
+        )
 
         modules = []
 
@@ -108,7 +138,7 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         return modules
 
     def __aspect_bucketing_in(self, config: TrainConfig):
-        calc_aspect = CalcAspect(image_in_name='image', resolution_out_name='original_resolution')
+        calc_aspect = CalcAspect(image_in_name="image", resolution_out_name="original_resolution")
 
         # Borrow-copy moves planning + row duplication upstream into
         # AspectBucketRebalance; this module then just consumes the per-row aspect.
@@ -117,16 +147,16 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
 
         aspect_bucketing = AspectBucketing(
             quantization=8,
-            resolution_in_name='original_resolution',
-            target_resolution_in_name='settings.target_resolution',
-            enable_target_resolutions_override_in_name='concept.image.enable_resolution_override',
-            target_frames_in_name='settings.target_frames',
+            resolution_in_name="original_resolution",
+            target_resolution_in_name="settings.target_resolution",
+            enable_target_resolutions_override_in_name="concept.image.enable_resolution_override",
+            target_frames_in_name="settings.target_frames",
             frame_dim_enabled=False,
-            target_resolutions_override_in_name='concept.image.resolution_override',
+            target_resolutions_override_in_name="concept.image.resolution_override",
             bucket_aspect_tolerance=config.aspect_ratio_bucket_tolerance,
-            scale_resolution_out_name='scale_resolution',
-            crop_resolution_out_name='crop_resolution',
-            possible_resolutions_out_name='possible_resolutions',
+            scale_resolution_out_name="scale_resolution",
+            crop_resolution_out_name="crop_resolution",
+            possible_resolutions_out_name="possible_resolutions",
             batch_size=config.batch_size,
             min_bucket_tiers=[] if consumer_mode else tiers,
             keep_out_name=None if consumer_mode else BUCKET_KEEP_NAME,
@@ -135,13 +165,13 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         )
 
         single_aspect_calculation = SingleAspectCalculation(
-            resolution_in_name='original_resolution',
-            target_resolution_in_name='settings.target_resolution',
-            enable_target_resolutions_override_in_name='concept.image.enable_resolution_override',
-            target_resolutions_override_in_name='concept.image.resolution_override',
-            scale_resolution_out_name='scale_resolution',
-            crop_resolution_out_name='crop_resolution',
-            possible_resolutions_out_name='possible_resolutions'
+            resolution_in_name="original_resolution",
+            target_resolution_in_name="settings.target_resolution",
+            enable_target_resolutions_override_in_name="concept.image.enable_resolution_override",
+            target_resolutions_override_in_name="concept.image.resolution_override",
+            scale_resolution_out_name="scale_resolution",
+            crop_resolution_out_name="crop_resolution",
+            possible_resolutions_out_name="possible_resolutions",
         )
 
         modules = [calc_aspect]
@@ -160,18 +190,18 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             return []
 
         rebalance = AspectBucketRebalance(
-            path_in_name='image_path',
-            concept_in_name='concept',
-            target_resolution_in_name='settings.target_resolution',
-            enable_target_resolutions_override_in_name='concept.image.enable_resolution_override',
-            target_resolutions_override_in_name='concept.image.resolution_override',
+            path_in_name="image_path",
+            concept_in_name="concept",
+            target_resolution_in_name="settings.target_resolution",
+            enable_target_resolutions_override_in_name="concept.image.enable_resolution_override",
+            target_resolutions_override_in_name="concept.image.resolution_override",
             quantization=8,
             bucket_aspect_tolerance=config.aspect_ratio_bucket_tolerance,
             batch_size=config.batch_size,
             min_bucket_tiers=tiers,
             image_extensions=path_util.supported_image_extensions(),
-            path_out_name='image_path',
-            concept_out_name='concept',
+            path_out_name="image_path",
+            concept_out_name="concept",
             keep_out_name=BUCKET_KEEP_NAME,
             repeat_out_name=BUCKET_REPEAT_NAME,
             override_aspect_out_name=BUCKET_OVERRIDE_NAME,
@@ -179,29 +209,64 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         return [rebalance]
 
     def __crop_modules(self, config: TrainConfig):
-        inputs = ['image']
+        inputs = ["image"]
 
         if config.masked_training:
-            inputs.append('latent_mask')
+            inputs.append("latent_mask")
 
-        scale_crop = ScaleCropImage(names=inputs, scale_resolution_in_name='scale_resolution', crop_resolution_in_name='crop_resolution', enable_crop_jitter_in_name='concept.image.enable_crop_jitter', crop_offset_out_name='crop_offset')
+        scale_crop = ScaleCropImage(
+            names=inputs,
+            scale_resolution_in_name="scale_resolution",
+            crop_resolution_in_name="crop_resolution",
+            enable_crop_jitter_in_name="concept.image.enable_crop_jitter",
+            crop_offset_out_name="crop_offset",
+        )
 
         modules = [scale_crop]
 
         return modules
 
     def __augmentation_modules(self, config: TrainConfig):
-        inputs = ['image']
+        inputs = ["image"]
 
         if config.masked_training:
-            inputs.append('latent_mask')
+            inputs.append("latent_mask")
 
-        random_flip = RandomFlip(names=inputs, enabled_in_name='concept.image.enable_random_flip', fixed_enabled_in_name='concept.image.enable_fixed_flip')
-        random_rotate = RandomRotate(names=inputs, enabled_in_name='concept.image.enable_random_rotate', fixed_enabled_in_name='concept.image.enable_fixed_rotate', max_angle_in_name='concept.image.random_rotate_max_angle')
-        random_brightness = RandomBrightness(names=['image'], enabled_in_name='concept.image.enable_random_brightness', fixed_enabled_in_name='concept.image.enable_fixed_brightness', max_strength_in_name='concept.image.random_brightness_max_strength')
-        random_contrast = RandomContrast(names=['image'], enabled_in_name='concept.image.enable_random_contrast', fixed_enabled_in_name='concept.image.enable_fixed_contrast', max_strength_in_name='concept.image.random_contrast_max_strength')
-        random_saturation = RandomSaturation(names=['image'], enabled_in_name='concept.image.enable_random_saturation', fixed_enabled_in_name='concept.image.enable_fixed_saturation', max_strength_in_name='concept.image.random_saturation_max_strength')
-        random_hue = RandomHue(names=['image'], enabled_in_name='concept.image.enable_random_hue', fixed_enabled_in_name='concept.image.enable_fixed_hue', max_strength_in_name='concept.image.random_hue_max_strength')
+        random_flip = RandomFlip(
+            names=inputs,
+            enabled_in_name="concept.image.enable_random_flip",
+            fixed_enabled_in_name="concept.image.enable_fixed_flip",
+        )
+        random_rotate = RandomRotate(
+            names=inputs,
+            enabled_in_name="concept.image.enable_random_rotate",
+            fixed_enabled_in_name="concept.image.enable_fixed_rotate",
+            max_angle_in_name="concept.image.random_rotate_max_angle",
+        )
+        random_brightness = RandomBrightness(
+            names=["image"],
+            enabled_in_name="concept.image.enable_random_brightness",
+            fixed_enabled_in_name="concept.image.enable_fixed_brightness",
+            max_strength_in_name="concept.image.random_brightness_max_strength",
+        )
+        random_contrast = RandomContrast(
+            names=["image"],
+            enabled_in_name="concept.image.enable_random_contrast",
+            fixed_enabled_in_name="concept.image.enable_fixed_contrast",
+            max_strength_in_name="concept.image.random_contrast_max_strength",
+        )
+        random_saturation = RandomSaturation(
+            names=["image"],
+            enabled_in_name="concept.image.enable_random_saturation",
+            fixed_enabled_in_name="concept.image.enable_fixed_saturation",
+            max_strength_in_name="concept.image.random_saturation_max_strength",
+        )
+        random_hue = RandomHue(
+            names=["image"],
+            enabled_in_name="concept.image.enable_random_hue",
+            fixed_enabled_in_name="concept.image.enable_fixed_hue",
+            max_strength_in_name="concept.image.random_hue_max_strength",
+        )
 
         modules = [
             random_flip,
@@ -215,21 +280,21 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         return modules
 
     def __preparation_modules(self, config: TrainConfig, model: StableDiffusionModel):
-        image = EncodeVAE(in_name='image', out_name='latent_image_distribution', vae=model.vae)
+        image = EncodeVAE(in_name="image", out_name="latent_image_distribution", vae=model.vae)
 
         modules = [image]
 
         return modules
 
     def __cache_modules(self, config: TrainConfig, model: StableDiffusionModel):
-        split_names = ['image', 'latent_image_distribution']
+        split_names = ["image", "latent_image_distribution"]
 
         if config.masked_training:
-            split_names.append('latent_mask')
+            split_names.append("latent_mask")
 
-        aggregate_names = ['crop_resolution', 'image_path']
+        aggregate_names = ["crop_resolution", "image_path"]
 
-        sort_names = ['concept']
+        sort_names = ["concept"]
 
         # Cache AspectBucketing's rebalancing tags exactly like crop_resolution
         # (cache-only aggregates). In the non-cached path there is no reordering
@@ -240,10 +305,30 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         def before_cache_fun():
             self._setup_cache_device(model, self.train_device, self.temp_device, config)
 
-        disk_cache = DiskCache(cache_dir=config.cache_dir, split_names=split_names, aggregate_names=aggregate_names, variations_in_name='concept.image_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                               variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_fun, cache_label='vae latents')
-        variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'],
-                               group_enabled_in_name='concept.enabled')
+        disk_cache = DiskCache(
+            cache_dir=config.cache_dir,
+            split_names=split_names,
+            aggregate_names=aggregate_names,
+            variations_in_name="concept.image_variations",
+            balancing_in_name="concept.balancing",
+            balancing_strategy_in_name="concept.balancing_strategy",
+            variations_group_in_name=[
+                "concept.path",
+                "concept.seed",
+                "concept.include_subdirectories",
+                "concept.image",
+            ],
+            group_enabled_in_name="concept.enabled",
+            before_cache_fun=before_cache_fun,
+            cache_label="vae latents",
+        )
+        variation_sorting = VariationSorting(
+            names=sort_names,
+            balancing_in_name="concept.balancing",
+            balancing_strategy_in_name="concept.balancing_strategy",
+            variations_group_in_name=["concept.path", "concept.seed", "concept.include_subdirectories", "concept.text"],
+            group_enabled_in_name="concept.enabled",
+        )
 
         modules = []
 
@@ -254,29 +339,41 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         return modules
 
     def __output_modules(self, config: TrainConfig):
-        output_names = ['image', 'latent_image', 'image_path']
+        output_names = ["image", "latent_image", "image_path"]
 
         if config.masked_training:
-            output_names.append('latent_mask')
+            output_names.append("latent_mask")
 
-        sort_names = output_names + ['concept']
-        output_names = output_names + [('concept.loss_weight', 'loss_weight')]
-        output_names = output_names + [('concept.type', 'concept_type')]
+        sort_names = output_names + ["concept"]
+        output_names = output_names + [("concept.loss_weight", "loss_weight")]
+        output_names = output_names + [("concept.type", "concept_type")]
 
         # add for calculating loss per concept
         if config.validation:
-            output_names.append(('concept.name', 'concept_name'))
-            output_names.append(('concept.path', 'concept_path'))
-            output_names.append(('concept.seed', 'concept_seed'))
+            output_names.append(("concept.name", "concept_name"))
+            output_names.append(("concept.path", "concept_path"))
+            output_names.append(("concept.seed", "concept_seed"))
 
-        image_sample = SampleVAEDistribution(in_name='latent_image_distribution', out_name='latent_image', mode='mean')
+        image_sample = SampleVAEDistribution(in_name="latent_image_distribution", out_name="latent_image", mode="mean")
 
         keep_in_name = BUCKET_KEEP_NAME if config.aspect_ratio_bucketing else None
         repeat_in_name = BUCKET_REPEAT_NAME if config.aspect_ratio_bucketing else None
         if config.latent_caching:
-            batch_sorting = AspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size, keep_in_name=keep_in_name, repeat_in_name=repeat_in_name)
+            batch_sorting = AspectBatchSorting(
+                resolution_in_name="crop_resolution",
+                names=sort_names,
+                batch_size=config.batch_size,
+                keep_in_name=keep_in_name,
+                repeat_in_name=repeat_in_name,
+            )
         else:
-            batch_sorting = InlineAspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size, keep_in_name=keep_in_name, repeat_in_name=repeat_in_name)
+            batch_sorting = InlineAspectBatchSorting(
+                resolution_in_name="crop_resolution",
+                names=sort_names,
+                batch_size=config.batch_size,
+                keep_in_name=keep_in_name,
+                repeat_in_name=repeat_in_name,
+            )
 
         output = OutputPipelineModule(names=output_names)
 
@@ -294,11 +391,25 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         def before_save_fun():
             model.vae_to(self.train_device)
 
-        decode_image = DecodeVAE(in_name='latent_image', out_name='decoded_image', vae=model.vae)
-        upscale_mask = ScaleImage(in_name='latent_mask', out_name='decoded_mask', factor=8)
+        decode_image = DecodeVAE(in_name="latent_image", out_name="decoded_image", vae=model.vae)
+        upscale_mask = ScaleImage(in_name="latent_mask", out_name="decoded_mask", factor=8)
 
-        save_image = SaveImage(image_in_name='decoded_image', original_path_in_name='image_path', path=debug_dir, in_range_min=-1, in_range_max=1, before_save_fun=before_save_fun)
-        save_mask = SaveImage(image_in_name='latent_mask', original_path_in_name='image_path', path=debug_dir, in_range_min=0, in_range_max=1, before_save_fun=before_save_fun)
+        save_image = SaveImage(
+            image_in_name="decoded_image",
+            original_path_in_name="image_path",
+            path=debug_dir,
+            in_range_min=-1,
+            in_range_max=1,
+            before_save_fun=before_save_fun,
+        )
+        save_mask = SaveImage(
+            image_in_name="latent_mask",
+            original_path_in_name="image_path",
+            path=debug_dir,
+            in_range_min=0,
+            in_range_max=1,
+            before_save_fun=before_save_fun,
+        )
 
         modules = [decode_image, save_image]
 
@@ -308,15 +419,16 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         return modules
 
     def _create_dataset(
-            self,
-            config: TrainConfig,
-            model: StableDiffusionModel,
-            model_setup: BaseModelSetup,
-            train_progress: TrainProgress,
-            is_validation: bool = False,
+        self,
+        config: TrainConfig,
+        model: StableDiffusionModel,
+        model_setup: BaseModelSetup,
+        train_progress: TrainProgress,
+        is_validation: bool = False,
     ):
         enumerate_input = self.__enumerate_input_modules(config)
         bucket_rebalance = self.__bucket_rebalance_modules(config)
+        derive_paths = self.__derive_path_modules(config)
         load_input = self.__load_input_modules(config)
         mask_augmentation = self.__mask_augmentation_modules(config)
         aspect_bucketing_in = self.__aspect_bucketing_in(config)
@@ -333,6 +445,7 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             [
                 enumerate_input,
                 bucket_rebalance,
+                derive_paths,
                 load_input,
                 mask_augmentation,
                 aspect_bucketing_in,
@@ -341,18 +454,49 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
                 preparation_modules,
                 cache_modules,
                 output_modules,
-
                 debug_modules if config.debug_mode else None,
             ],
             train_progress,
             is_validation,
         )
 
-factory.register(BaseDataLoader, StableDiffusionFineTuneVaeDataLoader, ModelType.STABLE_DIFFUSION_15, TrainingMethod.FINE_TUNE_VAE)
-factory.register(BaseDataLoader, StableDiffusionFineTuneVaeDataLoader, ModelType.STABLE_DIFFUSION_15_INPAINTING, TrainingMethod.FINE_TUNE_VAE)
-factory.register(BaseDataLoader, StableDiffusionFineTuneVaeDataLoader, ModelType.STABLE_DIFFUSION_20, TrainingMethod.FINE_TUNE_VAE)
-factory.register(BaseDataLoader, StableDiffusionFineTuneVaeDataLoader, ModelType.STABLE_DIFFUSION_20_BASE, TrainingMethod.FINE_TUNE_VAE)
-factory.register(BaseDataLoader, StableDiffusionFineTuneVaeDataLoader, ModelType.STABLE_DIFFUSION_20_INPAINTING, TrainingMethod.FINE_TUNE_VAE)
-factory.register(BaseDataLoader, StableDiffusionFineTuneVaeDataLoader, ModelType.STABLE_DIFFUSION_20_DEPTH, TrainingMethod.FINE_TUNE_VAE)
-factory.register(BaseDataLoader, StableDiffusionFineTuneVaeDataLoader, ModelType.STABLE_DIFFUSION_21, TrainingMethod.FINE_TUNE_VAE)
-factory.register(BaseDataLoader, StableDiffusionFineTuneVaeDataLoader, ModelType.STABLE_DIFFUSION_21_BASE, TrainingMethod.FINE_TUNE_VAE)
+
+factory.register(
+    BaseDataLoader, StableDiffusionFineTuneVaeDataLoader, ModelType.STABLE_DIFFUSION_15, TrainingMethod.FINE_TUNE_VAE
+)
+factory.register(
+    BaseDataLoader,
+    StableDiffusionFineTuneVaeDataLoader,
+    ModelType.STABLE_DIFFUSION_15_INPAINTING,
+    TrainingMethod.FINE_TUNE_VAE,
+)
+factory.register(
+    BaseDataLoader, StableDiffusionFineTuneVaeDataLoader, ModelType.STABLE_DIFFUSION_20, TrainingMethod.FINE_TUNE_VAE
+)
+factory.register(
+    BaseDataLoader,
+    StableDiffusionFineTuneVaeDataLoader,
+    ModelType.STABLE_DIFFUSION_20_BASE,
+    TrainingMethod.FINE_TUNE_VAE,
+)
+factory.register(
+    BaseDataLoader,
+    StableDiffusionFineTuneVaeDataLoader,
+    ModelType.STABLE_DIFFUSION_20_INPAINTING,
+    TrainingMethod.FINE_TUNE_VAE,
+)
+factory.register(
+    BaseDataLoader,
+    StableDiffusionFineTuneVaeDataLoader,
+    ModelType.STABLE_DIFFUSION_20_DEPTH,
+    TrainingMethod.FINE_TUNE_VAE,
+)
+factory.register(
+    BaseDataLoader, StableDiffusionFineTuneVaeDataLoader, ModelType.STABLE_DIFFUSION_21, TrainingMethod.FINE_TUNE_VAE
+)
+factory.register(
+    BaseDataLoader,
+    StableDiffusionFineTuneVaeDataLoader,
+    ModelType.STABLE_DIFFUSION_21_BASE,
+    TrainingMethod.FINE_TUNE_VAE,
+)

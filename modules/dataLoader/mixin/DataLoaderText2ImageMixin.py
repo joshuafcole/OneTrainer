@@ -135,19 +135,33 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             exclude_postfix=["-masklabel", "-condlabel"],
         )
 
-        mask_path = ModifyPath(in_name="image_path", out_name="mask_path", postfix="-masklabel", extension=".png")
-        cond_path = ModifyPath(in_name="image_path", out_name="cond_path", postfix="-condlabel", extension=".png")
+        # The per-image derived paths (sample_prompt_path / mask_path / cond_path) are
+        # intentionally NOT built here. AspectBucketRebalance (borrow-copy) mints
+        # duplicate rows *after* this stage and only remaps image_path/concept, so a
+        # path derived from image_path before the rebalance keeps the pre-copy row
+        # count and IndexErrors the moment a minted copy row is served. They are built
+        # in _derive_path_modules() and inserted after the rebalance instead.
+        return [download_datasets, collect_paths]
+
+    def _derive_path_modules(self, config: TrainConfig) -> list:
+        """Per-image sibling paths derived from ``image_path`` (prompt .txt, mask, cond).
+
+        Placed *after* AspectBucketRebalance so they derive from the post-rebalance
+        ``image_path`` -- covering the minted borrow-copy rows, each of which resolves
+        to its source image's sibling paths. Building them here (rather than in
+        _enumerate_input_modules) is exactly what keeps a duplicated row from indexing
+        past a pre-rebalance derivation."""
         sample_prompt_path = ModifyPath(
             in_name="image_path", out_name="sample_prompt_path", postfix="", extension=".txt"
         )
+        mask_path = ModifyPath(in_name="image_path", out_name="mask_path", postfix="-masklabel", extension=".png")
+        cond_path = ModifyPath(in_name="image_path", out_name="cond_path", postfix="-condlabel", extension=".png")
 
-        modules = [download_datasets, collect_paths, sample_prompt_path]
-
+        modules = [sample_prompt_path]
         if config.masked_training:
             modules.append(mask_path)
         if config.custom_conditioning_image:
             modules.append(cond_path)
-
         return modules
 
     def _load_input_modules(
@@ -707,6 +721,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     ):
         enumerate_input = self._enumerate_input_modules(config, allow_videos=allow_video_files)
         bucket_rebalance = self._bucket_rebalance_modules(config, aspect_bucketing_quantization)
+        # Derived sibling paths must follow the rebalance so they cover its minted
+        # borrow-copy rows (see _derive_path_modules).
+        derive_paths = self._derive_path_modules(config)
         load_input = self._load_input_modules(config, model.train_dtype, vae_frame_dim=vae_frame_dim)
         mask_augmentation = self._mask_augmentation_modules(config)
         aspect_bucketing_in = self._aspect_bucketing_in(config, aspect_bucketing_quantization, frame_dim_enabled)
@@ -725,6 +742,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             [
                 enumerate_input,
                 bucket_rebalance,
+                derive_paths,
                 load_input,
                 mask_augmentation,
                 aspect_bucketing_in,
