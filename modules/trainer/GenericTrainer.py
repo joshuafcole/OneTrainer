@@ -233,6 +233,34 @@ class GenericTrainer(BaseTrainer):
         if self.config.sample_on_train_end and multi.is_master() and progress_key not in self.sampled_train_progresses:
             self.__sample_during_training(train_progress, self.train_device, distribute=False)
 
+    def __emit_scheduled_for_empty_epoch(self, train_progress: TrainProgress, train_device: torch.device):
+        """Honor the periodic sample/save schedule for an epoch that produced no step.
+
+        The per-batch loop owns the periodic sample/save checks (they fire at the
+        first step of a boundary epoch), so an epoch that yields zero training steps
+        -- e.g. a sparse aspect bucket starved by drop-last -- would skip its
+        scheduled sample/save entirely, dropping that column from the monitor. The
+        schedule predicates already require ``epoch_step == 0``, so this is a no-op
+        for any epoch that ran at least one step; it only fills the gap for a starved
+        boundary epoch. Deduped against an in-loop emit at this same progress via the
+        §177 tracking sets, so a normal epoch never double-emits."""
+        progress_key = self.__progress_key(train_progress)
+
+        if self.__needs_sample(train_progress) and progress_key not in self.sampled_train_progresses:
+            self.__enqueue_sample_during_training(
+                lambda: self.__sample_during_training(train_progress, train_device)
+            )
+            self.__execute_sample_during_training()
+
+        if (
+            multi.is_master()
+            and self.__needs_save(train_progress)
+            and progress_key not in self.saved_train_progresses
+        ):
+            self.model.to(self.temp_device)
+            self.__save(train_progress, True, print)
+            self.model_setup.setup_train_device(self.model, self.config)
+
     def __sample_loop(
         self,
         train_progress: TrainProgress,
@@ -910,6 +938,11 @@ class GenericTrainer(BaseTrainer):
                 if self.commands.get_stop_command():
                     self.__mark_clean_train_exit()
                     return
+
+            # If this epoch produced no training step (a starved bucket), the in-loop
+            # periodic sample/save never ran; honor the schedule on the epoch boundary
+            # so the cadence holds. No-op for any epoch that ran a step.
+            self.__emit_scheduled_for_empty_epoch(train_progress, train_device)
 
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
