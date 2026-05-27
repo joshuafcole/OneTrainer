@@ -50,7 +50,7 @@ from mgds.pipelineModules.SelectRandomText import SelectRandomText
 from mgds.pipelineModules.ShuffleTags import ShuffleTags
 from mgds.pipelineModules.SingleAspectCalculation import SingleAspectCalculation
 from mgds.pipelineModules.VariationSorting import VariationSorting
-from mgds.util.bucketRebalancing import BORROW, BORROW_COPY, BORROW_MOVE, DONATE, REPEAT, BucketTier
+from mgds.util.bucketRebalancing import BORROW, BORROW_COPY, BORROW_MOVE, BucketTier
 
 import torch
 
@@ -72,21 +72,6 @@ def has_copy_tier(tiers: list[BucketTier]) -> bool:
     row-duplication planner (AspectBucketRebalance). Other strategies stay inline
     in AspectBucketing."""
     return any(tier.strategy == BORROW and tier.mode == BORROW_COPY for tier in tiers)
-
-
-def wants_bucket_fill(tiers: list[BucketTier]) -> bool:
-    """True when any tier asks to *save* a sparse rung (donate / borrow / repeat)
-    rather than drop or keep it.
-
-    Such a config wants small buckets to keep training, so the batch sorter pads each
-    realized partial batch up to batch_size instead of drop-lasting it. This is the
-    load-bearing fix for SAMPLES balancing: the rebalance plan is computed once at
-    setup over the full path-stage population, but SAMPLES balancing then feeds the
-    sorter a different random subset every epoch, so the plan's per-bucket batch
-    alignment no longer holds and drop-last silently discards most of the epoch.
-    Filling on the realized population restores a stable batch count per epoch. A pure
-    drop/keep config keeps upstream drop-last untouched."""
-    return any(tier.strategy in (DONATE, BORROW, REPEAT) for tier in tiers)
 
 
 def parse_bucket_tiers(tier_dicts: list[dict[str, str]] | None) -> list[BucketTier]:
@@ -566,12 +551,11 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         # bucketing is on; None preserves upstream behavior otherwise.
         keep_in_name = BUCKET_KEEP_NAME if config.aspect_ratio_bucketing else None
         repeat_in_name = BUCKET_REPEAT_NAME if config.aspect_ratio_bucketing else None
-        # When the user configured save-the-bucket tiers, pad realized partial batches
-        # instead of drop-lasting them, so the fill survives SAMPLES balancing's
-        # per-epoch resampling (see wants_bucket_fill).
-        fill_partial_buckets = config.aspect_ratio_bucketing and wants_bucket_fill(
-            parse_bucket_tiers(config.aspect_ratio_bucket_min_tiers)
-        )
+        # NOTE (178.3a): the fill_partial_buckets hack is gone -- the batch sorter now
+        # does bucket-aware whole-batch selection and never leaves a sub-batch bucket.
+        # Bucket-aware SAMPLES selection (group_in_name / budget_in_name, fed by the
+        # full-population change in DiskCache / VariationSorting) is wired in a
+        # follow-up; until then SAMPLES falls back to plain per-bucket drop-last.
         if config.latent_caching:
             batch_sorting = AspectBatchSorting(
                 resolution_in_name="crop_resolution",
@@ -579,7 +563,6 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 batch_size=config.batch_size * world_size,
                 keep_in_name=keep_in_name,
                 repeat_in_name=repeat_in_name,
-                fill_partial_buckets=fill_partial_buckets,
             )
             distributed_sampler = DistributedSampler(names=sort_names, world_size=world_size, rank=multi.rank())
         else:
@@ -589,7 +572,6 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 batch_size=config.batch_size * world_size,
                 keep_in_name=keep_in_name,
                 repeat_in_name=repeat_in_name,
-                fill_partial_buckets=fill_partial_buckets,
             )
             distributed_sampler = InlineDistributedSampler(names=sort_names, world_size=world_size, rank=multi.rank())
 
