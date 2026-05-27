@@ -61,6 +61,12 @@ from diffusers import AutoencoderKL
 # carried by VariationSorting, so they reach the batch sorter in both modes.
 BUCKET_KEEP_NAME = "bucket_keep"
 BUCKET_REPEAT_NAME = "bucket_repeat"
+# Per-item balancing-group id + sample budget emitted by VariationSorting and read
+# by the batch sorter for bucket-aware whole-batch SAMPLES selection (budget -1 ==
+# take all whole batches). VariationSorting now passes SAMPLES groups' full
+# population downstream; the sorter does the budgeted draw.
+BUCKET_GROUP_NAME = "bucket_group"
+BUCKET_BUDGET_NAME = "bucket_budget"
 # Per-row aspect override emitted by AspectBucketRebalance (borrow-copy mode) and
 # consumed by AspectBucketing. Unlike keep/repeat it is read mid-pipeline (before
 # the crop), so it is neither cached nor carried to the sorter.
@@ -551,11 +557,12 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         # bucketing is on; None preserves upstream behavior otherwise.
         keep_in_name = BUCKET_KEEP_NAME if config.aspect_ratio_bucketing else None
         repeat_in_name = BUCKET_REPEAT_NAME if config.aspect_ratio_bucketing else None
-        # NOTE (178.3a): the fill_partial_buckets hack is gone -- the batch sorter now
-        # does bucket-aware whole-batch selection and never leaves a sub-batch bucket.
-        # Bucket-aware SAMPLES selection (group_in_name / budget_in_name, fed by the
-        # full-population change in DiskCache / VariationSorting) is wired in a
-        # follow-up; until then SAMPLES falls back to plain per-bucket drop-last.
+        # Bucket-aware whole-batch selection (178.3a): VariationSorting emits a
+        # balancing-group id + sample budget; the sorter draws whole batches per
+        # bucket so no sub-batch bucket is silently dropped and the per-epoch count
+        # is stable. Replaces fill_partial_buckets. None => plain drop-last.
+        group_in_name = BUCKET_GROUP_NAME if config.aspect_ratio_bucketing else None
+        budget_in_name = BUCKET_BUDGET_NAME if config.aspect_ratio_bucketing else None
         if config.latent_caching:
             batch_sorting = AspectBatchSorting(
                 resolution_in_name="crop_resolution",
@@ -563,6 +570,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 batch_size=config.batch_size * world_size,
                 keep_in_name=keep_in_name,
                 repeat_in_name=repeat_in_name,
+                group_in_name=group_in_name,
+                budget_in_name=budget_in_name,
             )
             distributed_sampler = DistributedSampler(names=sort_names, world_size=world_size, rank=multi.rank())
         else:
@@ -572,6 +581,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 batch_size=config.batch_size * world_size,
                 keep_in_name=keep_in_name,
                 repeat_in_name=repeat_in_name,
+                group_in_name=group_in_name,
+                budget_in_name=budget_in_name,
             )
             distributed_sampler = InlineDistributedSampler(names=sort_names, world_size=world_size, rank=multi.rank())
 
@@ -682,6 +693,10 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                     "concept.text",
                 ],
                 group_enabled_in_name="concept.enabled",
+                # emit the balancing-group id + sample budget the batch sorter uses
+                # for bucket-aware whole-batch SAMPLES selection (178.3a)
+                group_out_name=BUCKET_GROUP_NAME if config.aspect_ratio_bucketing else None,
+                budget_out_name=BUCKET_BUDGET_NAME if config.aspect_ratio_bucketing else None,
             )
 
             modules.append(variation_sorting)
