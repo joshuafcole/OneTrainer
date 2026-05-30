@@ -7,6 +7,7 @@ from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 from modules.util.optimizer_util import init_model_parameters
+from modules.util.ti_debug import ti_debug_enabled, ti_log, ti_should_log
 from modules.util.TrainProgress import TrainProgress
 
 import torch
@@ -115,6 +116,19 @@ class AnimaEmbeddingSetup(
         self.__setup_requires_grad(model, config)
         init_model_parameters(model, params, self.train_device)
 
+        # Snapshot the seed vectors so after_optimizer_step can report
+        # cumulative drift (how far each trained vector has moved from where it
+        # started) — the signal that distinguishes "no gradient" from "gradient
+        # but pinned by norm-preservation / optimizer".
+        self._ti_debug_seed_vectors = []
+        if ti_debug_enabled(config):
+            with torch.no_grad():
+                for emb in model.all_text_encoder_embeddings():
+                    v = getattr(emb, "vector", None)
+                    self._ti_debug_seed_vectors.append(
+                        v.detach().float().clone() if v is not None else None
+                    )
+
     def setup_train_device(
         self,
         model: AnimaModel,
@@ -144,6 +158,37 @@ class AnimaEmbeddingSetup(
         config: TrainConfig,
         train_progress: TrainProgress,
     ):
+        # Probe BEFORE normalization: read each trained vector's grad norm and
+        # its drift from the seed. Grad≈0 → no signal reaching the vector
+        # (data-flow break — cross-check the [TI-DEBUG] token counts). Grad>0
+        # but drift≈0 → signal present but the step is being undone (norm
+        # preservation pinning, or optimizer not applying it).
+        if ti_debug_enabled(config) and ti_should_log(train_progress.global_step):
+            step = train_progress.global_step
+            seeds = getattr(self, "_ti_debug_seed_vectors", [])
+            with torch.no_grad():
+                for i, emb in enumerate(model.all_text_encoder_embeddings()):
+                    v = getattr(emb, "vector", None)
+                    if v is None:
+                        ti_log(f"step={step} emb[{i}]: vector is None")
+                        continue
+                    g = v.grad
+                    grad_norm = float(g.detach().float().norm()) if g is not None else None
+                    cur = v.detach().float()
+                    cur_norm = float(cur.norm())
+                    seed = seeds[i] if i < len(seeds) else None
+                    drift = float((cur - seed).norm()) if seed is not None else None
+                    ti_log(
+                        f"step={step} emb[{i}] requires_grad={v.requires_grad} "
+                        f"grad_norm={grad_norm} vec_norm={cur_norm:.5f} "
+                        f"drift_from_seed={drift}"
+                    )
+                    if grad_norm is None:
+                        ti_log(
+                            f"step={step} emb[{i}]: *** grad is None *** "
+                            f"(optimizer saw no gradient — vector cannot move)"
+                        )
+
         if config.preserve_embedding_norm:
             self._normalize_output_embeddings(model.all_text_encoder_embeddings())
             if model.embedding_wrapper is not None:

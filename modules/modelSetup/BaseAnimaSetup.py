@@ -36,6 +36,7 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dtype_util import create_autocast_context
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
+from modules.util.ti_debug import ti_debug_enabled, ti_log, ti_should_log
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
@@ -319,6 +320,9 @@ class BaseAnimaSetup(
                 text_encoder_sequence_length=config.text_encoder_sequence_length,
             )
 
+            if ti_debug_enabled(config) and ti_should_log(train_progress.global_step):
+                self._ti_debug_batch_tokens(model, batch, config, train_progress)
+
             # ---- latents ---------------------------------------------------
             # vae_frame_dim=True in the dataloader gives us 5D
             # (B, C, T=1, H_lat, W_lat); defend against 4D in case a future
@@ -406,6 +410,96 @@ class BaseAnimaSetup(
                     self._save_latent("6-image", scaled_latent_image, config, train_progress)
 
         return model_output_data
+
+    def _ti_debug_batch_tokens(
+        self,
+        model: AnimaModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+    ) -> None:
+        """Answer the decisive data-flow question: does the trigger token id
+        actually appear in the batch the train step consumes?
+
+        Added-embedding rows are spliced at the end of the embedding table, so
+        any token id ``>= original_token_count`` is a trained vector. If those
+        ids never show up in ``tokens_qwen`` the trigger isn't reaching the
+        model and no gradient can flow — the embedding stays frozen no matter
+        the LR. We also decode the first sample's caption so a blanked/missing
+        caption (LoadText returning '' or DropTags stripping the trigger) is
+        visible at the same place.
+        """
+        import torch
+
+        step = train_progress.global_step
+
+        def _report(side: str, tokens, wrapper, tokenizer):
+            if tokens is None:
+                ti_log(f"step={step} {side}: tokens MISSING from batch")
+                return
+            if wrapper is None:
+                # Expected for T5 when train_t5_embedding is off.
+                cutoff = None
+            else:
+                cutoff = getattr(wrapper, "original_token_count", None)
+            t = tokens
+            if not isinstance(t, torch.Tensor):
+                ti_log(f"step={step} {side}: tokens not a tensor ({type(t).__name__})")
+                return
+            if t.ndim == 1:
+                t = t.unsqueeze(0)
+            bsz = t.shape[0]
+            if cutoff is None:
+                ti_log(
+                    f"step={step} {side}: shape={tuple(t.shape)} bsz={bsz} "
+                    f"(no wrapper — cannot count trigger ids; max_id={int(t.max())})"
+                )
+                return
+            per_sample = (t >= cutoff).sum(dim=1).tolist()
+            total = int(sum(per_sample))
+            ti_log(
+                f"step={step} {side}: shape={tuple(t.shape)} cutoff={cutoff} "
+                f"trigger_token_hits_per_sample={per_sample} total={total} "
+                f"max_id={int(t.max())}"
+            )
+            if total == 0:
+                ti_log(
+                    f"step={step} {side}: *** NO TRIGGER TOKEN IN BATCH *** "
+                    f"trained vector receives no gradient this step"
+                )
+
+        _report(
+            "qwen",
+            batch.get("tokens_qwen"),
+            getattr(model, "embedding_wrapper", None),
+            getattr(model, "tokenizer", None),
+        )
+        _report(
+            "t5",
+            batch.get("tokens_t5"),
+            getattr(model, "t5_embedding_wrapper", None),
+            getattr(model, "t5_tokenizer", None),
+        )
+
+        # Decode the first sample's qwen caption so a blanked/missing caption is
+        # caught here too. Skip-special so the trigger (a real added token) stays
+        # visible while padding drops out.
+        try:
+            qwen = batch.get("tokens_qwen")
+            tok = getattr(model, "tokenizer", None)
+            if qwen is not None and tok is not None:
+                first = qwen[0] if qwen.ndim > 1 else qwen
+                text = tok.decode(first.tolist(), skip_special_tokens=True)
+                ti_log(f"step={step} qwen sample[0] decoded='{text[:200]}'")
+        except Exception as exc:  # noqa: BLE001 — diagnostics must never crash the run
+            ti_log(f"step={step} decode failed: {exc!r}")
+
+        ti_log(
+            f"step={step} flags: train_text_encoder_or_embedding="
+            f"{config.train_text_encoder_or_embedding()} "
+            f"train_t5_embedding={getattr(config, 'train_t5_embedding', None)} "
+            f"preserve_embedding_norm={getattr(config, 'preserve_embedding_norm', None)}"
+        )
 
     def calculate_loss(
         self,
