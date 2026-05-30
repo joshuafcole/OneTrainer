@@ -121,6 +121,13 @@ class AnimaEmbeddingSetup(
         # started) — the signal that distinguishes "no gradient" from "gradient
         # but pinned by norm-preservation / optimizer".
         self._ti_debug_seed_vectors = []
+        # The trainer nulls .grad (zero_grad(set_to_none=True)) at GenericTrainer
+        # line 890 — BEFORE after_optimizer_step runs at line 920 — so reading
+        # v.grad in the probe always sees None even when training is healthy.
+        # Capture the live grad norm right after backward populates it, via a
+        # post-accumulate-grad hook (same mechanism the fused path uses), keyed
+        # by tensor identity so the probe can report the true value.
+        self._ti_debug_last_grad_norm = {}
         if ti_debug_enabled(config):
             with torch.no_grad():
                 for emb in model.all_text_encoder_embeddings():
@@ -128,6 +135,14 @@ class AnimaEmbeddingSetup(
                     self._ti_debug_seed_vectors.append(
                         v.detach().float().clone() if v is not None else None
                     )
+                    if v is not None and v.requires_grad:
+                        store = self._ti_debug_last_grad_norm
+
+                        def _capture_grad(t, store=store):
+                            if t.grad is not None:
+                                store[id(t)] = float(t.grad.detach().float().norm())
+
+                        v.register_post_accumulate_grad_hook(_capture_grad)
 
     def setup_train_device(
         self,
@@ -163,17 +178,21 @@ class AnimaEmbeddingSetup(
         # (data-flow break — cross-check the [TI-DEBUG] token counts). Grad>0
         # but drift≈0 → signal present but the step is being undone (norm
         # preservation pinning, or optimizer not applying it).
+        #
+        # grad_norm comes from the post-accumulate-grad hook stash, NOT v.grad:
+        # the trainer already nulled v.grad in zero_grad(set_to_none=True) before
+        # this hook runs, so reading v.grad here would falsely report None.
         if ti_debug_enabled(config) and ti_should_log(train_progress.global_step):
             step = train_progress.global_step
             seeds = getattr(self, "_ti_debug_seed_vectors", [])
+            grad_norms = getattr(self, "_ti_debug_last_grad_norm", {})
             with torch.no_grad():
                 for i, emb in enumerate(model.all_text_encoder_embeddings()):
                     v = getattr(emb, "vector", None)
                     if v is None:
                         ti_log(f"step={step} emb[{i}]: vector is None")
                         continue
-                    g = v.grad
-                    grad_norm = float(g.detach().float().norm()) if g is not None else None
+                    grad_norm = grad_norms.get(id(v))
                     cur = v.detach().float()
                     cur_norm = float(cur.norm())
                     seed = seeds[i] if i < len(seeds) else None
@@ -185,8 +204,9 @@ class AnimaEmbeddingSetup(
                     )
                     if grad_norm is None:
                         ti_log(
-                            f"step={step} emb[{i}]: *** grad is None *** "
-                            f"(optimizer saw no gradient — vector cannot move)"
+                            f"step={step} emb[{i}]: *** no grad captured *** "
+                            f"(post-accumulate-grad hook never fired — the vector "
+                            f"received no gradient and cannot move)"
                         )
 
         if config.preserve_embedding_norm:
