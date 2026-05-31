@@ -312,6 +312,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             keep_out_name=None if consumer_mode else BUCKET_KEEP_NAME,
             repeat_out_name=None if consumer_mode else BUCKET_REPEAT_NAME,
             override_aspect_in_name=BUCKET_OVERRIDE_NAME if consumer_mode else None,
+            resolution_mode=config.aspect_ratio_bucket_resolution_mode,
         )
 
         single_aspect_calculation = SingleAspectCalculation(

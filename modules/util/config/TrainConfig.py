@@ -393,6 +393,12 @@ class TrainConfig(BaseConfig):
     # "mode" (move|copy, borrow only). Dict-of-str to satisfy ConfigList, like
     # scheduler_params. Empty => upstream behavior (sparse buckets are dropped).
     aspect_ratio_bucket_min_tiers: list[dict[str, str]]
+    # Multi-resolution budget selection. "split" (default): each image picks one
+    # resolution at random per epoch, scattering an aspect rung across budgets (small
+    # datasets fragment into sub-batch buckets that get dropped). "rotate": the whole
+    # epoch trains at one resolution, rotating across the run -> no within-epoch
+    # fragmentation, constant/predictable steps/epoch, multi-scale coverage.
+    aspect_ratio_bucket_resolution_mode: str
     latent_caching: bool
     clear_cache_before_training: bool
 
@@ -1000,6 +1006,7 @@ class TrainConfig(BaseConfig):
         data.append(("aspect_ratio_bucketing", True, bool, False))
         data.append(("aspect_ratio_bucket_tolerance", 0.0, float, False))
         data.append(("aspect_ratio_bucket_min_tiers", [], list[dict[str, str]], True))
+        data.append(("aspect_ratio_bucket_resolution_mode", "split", str, False))
         data.append(("latent_caching", True, bool, False))
         data.append(("clear_cache_before_training", True, bool, False))
 
