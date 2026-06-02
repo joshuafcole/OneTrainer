@@ -84,6 +84,14 @@ def _convert_one(key: str) -> str:
     downstream metadata keys (which we don't usually have) still
     survive.
     """
+    # 0. bundled TI embeddings ride along in the same file under
+    # ``bundle_emb.<placeholder>.<qwen|qwen_out|t5>``. They are NOT transformer
+    # weights; ComfyUI looks for them under that exact prefix, so pass them
+    # through untouched. The component handling below would otherwise bury them
+    # under ``diffusion_model.`` and the embedding would silently never load.
+    if key.startswith("bundle_emb."):
+        return key
+
     # 1. strip the diffusers-component prefix
     if key.startswith("transformer."):
         body = key.removeprefix("transformer.")
