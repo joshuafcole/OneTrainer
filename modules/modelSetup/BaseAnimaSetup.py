@@ -40,6 +40,8 @@ from modules.util.ti_debug import ti_debug_enabled, ti_log, ti_should_log
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
+from mgds.perf_probe import perf
+
 import torch
 from torch import Tensor
 
@@ -305,6 +307,7 @@ class BaseAnimaSetup(
             # embedding wrapper) so gradients reach the trainable token
             # vectors. encoder_hidden_states is the (B, T_t5, 1024) tensor
             # the Cosmos cross-attention consumes.
+            perf.tic("text_encode")
             encoder_hidden_states = model.encode_text(
                 train_device=self.train_device,
                 batch_size=batch["latent_image"].shape[0],
@@ -319,6 +322,7 @@ class BaseAnimaSetup(
                 text_encoder_dropout_probability=None,
                 text_encoder_sequence_length=config.text_encoder_sequence_length,
             )
+            perf.toc("text_encode")
 
             if ti_debug_enabled(config) and ti_should_log(train_progress.global_step):
                 self._ti_debug_batch_tokens(model, batch, config, train_progress)
@@ -377,6 +381,13 @@ class BaseAnimaSetup(
             w_pix = scaled_latent_image.shape[-1] * VAE_SCALE_FACTOR
             padding_mask = latent_input.new_zeros((1, 1, h_pix, w_pix))
 
+            h_lat, w_lat = scaled_latent_image.shape[-2], scaled_latent_image.shape[-1]
+            perf.note("h_pix", int(h_pix))
+            perf.note("w_pix", int(w_pix))
+            perf.note("latent_tokens", int(h_lat * w_lat))  # Cosmos self-attn seq length ~ this
+            perf.note("batch_size", int(latent_input.shape[0]))
+
+            perf.tic("transformer_fwd")
             predicted_flow_5d = model.transformer(
                 hidden_states=latent_input,
                 timestep=t_norm,
@@ -384,6 +395,7 @@ class BaseAnimaSetup(
                 padding_mask=padding_mask,
                 return_dict=False,
             )[0]
+            perf.toc("transformer_fwd")
 
             # Cosmos returns velocity in the (noise - image) direction
             # directly -- no sign flip, unlike Z-Image's transformer

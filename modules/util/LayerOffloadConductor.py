@@ -17,6 +17,8 @@ from modules.util.torch_util import (
     unpin_tensor_,
 )
 
+from mgds.perf_probe import perf
+
 import torch
 from torch import nn
 
@@ -850,6 +852,11 @@ class LayerOffloadConductor:
         if device_equals(device, current_device):
             log(f"schedule layer {layer_index} to {str(device)}, skipping")
             return
+
+        # count actual (non-skipped) layer transfers per step; onload = CPU->GPU
+        perf.incr("offload_xfers")
+        if device_equals(device, self.__train_device):
+            perf.incr("offload_onload")
 
         layer_deallocator = self.__temp_device_layer_allocator \
             if device_equals(device, self.__train_device) \

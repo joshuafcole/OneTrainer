@@ -34,6 +34,8 @@ from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
+from mgds.perf_probe import perf
+
 import torch
 from torch import Tensor, nn
 from torch.nn import Parameter
@@ -817,9 +819,13 @@ class GenericTrainer(BaseTrainer):
 
                 self.callbacks.on_update_status("Training ...")
 
+                perf.step_begin(train_progress.global_step)
                 with (
                     TorchMemoryRecorder(enabled=False, filename=f"memory-step{train_progress.global_step}.pickle"),
-                    TorchProfiler(enabled=False, filename=f"profile-step{train_progress.global_step}.json"),
+                    TorchProfiler(
+                        enabled=perf.should_profile(train_progress.global_step),
+                        filename=f"profile-step{train_progress.global_step}.json",
+                    ),
                 ):
                     step_seed = train_progress.global_step
                     bf16_stochastic_rounding_set_seed(step_seed, train_device)
@@ -852,10 +858,12 @@ class GenericTrainer(BaseTrainer):
                     loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
 
                     loss = loss / self.config.gradient_accumulation_steps
+                    perf.tic("backward")
                     if scaler:
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    perf.toc("backward")
 
                     has_gradient = True
                     detached_loss = loss.detach()
@@ -863,6 +871,7 @@ class GenericTrainer(BaseTrainer):
                     accumulated_loss += detached_loss
 
                     if self.__is_update_step(train_progress):
+                        perf.tic("optimizer")
                         if self.config.fused_gradient_reduce:
                             multi.finish_async(self.config.gradient_reduce_precision)
                         else:
@@ -889,6 +898,7 @@ class GenericTrainer(BaseTrainer):
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
                         self.model.optimizer.zero_grad(set_to_none=True)
                         has_gradient = False
+                        perf.toc("optimizer")
 
                         if multi.is_master():
                             self.model_setup.report_to_tensorboard(
@@ -928,6 +938,8 @@ class GenericTrainer(BaseTrainer):
                             self.model.ema.step(self.parameters, update_step)
 
                         self.one_step_trained = True
+
+                perf.step_end()
 
                 if self.config.validation and multi.is_master():
                     self.__validate(train_progress)
