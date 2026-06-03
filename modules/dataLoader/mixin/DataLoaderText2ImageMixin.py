@@ -8,6 +8,7 @@ from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
 from modules.util import path_util
+from modules.util.cache_key import image_cache_salt, text_cache_salt
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.DataType import DataType
 from modules.util.torch_util import torch_gc
@@ -614,8 +615,13 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         text_caching: bool,
         before_cache_image_fun: Callable[[], None] | None = None,
     ):
-        image_cache_dir = os.path.join(config.cache_dir, "image")
-        text_cache_dir = os.path.join(config.cache_dir, "text")
+        # Nest each cache under a salt of the global inputs the DiskCache group key
+        # doesn't capture (VAE/resolution/bucketing for images; text encoders +
+        # vocab-extending embeddings for text). This is what makes reusing the cache
+        # across runs safe: a changed identity gets a fresh directory instead of
+        # silently colliding with stale tensors. See modules/util/cache_key.py.
+        image_cache_dir = os.path.join(config.cache_dir, "image", image_cache_salt(config))
+        text_cache_dir = os.path.join(config.cache_dir, "text", text_cache_salt(config))
 
         # Carry AspectBucketing's rebalancing tags alongside crop_resolution: as
         # image-cache aggregates (restored after caching) and in sort_names (so
