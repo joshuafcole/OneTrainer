@@ -2,7 +2,7 @@ import inspect
 from collections.abc import Callable
 from typing import Any
 
-from modules.util.compile_util import init_compile
+from modules.util.compile_util import init_attention_backend, init_compile
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.LayerOffloadConductor import LayerOffloadConductor
 from modules.util.torch_util import add_dummy_grad_fn_, has_grad_fn
@@ -31,6 +31,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
 from transformers.models.t5.modeling_t5 import T5Block
 
 init_compile()
+init_attention_backend()
 
 
 def _kwargs_to_args(fun: Callable, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...]:

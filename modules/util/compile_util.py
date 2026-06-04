@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 from sympy import S
@@ -59,3 +61,51 @@ def Mod_patched_eval(cls, p, q):
 def init_compile():
     torch._dynamo.config.cache_size_limit = 8192
     torch.utils._sympy.functions.Mod.eval = Mod_patched_eval
+
+
+def init_attention_backend():
+    """Env-gated SDPA backend preference for A/B perf testing (perf-instrumentation branch).
+
+    The default PyTorch SDPA selection lands on the cutlass *memory-efficient* path, whose
+    kernels are sm80-tagged -- a compatibility fallback on newer (e.g. Blackwell/sm120) GPUs.
+    This lets us force a faster backend for the (unmasked, expensive) self-attention while
+    leaving mem-efficient enabled as a fallback for ops the preferred backend rejects (e.g.
+    the masked cross-attention), so a run never hard-crashes from an unsupported mask.
+
+        OT_ATTN=cudnn      -> prefer cuDNN attention (native on Blackwell), mem-eff fallback
+        OT_ATTN=flash      -> prefer Flash attention, mem-eff fallback
+        OT_ATTN=mem/unset  -> leave PyTorch defaults (baseline: sm80 cutlass mem-efficient)
+    """
+    mode = os.environ.get("OT_ATTN", "").strip().lower()
+
+    try:
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            cap = torch.cuda.get_device_capability(0)
+            arch = f"sm{cap[0]}{cap[1]}"
+        else:
+            name, arch = "cpu", "n/a"
+    except Exception:
+        name, arch = "unknown", "n/a"
+
+    b = torch.backends.cuda
+    if mode == "cudnn":
+        b.enable_mem_efficient_sdp(True)   # fallback for masked cross-attn
+        b.enable_flash_sdp(False)
+        b.enable_cudnn_sdp(True)
+        b.enable_math_sdp(True)
+    elif mode == "flash":
+        b.enable_mem_efficient_sdp(True)
+        b.enable_flash_sdp(True)
+        b.enable_cudnn_sdp(False)
+        b.enable_math_sdp(True)
+    # else (mem / unset): leave defaults untouched for a clean baseline
+
+    try:
+        enabled = (
+            f"flash={b.flash_sdp_enabled()} mem_eff={b.mem_efficient_sdp_enabled()} "
+            f"cudnn={b.cudnn_sdp_enabled()} math={b.math_sdp_enabled()}"
+        )
+    except Exception:
+        enabled = "(could not query backend flags)"
+    print(f"[attn] OT_ATTN={mode or 'unset'} on {name} {arch} | SDPA allowed: {enabled}")
