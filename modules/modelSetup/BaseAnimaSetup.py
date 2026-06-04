@@ -15,6 +15,7 @@ Differences from BaseZImageSetup that matter:
     double text-cache footprint for a deterministic 10 ms op.
 """
 
+import os
 from abc import ABCMeta
 from random import Random
 
@@ -80,11 +81,46 @@ class BaseAnimaSetup(
         "cross-attn": {"patterns": ["^(?=.*attn2)(?!.*norm).*"], "regex": True},
     }
 
+    # OT_ATTN -> diffusers attention backend for the Cosmos transformer.
+    # The Cosmos attn processors dispatch through diffusers'
+    # dispatch_attention_fn, whose default "native" backend calls
+    # F.scaled_dot_product_attention WITHOUT forcing a kernel -- so on
+    # Blackwell torch defaults to the slow sm80 cutlass mem-efficient path
+    # (this is why an earlier torch-level enable_cudnn_sdp() flag was a
+    # no-op: it changes eligibility, not the diffusers dispatch). Selecting
+    # _native_cudnn routes each call through sdpa_kernel(CUDNN_ATTENTION),
+    # ~3-4x faster fwd+bwd on the high-res attention shapes and still
+    # handles the Cosmos cross-attn mask (verified by sdpa_backend_probe).
+    # Must run BEFORE compile so the traced graph bakes in the cuDNN path.
+    _ATTN_BACKENDS = {
+        "cudnn": "_native_cudnn",
+        "flash": "_native_flash",
+        "efficient": "_native_efficient",
+        "mem": "_native_efficient",
+    }
+
+    def _select_attention_backend(self, model: AnimaModel):
+        mode = os.environ.get("OT_ATTN", "").strip().lower()
+        backend = self._ATTN_BACKENDS.get(mode)
+        if backend is None:
+            return  # unset / unknown -> leave diffusers on its "native" default
+        transformer = getattr(model, "transformer", None)
+        if transformer is None or not hasattr(transformer, "set_attention_backend"):
+            print(f"[attn] OT_ATTN={mode}: transformer has no set_attention_backend (old diffusers?); skipping")
+            return
+        try:
+            transformer.set_attention_backend(backend)
+            print(f"[attn] Cosmos transformer attention backend -> {backend} (OT_ATTN={mode})")
+        except Exception as e:
+            print(f"[attn] set_attention_backend({backend!r}) failed: {e!r}; staying on native")
+
     def setup_optimizations(
         self,
         model: AnimaModel,
         config: TrainConfig,
     ):
+        self._select_attention_backend(model)
+
         # Gradient checkpointing goes through OneTrainer's conductor-based
         # wrappers (not the diffusers built-in) so that CPU_OFFLOADED can
         # stream the frozen Cosmos transformer's weights -- and optionally
