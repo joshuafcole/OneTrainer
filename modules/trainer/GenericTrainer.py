@@ -820,10 +820,15 @@ class GenericTrainer(BaseTrainer):
                 self.callbacks.on_update_status("Training ...")
 
                 perf.step_begin(train_progress.global_step)
+                # latent token count (~Cosmos self-attn seq length, = h_lat*w_lat) so the
+                # profiler can fire on the first high-res / VRAM-saturating step rather than a
+                # fixed index (see OT_PROFILE_MIN_TOKENS). Best-effort; None if shape is absent.
+                _lat = batch.get("latent_image") if isinstance(batch, dict) else None
+                _profile_tokens = int(_lat.shape[-2] * _lat.shape[-1]) if _lat is not None and _lat.ndim >= 2 else None
                 with (
                     TorchMemoryRecorder(enabled=False, filename=f"memory-step{train_progress.global_step}.pickle"),
                     TorchProfiler(
-                        enabled=perf.should_profile(train_progress.global_step),
+                        enabled=perf.should_profile(train_progress.global_step, tokens=_profile_tokens),
                         filename=f"profile-step{train_progress.global_step}.json",
                     ),
                 ):
