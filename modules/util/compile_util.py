@@ -59,7 +59,22 @@ def Mod_patched_eval(cls, p, q):
 
 
 def init_compile():
-    torch._dynamo.config.cache_size_limit = 8192
+    # Raise the per-frame recompile cap far above the aspect-ratio bucket count
+    # (each distinct latent shape can trigger a recompile; with fullgraph=True a
+    # hit is a hard crash). torch renamed this config key
+    # ``cache_size_limit`` -> ``recompile_limit`` (kept the old as a deprecated
+    # alias for a while, then dropped it), so on a newer/nightly torch setting only
+    # ``cache_size_limit`` is a silent no-op and the low default (8) is enforced --
+    # which is exactly the FailOnRecompileLimitHit a cu130 nightly run hit. Set
+    # whichever name(s) the installed torch actually exposes.
+    set_any = False
+    for attr in ("cache_size_limit", "recompile_limit"):
+        if hasattr(torch._dynamo.config, attr):
+            setattr(torch._dynamo.config, attr, 8192)
+            set_any = True
+    if not set_any:
+        print("[compile] WARNING: torch._dynamo.config has no (cache_size|recompile)_limit; "
+              "recompile cap left at default -- bucketed runs may FailOnRecompileLimitHit")
     torch.utils._sympy.functions.Mod.eval = Mod_patched_eval
 
 
