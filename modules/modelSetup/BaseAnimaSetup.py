@@ -114,6 +114,51 @@ class BaseAnimaSetup(
         except Exception as e:
             print(f"[attn] set_attention_backend({backend!r}) failed: {e!r}; staying on native")
 
+    def _report_quantization(self, model: AnimaModel, config: TrainConfig):
+        """Print a definitive per-component precision readout so the log shows
+        what *actually* happened, not just what was requested. For each component
+        it reports (a) the configured ``weight_dtype`` enum -- which surfaces
+        whether a FLOAT_W8A8/FLOAT_8 override even landed vs. silently staying
+        FLOAT_32 -- and (b) the live Linear classes after quantization, so an
+        active fp8 path shows up as ``LinearW8A8`` (sub_dtype=float8_e4m3fn) and a
+        no-op shows up as plain ``Linear``. Cheap: one ``modules()`` walk per
+        component, once at setup. Call AFTER ``quantize_layers`` so the replaced
+        classes and ``is_quantized`` flags are already in place."""
+        wd = config.weight_dtypes()
+        parts = [
+            ("transformer", model.transformer, wd.transformer),
+            ("text_encoder", model.text_encoder, wd.text_encoder),
+            ("text_conditioner", getattr(model, "text_conditioner", None), wd.text_encoder),
+            ("vae", model.vae, wd.vae),
+        ]
+        for name, module, dtype in parts:
+            cfg = getattr(dtype, "name", str(dtype))
+            if module is None:
+                print(f"[quant] {name:<16} dtype={cfg:<12} (component absent)")
+                continue
+            classes: dict[str, int] = {}
+            sub_dtypes: set[str] = set()
+            quantized: set[bool] = set()
+            for m in module.modules():
+                if not isinstance(m, torch.nn.Linear):
+                    continue
+                cls = type(m).__name__
+                classes[cls] = classes.get(cls, 0) + 1
+                if hasattr(m, "_dtype"):  # LinearW8A8 carries int8 vs float8_e4m3fn
+                    sub_dtypes.add(str(getattr(m, "_dtype")))
+                # public flag on LinearFp8; W8A8 name-mangles its own, read via getattr
+                flag = getattr(m, "is_quantized",
+                               getattr(m, "_LinearW8A8__is_quantized", None))
+                if isinstance(flag, bool):
+                    quantized.add(flag)
+            linears = ", ".join(f"{k}={v}" for k, v in sorted(classes.items())) or "none"
+            extra = ""
+            if sub_dtypes:
+                extra += f" sub_dtype={'/'.join(sorted(sub_dtypes))}"
+            if quantized:
+                extra += f" quantized={'/'.join(str(f) for f in sorted(quantized))}"
+            print(f"[quant] {name:<16} dtype={cfg:<12} linears: {linears}{extra}")
+
     def setup_optimizations(
         self,
         model: AnimaModel,
@@ -176,6 +221,8 @@ class BaseAnimaSetup(
         quantize_layers(model.text_conditioner, self.train_device, model.text_encoder_train_dtype, config)
         quantize_layers(model.vae, self.train_device, model.train_dtype, config)
         quantize_layers(model.transformer, self.train_device, model.train_dtype, config)
+
+        self._report_quantization(model, config)
 
     def _setup_embeddings(
         self,
