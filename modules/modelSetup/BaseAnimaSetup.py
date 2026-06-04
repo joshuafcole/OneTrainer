@@ -159,6 +159,31 @@ class BaseAnimaSetup(
                 extra += f" quantized={'/'.join(str(f) for f in sorted(quantized))}"
             print(f"[quant] {name:<16} dtype={cfg:<12} linears: {linears}{extra}")
 
+    def _report_execution_config(self, model: AnimaModel, config: TrainConfig):
+        """Print the resolved execution-shape config that governs the launch-overhead /
+        GPU-idle picture: whether the offload conductor is actually *swapping* (CPU<->GPU
+        per layer) or inert (recompute only), and whether layers are torch.compiled. This
+        is the missing fact for the perf investigation -- a profile showing ~70% GPU idle
+        and ~100k kernel launches is launch-bound, and the cause is one of: many small
+        compiled regions (no cudagraphs), reentrant gradient-checkpoint glue, or live
+        activation/weight offloading. Reads the conductor's own ``offload_activated()`` so
+        the report reflects what actually armed, not just the requested flags."""
+        gc = config.gradient_checkpointing
+        cond = getattr(model, "transformer_offload_conductor", None)
+        try:
+            offload_armed = bool(cond is not None and cond.offload_activated())
+        except Exception:
+            offload_armed = None
+        print(
+            "[exec] transformer: "
+            f"gradient_checkpointing={gc} "
+            f"offload_armed={offload_armed} "
+            f"layer_offload_fraction={getattr(config, 'layer_offload_fraction', '?')} "
+            f"enable_activation_offloading={getattr(config, 'enable_activation_offloading', '?')} "
+            f"enable_async_offloading={getattr(config, 'enable_async_offloading', '?')} "
+            f"compile={getattr(config, 'compile', '?')} (mode=default -> no cudagraphs)"
+        )
+
     def setup_optimizations(
         self,
         model: AnimaModel,
@@ -182,6 +207,8 @@ class BaseAnimaSetup(
                 model.text_encoder_offload_conductor = enable_checkpointing_for_qwen3_encoder_layers(
                     model.text_encoder, config
                 )
+
+        self._report_execution_config(model, config)
 
         model.autocast_context, model.train_dtype = create_autocast_context(
             self.train_device,
