@@ -1,6 +1,7 @@
 
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.DataType import DataType
+from modules.util.enum.LokrInitMode import LokrInitMode
 from modules.util.enum.ModelType import PeftType
 from modules.util.ui import components
 from modules.util.ui.UIState import UIState
@@ -185,6 +186,22 @@ class LoraTab:
             components.label(master, 6, 0, "Kronecker-Vec Trick",
                              tooltip="Uses an accelerated path that bypasses the materialization of the full Kronecker product. This delivers a massive speedup to the LoKr without sacrificing precision. Highly recommended.")
             components.switch(master, 6, 1, self.ui_state, "lokr_vec_trick")
+
+            # Kron-GA initialization
+            components.label(master, 7, 0, "Initialization",
+                             tooltip="Default: random (Kaiming) initialization. Gradient (Kron-GA): estimates the base weight gradients over the first few batches and aligns the initial LoKr factors with their principal Kronecker components, which can speed up early convergence. The model output is unchanged until the first optimizer step.")
+            components.options_kv(master, 7, 1, [
+                ("Default", LokrInitMode.DEFAULT),
+                ("Gradient (Kron-GA)", LokrInitMode.GRADIENT),
+            ], self.ui_state, "lokr_init_mode")
+
+            components.label(master, 8, 0, "Init Estimation Steps",
+                             tooltip="Number of batches used to estimate the gradients for the Kron-GA initialization.")
+            components.entry(master, 8, 1, self.ui_state, "lokr_init_steps")
+
+            components.label(master, 9, 0, "Init Gain",
+                             tooltip="Multiplier on the norm of the gradient-aligned initial factors, relative to the default initialization's norm. 1.0 matches the default magnitudes exactly.")
+            components.entry(master, 9, 1, self.ui_state, "lokr_init_gain")
 
             #LoKr Decomposition Settings
             components.label(master, 1, 3, "Decompose Both Matrices",

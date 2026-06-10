@@ -18,6 +18,7 @@ from modules.util.enum.GradientReducePrecision import GradientReducePrecision
 from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.LearningRateScaler import LearningRateScaler
 from modules.util.enum.LearningRateScheduler import LearningRateScheduler
+from modules.util.enum.LokrInitMode import LokrInitMode
 from modules.util.enum.LossScaler import LossScaler
 from modules.util.enum.LossWeight import LossWeight
 from modules.util.enum.ModelFormat import ModelFormat
@@ -548,6 +549,9 @@ class TrainConfig(BaseConfig):
     lokr_dora_on_output: bool
     lokr_full_matrix: bool
     lokr_vec_trick: bool
+    lokr_init_mode: LokrInitMode
+    lokr_init_steps: int
+    lokr_init_gain: float
 
     # optimizer
     optimizer: TrainOptimizerConfig
@@ -1215,6 +1219,9 @@ class TrainConfig(BaseConfig):
         data.append(("lokr_dora_on_output", True, bool, False))
         data.append(("lokr_full_matrix", False, bool, False))
         data.append(("lokr_vec_trick", True, bool, False))
+        data.append(("lokr_init_mode", LokrInitMode.DEFAULT, LokrInitMode, False))
+        data.append(("lokr_init_steps", 64, int, False))
+        data.append(("lokr_init_gain", 1.0, float, False))
 
         # optimizer
         data.append(("optimizer", TrainOptimizerConfig.default_values(), TrainOptimizerConfig, False))

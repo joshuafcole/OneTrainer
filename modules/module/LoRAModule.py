@@ -9,7 +9,7 @@ from modules.module.oft_utils import OFTRotationModule
 from modules.module.quantized.LinearSVD import BaseLinearSVD
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import PeftType
-from modules.util.lokr_utils import factorization, make_kron, rebuild_tucker
+from modules.util.lokr_utils import factorization, make_kron, nearest_kron_factors, rebuild_tucker
 from modules.util.ModuleFilter import ModuleFilter
 from modules.util.quantization_util import get_unquantized_weight, get_weight_shape
 
@@ -429,6 +429,55 @@ class LoKrModule(PeftBase):
 
         if self.use_w1 and self.use_w2:
             self.alpha.fill_(lokr_dim)
+
+    def init_from_gradient(self, grad: Tensor, gain: float = 1.0) -> bool:
+        """Gradient-aligned (Kron-GA) initialization, in the spirit of LoRA-GA.
+
+        Replaces the random directions of the nonzero factors with the
+        principal Kronecker factors of the estimated weight gradient
+        (Van Loan-Pitsianis), norm-matched to the existing init so only the
+        subspace changes. The zero factor (lokr_w2_b or lokr_w2) is left
+        untouched, so the adapter output remains exactly zero and the base
+        weights never need to be modified.
+        """
+        if not isinstance(self.orig_module, nn.Linear):
+            return False
+
+        device = self.train_device if self.train_device is not None else grad.device
+        grad = grad.to(device=device, dtype=torch.float32)
+        w1_t, w2_t, sigma = nearest_kron_factors(grad, self.out_l, self.out_k, self.in_m, self.in_n)
+        if not torch.isfinite(sigma) or sigma == 0:
+            return False
+
+        with torch.no_grad():
+            if self.use_w1:
+                target_norm = self.lokr_w1.detach().float().norm()
+                new_w1 = w1_t * (gain * target_norm / w1_t.norm())
+                self.lokr_w1.copy_(new_w1.to(self.lokr_w1.dtype))
+            else:
+                u, s, vh = torch.linalg.svd(w1_t, full_matrices=False)
+                k = min(self.dim, s.shape[0])
+                sqrt_s = s[:k].sqrt()
+                a = u[:, :k] * sqrt_s
+                b = sqrt_s.unsqueeze(1) * vh[:k, :]
+                target_norm = (self.lokr_w1_a.detach().float() @ self.lokr_w1_b.detach().float()).norm()
+                factor_scale = (gain * target_norm / (a @ b).norm()).sqrt()
+                self.lokr_w1_a[:, :k].copy_((a * factor_scale).to(self.lokr_w1_a.dtype))
+                self.lokr_w1_b[:k, :].copy_((b * factor_scale).to(self.lokr_w1_b.dtype))
+
+            # The w2 side: align the column space of w2_a with the gradient's
+            # second Kronecker factor. lokr_w2_b (or the full lokr_w2) stays
+            # zero, which keeps the adapter's output delta at exactly zero.
+            if not self.use_w2 and not self.tucker:
+                u2 = torch.linalg.svd(w2_t, full_matrices=False)[0]
+                k = min(self.dim, u2.shape[1])
+                target_norm = self.lokr_w2_a.detach().float().norm()
+                new_a = self.lokr_w2_a.detach().float().to(device).clone()
+                new_a[:, :k] = u2[:, :k]
+                new_a *= gain * target_norm / new_a.norm()
+                self.lokr_w2_a.copy_(new_a.to(self.lokr_w2_a.dtype))
+
+        return True
 
     def _get_factors(self):
         """Returns the two kronecker components W1 and W2."""
@@ -1003,6 +1052,22 @@ class LoRAModuleWrapper:
             module.requires_grad_(requires_grad)
         for module in self.frozen_lora_modules.values():
             module.requires_grad_(False)
+
+    def init_lokr_from_gradients(self, grads: Mapping[str, Tensor], gain: float = 1.0) -> tuple[int, int]:
+        """Applies gradient-aligned (Kron-GA) initialization to all LoKr modules.
+
+        grads maps the same short names used by lora_modules to estimated
+        dL/dW tensors of the original weights. Returns (applied, skipped).
+        """
+        applied = 0
+        skipped = 0
+        for name, module in self.lora_modules.items():
+            grad = grads.get(name)
+            if isinstance(module, LoKrModule) and grad is not None and module.init_from_gradient(grad, gain):
+                applied += 1
+            else:
+                skipped += 1
+        return applied, skipped
 
     def parameters(self) -> list[Parameter]:
         parameters = []

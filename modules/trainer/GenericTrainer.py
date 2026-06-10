@@ -15,6 +15,7 @@ from modules.modelLoader.BaseModelLoader import BaseModelLoader
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
 from modules.modelSaver.BaseModelSaver import BaseModelSaver
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.trainer.BaseTrainer import BaseTrainer
 from modules.util import create, path_util
 from modules.util.bf16_stochastic_rounding import set_seed as bf16_stochastic_rounding_set_seed
@@ -26,9 +27,12 @@ from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.FileType import FileType
+from modules.util.enum.LokrInitMode import LokrInitMode
 from modules.util.enum.ModelFormat import ModelFormat
+from modules.util.enum.ModelType import PeftType
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.grad_estimation import WeightGradientEstimator
 from modules.util.profiling_util import TorchMemoryRecorder, TorchProfiler
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
@@ -690,6 +694,104 @@ class GenericTrainer(BaseTrainer):
             torch.clear_autocast_cache()
             self.model.optimizer.eval()
 
+    def __run_lokr_gradient_init(self):
+        """Kron-GA: gradient-aligned LoKr initialization (LoRA-GA ported to LoKr).
+
+        Estimates per-layer dL/dW of the frozen base weights over the first
+        lokr_init_steps batches, then re-initializes the nonzero LoKr factors
+        with the principal Kronecker factors of the estimated gradient. The
+        zero factor is untouched, so the model output is unchanged until the
+        first real optimizer step.
+        """
+        config = self.config
+        if config.peft_type != PeftType.LOKR or config.lokr_init_mode != LokrInitMode.GRADIENT:
+            return
+        if config.training_method != TrainingMethod.LORA:
+            return
+        if self.model.train_progress.global_step > 0:
+            print("Kron-GA init: skipping, training is being resumed.")
+            return
+        if config.model_names().lora:
+            print("Kron-GA init: skipping, an existing LoKr checkpoint is being loaded.")
+            return
+        if multi.world_size() > 1:
+            print("Kron-GA init: skipping, multi-GPU training is not supported yet.")
+            return
+
+        wrappers = [
+            module for module in vars(self.model).values()
+            if isinstance(module, LoRAModuleWrapper)
+        ]
+        if not wrappers:
+            return
+
+        self.callbacks.on_update_status("Kron-GA gradient estimation")
+
+        estimators = []
+        for wrapper in wrappers:
+            estimator = WeightGradientEstimator()
+            estimator.attach({name: module.orig_module for name, module in wrapper.lora_modules.items()})
+            estimators.append(estimator)
+
+        # Keeps fp16 gradients from underflowing without a GradScaler. The init
+        # only uses gradient directions, so the constant has no other effect.
+        loss_scale = 1024.0 if enable_grad_scaling(config.train_dtype, self.parameters) else 1.0
+
+        if config.latent_caching:
+            self.data_loader.get_data_set().start_next_epoch()
+            self.model_setup.setup_train_device(self.model, config)
+        else:
+            self.model_setup.setup_train_device(self.model, config)
+            self.data_loader.get_data_set().start_next_epoch()
+
+        # An advancing copy so timestep/noise sampling varies across batches,
+        # without moving the real training progress.
+        progress = copy.deepcopy(self.model.train_progress)
+        step_count = 0
+        for batch in tqdm(self.data_loader.get_data_loader(), desc="kron-ga", total=config.lokr_init_steps):
+            model_output_data = self.model_setup.predict(self.model, batch, config, progress)
+
+            # Exclude prior-prediction (regularization) samples: their true
+            # step-0 gradient is ~0, because the adapter still outputs zero,
+            # so the trained model *is* the prior model. Detaching the
+            # prediction as their target zeroes their loss without running
+            # the prior model.
+            prior_pred_indices = [
+                i
+                for i in range(config.batch_size)
+                if ConceptType(batch["concept_type"][i]) == ConceptType.PRIOR_PREDICTION
+            ]
+            if len(prior_pred_indices) > 0:
+                predicted_detached = model_output_data["predicted"].detach().to(
+                    dtype=model_output_data["target"].dtype
+                )
+                model_output_data["target"][prior_pred_indices] = predicted_detached[prior_pred_indices]
+
+            loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, config)
+            (loss * loss_scale).backward()
+            for estimator in estimators:
+                estimator.count_step()
+            progress.next_step(config.batch_size)
+            step_count += 1
+            if step_count >= config.lokr_init_steps:
+                break
+
+        applied = skipped = 0
+        for wrapper, estimator in zip(wrappers, estimators, strict=True):
+            estimator.detach_hooks()
+            grads = {
+                name: grad for name in wrapper.lora_modules
+                if (grad := estimator.mean_gradient(name)) is not None
+            }
+            wrapper_applied, wrapper_skipped = wrapper.init_lokr_from_gradients(grads, config.lokr_init_gain)
+            applied += wrapper_applied
+            skipped += wrapper_skipped
+            estimator.clear()
+
+        self.model.optimizer.zero_grad(set_to_none=True)
+        torch_gc()
+        print(f"Kron-GA init: applied to {applied} layers ({skipped} skipped) from {step_count} batches.")
+
     def train(self):
         train_device = torch.device(self.config.train_device)
 
@@ -703,6 +805,8 @@ class GenericTrainer(BaseTrainer):
                     self.data_loader.get_data_set().start_next_epoch()
             self.__mark_clean_train_exit()
             return
+
+        self.__run_lokr_gradient_init()
 
         scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
 
