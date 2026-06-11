@@ -14,6 +14,7 @@ class TrainCallbacks:
             on_update_sample_default_progress: Callable[[int, int], None] = lambda _, __: None,
             on_sample_custom: Callable[[ModelSamplerOutput], None] = lambda _: None,
             on_update_sample_custom_progress: Callable[[int, int], None] = lambda _, __: None,
+            on_update_aux_progress: Callable[[str, int, int], None] = lambda _, __, ___: None,
     ):
         self.__on_update_train_progress = on_update_train_progress
         self.__on_update_status = on_update_status
@@ -21,6 +22,7 @@ class TrainCallbacks:
         self.__on_update_sample_default_progress = on_update_sample_default_progress
         self.__on_sample_custom = on_sample_custom
         self.__on_update_sample_custom_progress = on_update_sample_custom_progress
+        self.__on_update_aux_progress = on_update_aux_progress
 
     # on_update_train_progress
     def set_on_update_train_progress(
@@ -93,3 +95,18 @@ class TrainCallbacks:
         if self.__on_update_sample_custom_progress:
             with contextlib.suppress(Exception):
                 self.__on_update_sample_custom_progress(progress, max_progress)
+
+    # on_update_aux_progress
+    def set_on_update_aux_progress(
+            self,
+            on_update_aux_progress: Callable[[str, int, int], None] = lambda _, __, ___: None,
+    ):
+        self.__on_update_aux_progress = on_update_aux_progress
+
+    def on_update_aux_progress(self, label: str, step: int, max_step: int):
+        """Sub-progress of an auxiliary pass that is neither training steps nor
+        sampling (e.g. the Kron-GA gradient estimation pass). A max_step <= 0
+        clears the sub-progress."""
+        if self.__on_update_aux_progress:
+            with contextlib.suppress(Exception):
+                self.__on_update_aux_progress(label, step, max_step)

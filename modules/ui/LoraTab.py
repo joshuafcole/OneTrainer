@@ -203,6 +203,10 @@ class LoraTab:
                              tooltip="Multiplier on the norm of the gradient-aligned initial factors, relative to the default initialization's norm. 1.0 matches the default magnitudes exactly.")
             components.entry(master, 9, 1, self.ui_state, "lokr_init_gain")
 
+            components.label(master, 10, 0, "Offload Init Grads",
+                             tooltip="Accumulates the Kron-GA gradient estimates in CPU memory instead of VRAM. Slower (one device-to-host transfer per layer per batch), but frees one fp32 weight-sized buffer per adapted layer from VRAM during the estimation pass.")
+            components.switch(master, 10, 1, self.ui_state, "lokr_init_offload")
+
             #LoKr Decomposition Settings
             components.label(master, 1, 3, "Decompose Both Matrices",
                              tooltip="Perform rank decomposition on both Kronecker product matrices (W1 and W2). Only effective for very small dimensions.")

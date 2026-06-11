@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import hashlib
 import json
 import math
 import os
@@ -694,6 +695,27 @@ class GenericTrainer(BaseTrainer):
             torch.clear_autocast_cache()
             self.model.optimizer.eval()
 
+    def __lokr_init_cache_path(self) -> str | None:
+        """Cache file for the estimated Kron-GA Van Loan factors.
+
+        The factors depend on the base model, the dataset, the estimation
+        length and the Kronecker factorization — but NOT on rank (dim), alpha
+        or gain, so one estimation pass serves a whole hyperparameter sweep.
+        Keyed by the inputs that change the estimate; lives under cache_dir
+        next to the latent cache, which has the same reuse semantics.
+        """
+        config = self.config
+        if not config.cache_dir:
+            return None
+        key = json.dumps({
+            "base_model_name": config.base_model_name,
+            "concept_file_name": config.concept_file_name,
+            "lokr_init_steps": config.lokr_init_steps,
+            "lokr_decompose_factor": config.lokr_decompose_factor,
+        }, sort_keys=True)
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        return os.path.join(config.cache_dir, "kron_ga", f"{digest}.pt")
+
     def __run_lokr_gradient_init(self):
         """Kron-GA: gradient-aligned LoKr initialization (LoRA-GA ported to LoKr).
 
@@ -725,11 +747,40 @@ class GenericTrainer(BaseTrainer):
         if not wrappers:
             return
 
+        cache_path = self.__lokr_init_cache_path()
+        if cache_path is not None and os.path.isfile(cache_path):
+            try:
+                cached = torch.load(cache_path, map_location="cpu", weights_only=True)
+            except Exception as e:
+                print(f"Kron-GA init: ignoring unreadable cache {cache_path}: {e}")
+                cached = None
+            if cached is not None:
+                self.callbacks.on_update_status("Kron-GA factor initialization")
+                applied = skipped = 0
+                for wrapper in wrappers:
+                    factors = {
+                        name: pair for name, pair in
+                        ((name, cached.get(f"{wrapper.prefix}.{name}")) for name in wrapper.lora_modules)
+                        if pair is not None
+                    }
+                    wrapper_applied, wrapper_skipped = wrapper.init_lokr_from_factors(
+                        factors, config.lokr_init_gain)
+                    applied += wrapper_applied
+                    skipped += wrapper_skipped
+                print(f"Kron-GA init: applied to {applied} layers ({skipped} skipped) from cache {cache_path}")
+                return
+
         self.callbacks.on_update_status("Kron-GA gradient estimation")
+        self.callbacks.on_update_aux_progress("kron-ga", 0, config.lokr_init_steps)
+
+        # The fp32 accumulators are weight-shaped, one per adapted Linear:
+        # accumulating on the train device avoids a per-layer device-to-host
+        # sync every batch, at the cost of that VRAM; offload trades it back.
+        store_device = torch.device("cpu") if config.lokr_init_offload else torch.device(config.train_device)
 
         estimators = []
         for wrapper in wrappers:
-            estimator = WeightGradientEstimator()
+            estimator = WeightGradientEstimator(store_device=store_device)
             estimator.attach({name: module.orig_module for name, module in wrapper.lora_modules.items()})
             estimators.append(estimator)
 
@@ -777,23 +828,38 @@ class GenericTrainer(BaseTrainer):
                     estimator.count_step()
                 progress.next_step(config.batch_size)
                 step_count += 1
+                self.callbacks.on_update_aux_progress("kron-ga", step_count, config.lokr_init_steps)
                 if step_count >= config.lokr_init_steps:
                     break
 
+        self.callbacks.on_update_status("Kron-GA factor initialization")
         applied = skipped = 0
+        all_factors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         for wrapper, estimator in zip(wrappers, estimators, strict=True):
             estimator.detach_hooks()
             grads = {
                 name: grad for name in wrapper.lora_modules
                 if (grad := estimator.mean_gradient(name)) is not None
             }
-            wrapper_applied, wrapper_skipped = wrapper.init_lokr_from_gradients(grads, config.lokr_init_gain)
+            wrapper_applied, wrapper_skipped, factors = \
+                wrapper.init_lokr_from_gradients(grads, config.lokr_init_gain)
             applied += wrapper_applied
             skipped += wrapper_skipped
+            for name, pair in factors.items():
+                all_factors[f"{wrapper.prefix}.{name}"] = pair
             estimator.clear()
+
+        if cache_path is not None and all_factors:
+            try:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                torch.save(all_factors, cache_path)
+                print(f"Kron-GA init: cached Van Loan factors to {cache_path}")
+            except OSError as e:
+                print(f"Kron-GA init: failed to write cache {cache_path}: {e}")
 
         self.model.optimizer.zero_grad(set_to_none=True)
         torch_gc()
+        self.callbacks.on_update_aux_progress("kron-ga", 0, 0)
         print(f"Kron-GA init: applied to {applied} layers ({skipped} skipped) from {step_count} batches.")
 
     def train(self):

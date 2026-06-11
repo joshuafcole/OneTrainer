@@ -125,6 +125,32 @@ def test_rejects_degenerate_gradient():
     assert not module.init_from_gradient(torch.zeros(linear.out_features, linear.in_features))
 
 
+def test_factor_replay_matches_gradient_init():
+    # The returned Van Loan pair, replayed onto a fresh identically-configured
+    # module via init_from_factors (the cache-hit path), must produce the same
+    # parameters as running init_from_gradient directly.
+    _, module = _make_module()
+    grad = _fake_gradient(module)
+    pair = module.init_from_gradient(grad)
+    assert pair is not None
+    cached = (pair[0].detach().cpu(), pair[1].detach().cpu())
+
+    _, replayed = _make_module()
+    assert replayed.init_from_factors(cached[0], cached[1])
+    assert torch.allclose(replayed.lokr_w1.detach(), module.lokr_w1.detach(), atol=1e-6)
+    assert torch.allclose(replayed.lokr_w2_a.detach(), module.lokr_w2_a.detach(), atol=1e-6)
+    assert torch.count_nonzero(replayed.lokr_w2_b) == 0
+
+
+def test_factor_replay_rejects_stale_shapes():
+    # A cache produced under a different decompose factor (or model) has
+    # differently-shaped factors; the replay must reject, not misapply.
+    _, module = _make_module()
+    assert not module.init_from_factors(
+        torch.randn(module.out_l + 1, module.in_m), torch.randn(module.out_k, module.in_n)
+    )
+
+
 def test_first_training_step_moves_toward_gradient_subspace():
     # After Kron-GA init, a step on w2_b must produce a delta correlated with
     # the (clean) gradient direction — the point of the whole exercise.
@@ -161,5 +187,7 @@ if __name__ == "__main__":
     test_decompose_both_variant()
     test_full_matrix_variant()
     test_rejects_degenerate_gradient()
+    test_factor_replay_matches_gradient_init()
+    test_factor_replay_rejects_stale_shapes()
     test_first_training_step_moves_toward_gradient_subspace()
     print("all lokr_grad_init tests passed")

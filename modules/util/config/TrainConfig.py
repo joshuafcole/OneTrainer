@@ -552,6 +552,7 @@ class TrainConfig(BaseConfig):
     lokr_init_mode: LokrInitMode
     lokr_init_steps: int
     lokr_init_gain: float
+    lokr_init_offload: bool
 
     # optimizer
     optimizer: TrainOptimizerConfig
@@ -1222,6 +1223,7 @@ class TrainConfig(BaseConfig):
         data.append(("lokr_init_mode", LokrInitMode.DEFAULT, LokrInitMode, False))
         data.append(("lokr_init_steps", 64, int, False))
         data.append(("lokr_init_gain", 1.0, float, False))
+        data.append(("lokr_init_offload", False, bool, False))
 
         # optimizer
         data.append(("optimizer", TrainOptimizerConfig.default_values(), TrainOptimizerConfig, False))

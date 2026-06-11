@@ -430,7 +430,7 @@ class LoKrModule(PeftBase):
         if self.use_w1 and self.use_w2:
             self.alpha.fill_(lokr_dim)
 
-    def init_from_gradient(self, grad: Tensor, gain: float = 1.0) -> bool:
+    def init_from_gradient(self, grad: Tensor, gain: float = 1.0) -> tuple[Tensor, Tensor] | None:
         """Gradient-aligned (Kron-GA) initialization, in the spirit of LoRA-GA.
 
         Replaces the random directions of the nonzero factors with the
@@ -439,15 +439,33 @@ class LoKrModule(PeftBase):
         subspace changes. The zero factor (lokr_w2_b or lokr_w2) is left
         untouched, so the adapter output remains exactly zero and the base
         weights never need to be modified.
+
+        Returns the Van Loan factor pair (w1_t, w2_t) so it can be cached and
+        replayed via init_from_factors, or None if the layer was skipped.
         """
         if not isinstance(self.orig_module, nn.Linear):
-            return False
+            return None
 
         device = self.train_device if self.train_device is not None else grad.device
         grad = grad.to(device=device, dtype=torch.float32)
         w1_t, w2_t, sigma = nearest_kron_factors(grad, self.out_l, self.out_k, self.in_m, self.in_n)
         if not torch.isfinite(sigma) or sigma == 0:
+            return None
+
+        return (w1_t, w2_t) if self.init_from_factors(w1_t, w2_t, gain) else None
+
+    def init_from_factors(self, w1_t: Tensor, w2_t: Tensor, gain: float = 1.0) -> bool:
+        """Applies a Van Loan factor pair — fresh from init_from_gradient or
+        loaded from a cache. Shape-checked so a stale cache (different
+        decompose factor or model) is rejected instead of misapplied."""
+        if not isinstance(self.orig_module, nn.Linear):
             return False
+        if w1_t.shape != (self.out_l, self.in_m) or w2_t.shape != (self.out_k, self.in_n):
+            return False
+
+        device = self.train_device if self.train_device is not None else w1_t.device
+        w1_t = w1_t.to(device=device, dtype=torch.float32)
+        w2_t = w2_t.to(device=device, dtype=torch.float32)
 
         with torch.no_grad():
             if self.use_w1:
@@ -1053,17 +1071,47 @@ class LoRAModuleWrapper:
         for module in self.frozen_lora_modules.values():
             module.requires_grad_(False)
 
-    def init_lokr_from_gradients(self, grads: Mapping[str, Tensor], gain: float = 1.0) -> tuple[int, int]:
+    def init_lokr_from_gradients(
+            self, grads: Mapping[str, Tensor], gain: float = 1.0,
+    ) -> tuple[int, int, dict[str, tuple[Tensor, Tensor]]]:
         """Applies gradient-aligned (Kron-GA) initialization to all LoKr modules.
 
         grads maps the same short names used by lora_modules to estimated
-        dL/dW tensors of the original weights. Returns (applied, skipped).
+        dL/dW tensors of the original weights. Returns (applied, skipped,
+        factors), where factors holds each applied layer's Van Loan pair on
+        CPU for caching (replayable via init_lokr_from_factors).
         """
         applied = 0
         skipped = 0
+        factors: dict[str, tuple[Tensor, Tensor]] = {}
         for name, module in self.lora_modules.items():
             grad = grads.get(name)
-            if isinstance(module, LoKrModule) and grad is not None and module.init_from_gradient(grad, gain):
+            pair = (
+                module.init_from_gradient(grad, gain)
+                if isinstance(module, LoKrModule) and grad is not None
+                else None
+            )
+            if pair is not None:
+                factors[name] = (pair[0].detach().cpu(), pair[1].detach().cpu())
+                applied += 1
+            else:
+                skipped += 1
+        return applied, skipped, factors
+
+    def init_lokr_from_factors(
+            self, factors: Mapping[str, tuple[Tensor, Tensor]], gain: float = 1.0,
+    ) -> tuple[int, int]:
+        """Replays cached Kron-GA Van Loan factor pairs (see
+        init_lokr_from_gradients) onto all LoKr modules. Returns (applied, skipped)."""
+        applied = 0
+        skipped = 0
+        for name, module in self.lora_modules.items():
+            pair = factors.get(name)
+            if (
+                isinstance(module, LoKrModule)
+                and pair is not None
+                and module.init_from_factors(pair[0], pair[1], gain)
+            ):
                 applied += 1
             else:
                 skipped += 1
