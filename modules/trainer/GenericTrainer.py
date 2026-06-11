@@ -748,33 +748,37 @@ class GenericTrainer(BaseTrainer):
         # without moving the real training progress.
         progress = copy.deepcopy(self.model.train_progress)
         step_count = 0
-        for batch in tqdm(self.data_loader.get_data_loader(), desc="kron-ga", total=config.lokr_init_steps):
-            model_output_data = self.model_setup.predict(self.model, batch, config, progress)
+        # force_eager: dynamo hard-errors on tensor hook registration inside
+        # compiled regions, so compiled blocks must run eagerly during the
+        # estimation pass. Compiled training resumes normally afterwards.
+        with torch.compiler.set_stance("force_eager"):
+            for batch in tqdm(self.data_loader.get_data_loader(), desc="kron-ga", total=config.lokr_init_steps):
+                model_output_data = self.model_setup.predict(self.model, batch, config, progress)
 
-            # Exclude prior-prediction (regularization) samples: their true
-            # step-0 gradient is ~0, because the adapter still outputs zero,
-            # so the trained model *is* the prior model. Detaching the
-            # prediction as their target zeroes their loss without running
-            # the prior model.
-            prior_pred_indices = [
-                i
-                for i in range(config.batch_size)
-                if ConceptType(batch["concept_type"][i]) == ConceptType.PRIOR_PREDICTION
-            ]
-            if len(prior_pred_indices) > 0:
-                predicted_detached = model_output_data["predicted"].detach().to(
-                    dtype=model_output_data["target"].dtype
-                )
-                model_output_data["target"][prior_pred_indices] = predicted_detached[prior_pred_indices]
+                # Exclude prior-prediction (regularization) samples: their true
+                # step-0 gradient is ~0, because the adapter still outputs zero,
+                # so the trained model *is* the prior model. Detaching the
+                # prediction as their target zeroes their loss without running
+                # the prior model.
+                prior_pred_indices = [
+                    i
+                    for i in range(config.batch_size)
+                    if ConceptType(batch["concept_type"][i]) == ConceptType.PRIOR_PREDICTION
+                ]
+                if len(prior_pred_indices) > 0:
+                    predicted_detached = model_output_data["predicted"].detach().to(
+                        dtype=model_output_data["target"].dtype
+                    )
+                    model_output_data["target"][prior_pred_indices] = predicted_detached[prior_pred_indices]
 
-            loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, config)
-            (loss * loss_scale).backward()
-            for estimator in estimators:
-                estimator.count_step()
-            progress.next_step(config.batch_size)
-            step_count += 1
-            if step_count >= config.lokr_init_steps:
-                break
+                loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, config)
+                (loss * loss_scale).backward()
+                for estimator in estimators:
+                    estimator.count_step()
+                progress.next_step(config.batch_size)
+                step_count += 1
+                if step_count >= config.lokr_init_steps:
+                    break
 
         applied = skipped = 0
         for wrapper, estimator in zip(wrappers, estimators, strict=True):

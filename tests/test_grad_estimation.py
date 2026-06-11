@@ -110,6 +110,33 @@ def test_matches_autograd_with_replaced_forward():
         assert torch.allclose(est.grads[name], ref, atol=1e-5), name
 
 
+def test_matches_autograd_with_compiled_module_under_force_eager():
+    # dynamo hard-errors on register_hook inside a compiled region
+    # ("Compilation of intermediate hooks requires compiled autograd"), so the
+    # estimation pass must run under set_stance("force_eager"). Verify the
+    # hooks both fire and produce correct gradients in that stance.
+    model = _make_model()
+    expected = _reference_grads(model, steps=2)
+
+    linears = _named_linears(model)
+    try:
+        compiled = torch.compile(model)
+    except RuntimeError as e:  # e.g. "torch.compile is not supported on Python 3.14+"
+        print(f"skipping compiled-module test: {e}")
+        return
+    torch.manual_seed(42)
+    est = WeightGradientEstimator()
+    est.attach(linears)
+    with est, torch.compiler.set_stance("force_eager"):
+        for _ in range(2):
+            x = torch.randn(4, 5, 16)
+            compiled(x).square().mean().backward()
+            est.count_step()
+
+    for name, ref in expected.items():
+        assert torch.allclose(est.grads[name], ref, atol=1e-5), name
+
+
 def test_hooks_removed_on_exit():
     model = _make_model()
     est = WeightGradientEstimator()
@@ -125,5 +152,6 @@ if __name__ == "__main__":
     test_matches_autograd_plain()
     test_matches_autograd_under_checkpointing()
     test_matches_autograd_with_replaced_forward()
+    test_matches_autograd_with_compiled_module_under_force_eager()
     test_hooks_removed_on_exit()
     print("all grad_estimation tests passed")
