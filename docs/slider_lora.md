@@ -244,3 +244,19 @@ direction it must learn. Leapfrog. Works for both LoRA and LoKr.
   `rel_cfg=‖v(c_t)−v(∅)‖/‖v(c_t)‖`, and stronger polar prompts. Verdict keys on
   rel_cfg (conditioning-blind?) + cos_align (coherent axis?). Awaiting v2 numbers
   before committing to S3.
+- **2026-06-16** — **Probe v2 verdict: VIABLE (green).** On-manifold means:
+  rel_guid=0.029, rel_cfg=0.024, cos_align=0.54, **ratio≈1.2 (often >1)** — the
+  attribute axis is as wide as the whole conditioning gap. Not distilled; coherent
+  ± axis. Signal concentrates at high σ → **slider training should weight
+  higher-noise timesteps** (design note for S4). Modest magnitude ⇒ η≈3–4 + enough
+  steps, per the CS α/η decoupling. Core assumption (§2) holds.
+- **2026-06-16** — **S3-core done** (branch `feat/slider-core` off
+  `feat/lora-ga-init`): `modules/modelSetup/mixin/ModelSetupSliderMixin.py` —
+  model-agnostic velocity slider objective. `_slider_prompt_loss` runs the frozen
+  base (multiplier 0, no_grad) to build the detached target `v(c_t)+η·mean_p(v(c+,p)
+  −v(c−,p))`, then trains ± passes via `set_multiplier`; `_slider_image_pair_loss`
+  for CS Eq. 9. Decoupled from any model via `run_velocity`/`set_multiplier`
+  callables. Test `tests/test_slider_objective.py` — a toy adapter trained with the
+  loss learns the guidance direction (cos>0.99, rel_err<0.1) and the −strength pole
+  mirrors +strength. **Next:** S2 (config/enum + GA UI toggle) and S4 (AnimaSliderSetup
+  wiring: build x_t, the run_velocity closure, factory reg, multiplier-sweep sampling).
