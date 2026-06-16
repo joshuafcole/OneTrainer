@@ -301,3 +301,107 @@ direction it must learn. Leapfrog. Works for both LoRA and LoKr.
   - **Deferred:** image-pair regime (raises NotImplementedError for now); multiplier-
     sweep sampling (samples currently show the adapter at the last-set multiplier,
     ≈ +strength); high-σ timestep weighting (currently uniform in [sigma_min,max]).
+
+## 9. Coordinate-labeled image sliders (design of record + as-built)
+
+The visual-slider regime is **coordinate-labeled**, not explicit before/after
+pairs. (An explicit-pair prototype was built on `feat/slider-image` and is
+**superseded** — see the reasoning below for why.)
+
+### 9.0 The one load-bearing constraint, and why pairs are not it
+
+Derived with the user: the *only* hard requirement for a slider is that the
+systematic difference between the two poles is the target attribute **and nothing
+else**. Confounds must be either *shared* (matched pairs cancel them per example)
+or *balanced/averaged away* (shuffled symmetric sets). Fixed pairs are merely one
+data-efficient way to achieve confound control — and in our flow target they buy
+even less than usual: `_slider_image_pair_loss` is two *independent*
+reconstructions, so co-occurrence of a pair in one step has **zero in-gradient
+coupling**. Pairs only ever bought set-balance (+ antithetic shared-noise variance
+reduction). Therefore the right primitive is the **per-image axis coordinate**, not
+the pair.
+
+A second constraint follows: the caption must be **orthogonal to the axis**. If the
+caption names the attribute, the frozen base reads it from the prompt and the
+adapter has nothing to learn → entangled/weak control. So the coordinate must be
+*removed* from the conditioning, not just recorded.
+
+"0 = whatever the base does" (user's call) selects the **reconstruction** objective
+(native neutral at multiplier 0) over a transport objective (where pairs would be
+in-gradient but 0 ≠ neutral — parked).
+
+### 9.1 The model
+
+- **Vanilla OT concepts**, unchanged. Each image's caption carries an a1111-style
+  coordinate token for its position on the axis, e.g. `a car on a road, (distance:-2)`.
+- A **declared axis** list (`TrainConfig.slider_axes`, `SliderAxisConfig`). v1 =
+  exactly one enabled **target** axis (`is_target`); its coordinate drives the
+  multiplier. Other declared axes are still stripped from the caption (keep known
+  confounders out of the conditioning) and `stratify` flags them for the balanced
+  sampler (a fast-follow; unused in v1).
+- The dataloader (`AnimaSliderImageDataLoader`, subclass of `AnimaBaseDataLoader`)
+  injects two MGDS `MapData` nodes right after caption selection and **before**
+  tag-dropout/tokenize: one extracts the target coordinate into a `(1,)` float
+  tensor `slider_coordinate`; one strips every declared-axis token from `prompt`
+  (a1111 emphasis on non-axis tokens passes through). Parsing is a torch-free pure
+  fn, `modules/util/slider_caption_util.parse_slider_coordinates`. `slider_coordinate`
+  is threaded through the cache split + output names so it survives latent/text
+  caching.
+
+### 9.2 The objective — coordinate-scaled reconstruction
+
+Per sample: multiplier `m = k · ℓ` (`k` = `gain_k`, `ℓ` = raw coordinate), built at
+step time so `k` can be retuned without rebuilding the cache. The adapter at `m`
+reconstructs that image's rectified-flow target `v = noise − x0` at a shared sampled
+σ (`_make_flow_target`). `ModelSetupSliderMixin._slider_coordinate_loss` sets each
+sample's multiplier and MSEs its reconstruction, mean over the batch. With ℓ
+symmetric around 0 across the dataset this yields a calibrated, monotonic slider;
+binary poles `ℓ∈{−1,+1}, k=strength` recover `_slider_image_pair_loss` exactly (it is
+the parity special case). No frozen-base guidance, no η — the flow target *is* the
+supervision.
+
+### 9.3 As-built reality (three corrections to the original design note)
+
+Grounding against `BaseAnimaSetup.predict` surfaced three things the design note had
+wrong, now fixed in code:
+
+1. **Scale at step time.** MGDS `latent_image` is the *unscaled* VAE mean;
+   `_predict_coordinate` applies `model.scale_latents` itself (the prototype's
+   `_encode_image` pre-scaling does **not** carry over — that helper is dead for §9).
+2. **Conditioning from the batch.** Uses `model.encode_text(qwen_hidden_states=
+   batch["text_encoder_hidden_state"], tokens_t5=…)` per sample — *not* a fixed
+   `_encode_cached(string)`. `_cond_cache`/`_encode_cached` are prompt-pair-only.
+3. **General per-sample-multiplier loss.** `_slider_image_pair_loss` hardcodes
+   even→−strength/odd→+strength by index parity and cannot express `m=k·ℓ`; the new
+   `_slider_coordinate_loss` takes explicit per-sample multipliers.
+
+What genuinely carries over: `_make_flow_target`, the `predict` regime split, the
+`run_velocity_for_sample` closure shape. The `SliderRegime` value was renamed
+`IMAGE_PAIR → IMAGE`.
+
+### 9.4 v1 scope and fast-follows
+
+- **v1 dataset prep (manual):** keep attribute prose out of captions; pre-scale the
+  axis coordinates (ordinal recommended, not enforced — continuous/lidar labels work
+  as-is via `gain_k`). Each image needs the target coordinate; a missing one yields
+  ℓ=0 ⇒ m=0 ⇒ adapter-off ⇒ a wasted (harmless) sample. Disable tag-dropout for
+  slider datasets (extraction runs before it, but a dropout-eaten coordinate tag
+  would be lost).
+- **Decisions (user):** single target axis; defer the stratified sampler; build now.
+- **Fast-follows:** auto-strip an axis-linked phrase list; per-axis label rescale;
+  **caption-cluster / confounder stratified sampler** (the `stratify` flag is the
+  hook); coordinate-symmetric sampling default; high-σ timestep weighting; transport
+  objective.
+
+- **2026-06-16** — **§9 coordinate image sliders implemented** (branch
+  `feat/slider-coordinate` off `feat/slider-anima`; the explicit-pair
+  `feat/slider-image` branch is abandoned/superseded). `SliderAxisConfig` +
+  `TrainConfig.slider_axes`; `slider_caption_util`; `AnimaSliderImageDataLoader`
+  (+ regime dispatcher in `AnimaSliderDataLoader`); `_slider_coordinate_loss`;
+  `AnimaSliderSetup._predict_coordinate` + `_make_flow_target`/`_sample_sigma`/
+  `_resolve_target_axis`; `SliderRegime.IMAGE`; `SliderTab` axes popup. Tests:
+  parser (strip/passthrough/case/multi-axis), `_resolve_target_axis`,
+  `_make_flow_target`, `_slider_coordinate_loss` multiplier schedule. All
+  py-compile; parser smoke-tested. **Unverified beyond py-compile:** the real
+  MGDS coordinate pipeline and the per-sample forward (no torch/mgds in the
+  authoring sandbox) — first GPU run validates both regimes.

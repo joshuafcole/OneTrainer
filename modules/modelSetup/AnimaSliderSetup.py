@@ -28,7 +28,7 @@ from modules.modelSaver.BaseModelSaver import BaseModelSaver
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupSliderMixin import ModelSetupSliderMixin
 from modules.util import factory
-from modules.util.config.SliderConfig import SliderPromptConfig
+from modules.util.config.SliderConfig import SliderAxisConfig, SliderPromptConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.SliderRegime import SliderRegime
@@ -124,6 +124,38 @@ class AnimaSliderSetup(
         in_ch = int(getattr(getattr(model.transformer, "config", None), "in_channels", 16) or 16)
         return in_ch, h_pix // VAE_SCALE_FACTOR, w_pix // VAE_SCALE_FACTOR
 
+    @staticmethod
+    def _sample_sigma(config: TrainConfig, rand: Random) -> float:
+        """Uniform noise level in [sigma_min, sigma_max] (bounds order-insensitive)."""
+        lo, hi = float(config.slider_sigma_min), float(config.slider_sigma_max)
+        if hi < lo:
+            lo, hi = hi, lo
+        return lo + (hi - lo) * rand.random()
+
+    @staticmethod
+    def _make_flow_target(x0: Tensor, sigma: float, dtype, gen) -> tuple[Tensor, Tensor]:
+        """Rectified-flow forward at a single sigma: ``x_t = (1-σ)x0 + σ·noise``,
+        target velocity ``v = noise - x0`` (matches Anima's training flow). Returns
+        (x_t, detached target)."""
+        noise = torch.randn(x0.shape, generator=gen).to(x0.device, dtype=x0.dtype)
+        x_t = ((1.0 - sigma) * x0 + sigma * noise).to(dtype=dtype)
+        target = (noise - x0).detach()
+        return x_t, target
+
+    @staticmethod
+    def _resolve_target_axis(config: TrainConfig) -> SliderAxisConfig:
+        """The single enabled axis that drives the multiplier (docs §10, v1 =
+        one target axis). Raises with a UI-actionable message otherwise."""
+        axes = [a for a in config.slider_axes if a.enabled]
+        if not axes:
+            raise RuntimeError("Coordinate image-slider training needs at least one enabled axis (see the Slider tab).")
+        targets = [a for a in axes if a.is_target]
+        if len(targets) != 1:
+            raise RuntimeError(
+                f"Exactly one enabled slider axis must be flagged as the target axis; found {len(targets)}."
+            )
+        return targets[0]
+
     # ---- x_t generation -----------------------------------------------------
 
     @torch.no_grad()
@@ -165,9 +197,11 @@ class AnimaSliderSetup(
         *,
         deterministic: bool = False,
     ) -> dict:
+        if config.slider_regime == SliderRegime.IMAGE:
+            return self._predict_coordinate(model, batch, config, train_progress, deterministic)
         if config.slider_regime != SliderRegime.PROMPT_PAIR:
             raise NotImplementedError(
-                f"slider regime {config.slider_regime} is not wired for Anima yet (prompt-pair only)"
+                f"slider regime {config.slider_regime} is not wired for Anima"
             )
 
         triples = [t for t in config.slider_prompts if t.enabled]
@@ -191,10 +225,7 @@ class AnimaSliderSetup(
             h_pix, w_pix = h_lat * VAE_SCALE_FACTOR, w_lat * VAE_SCALE_FACTOR
             padding_mask = torch.zeros((1, 1, h_pix, w_pix), device=self.train_device, dtype=dtype)
 
-            lo, hi = float(config.slider_sigma_min), float(config.slider_sigma_max)
-            if hi < lo:
-                lo, hi = hi, lo
-            sigma = lo + (hi - lo) * rand.random()
+            sigma = self._sample_sigma(config, rand)
             t_norm = torch.full((1,), sigma, device=self.train_device, dtype=dtype)
 
             x_t = self._build_xt(
@@ -220,6 +251,94 @@ class AnimaSliderSetup(
                 eta=float(config.slider_eta),
                 strength=float(config.slider_strength),
                 symmetric=bool(config.slider_symmetric),
+            )
+
+        return {"loss": loss}
+
+    def _predict_coordinate(
+        self,
+        model: AnimaModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        deterministic: bool,
+    ) -> dict:
+        """Coordinate-labeled image-slider step (docs §10). Each real image carries
+        a caption coordinate ``ℓ`` (extracted upstream into ``slider_coordinate``);
+        the adapter at multiplier ``m = k·ℓ`` must reconstruct that image's
+        flow-matching target under the axis-stripped conditioning. No frozen-base
+        guidance and no eta -- the reconstruction target IS the supervision. With
+        ``ℓ`` symmetric around 0 across the dataset this yields a calibrated,
+        monotonic slider; binary poles ``ℓ∈{-1,+1}`` reduce to CS Eq. 9."""
+        target_axis = self._resolve_target_axis(config)
+        gain = float(target_axis.gain_k)
+
+        wrapper = model.transformer_lora
+        dtype = model.train_dtype.torch_dtype()
+
+        with model.autocast_context:
+            seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
+            rand = Random(seed)
+            gen = torch.Generator(device="cpu").manual_seed(seed)
+
+            # Conditioning from the batch, exactly as BaseAnimaSetup.predict: the
+            # dataloader cached Qwen3 hidden states + T5 tokens; encode_text runs
+            # only the (cheap) AnimaTextConditioner here. The caption has already
+            # had the declared-axis coordinate tokens stripped, so the conditioning
+            # is orthogonal to the axis.
+            encoder_hidden_states = model.encode_text(
+                train_device=self.train_device,
+                batch_size=batch["latent_image"].shape[0],
+                rand=rand,
+                tokens_qwen=batch["tokens_qwen"],
+                qwen_hidden_states=batch.get("text_encoder_hidden_state")
+                if not config.train_text_encoder_or_embedding()
+                else None,
+                tokens_mask_qwen=batch["tokens_mask_qwen"],
+                tokens_t5=batch["tokens_t5"],
+                tokens_mask_t5=batch["tokens_mask_t5"],
+                text_encoder_dropout_probability=None,
+                text_encoder_sequence_length=config.text_encoder_sequence_length,
+            )
+
+            # latent_image is the *unscaled* VAE mean (scale is applied at step
+            # time, matching BaseAnimaSetup); 5D (B,C,T=1,H,W) via vae_frame_dim.
+            latent_image = batch["latent_image"]
+            if latent_image.ndim == 4:
+                latent_image = latent_image.unsqueeze(2)
+            scaled = model.scale_latents(latent_image)
+
+            coords = batch["slider_coordinate"].reshape(-1).tolist()  # raw ℓ per sample
+            batch_size = scaled.shape[0]
+
+            sigma = self._sample_sigma(config, rand)
+            t_norm = torch.full((1,), sigma, device=self.train_device, dtype=dtype)
+
+            h_pix = scaled.shape[-2] * VAE_SCALE_FACTOR
+            w_pix = scaled.shape[-1] * VAE_SCALE_FACTOR
+            padding_mask = torch.zeros((1, 1, h_pix, w_pix), device=self.train_device, dtype=dtype)
+
+            x_ts, targets, multipliers = [], [], []
+            for i in range(batch_size):
+                x_t, target = self._make_flow_target(scaled[i:i + 1], sigma, dtype, gen)
+                x_ts.append(x_t)
+                targets.append(target)
+                multipliers.append(gain * float(coords[i]))
+
+            def run_velocity_for_sample(i: int, multiplier: float) -> Tensor:
+                return model.transformer(
+                    hidden_states=x_ts[i],
+                    timestep=t_norm,
+                    encoder_hidden_states=encoder_hidden_states[i:i + 1].to(dtype=dtype),
+                    padding_mask=padding_mask,
+                    return_dict=False,
+                )[0]
+
+            loss = self._slider_coordinate_loss(
+                run_velocity_for_sample,
+                wrapper.set_multiplier,
+                targets,
+                multipliers,
             )
 
         return {"loss": loss}

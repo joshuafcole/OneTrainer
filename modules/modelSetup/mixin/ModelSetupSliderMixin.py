@@ -137,3 +137,43 @@ class ModelSetupSliderMixin:
             loss = term if loss is None else loss + term
         set_multiplier(1.0)
         return loss / len(targets)
+
+    def _slider_coordinate_loss(
+        self,
+        run_velocity_for_sample: Callable[[int, float], Tensor],
+        set_multiplier: Callable[[float], None],
+        targets: Sequence[Tensor],
+        multipliers: Sequence[float],
+        loss_fn: Callable[[Tensor, Tensor], Tensor] | None = None,
+    ) -> Tensor:
+        """Coordinate-scaled reconstruction loss (docs §10), the generalization of
+        the image-pair loss to a per-sample multiplier.
+
+        Each sample ``i`` carries its own signed multiplier ``m_i = gain_k *
+        coordinate_i`` (set by the host from the caption coordinate). The adapter
+        at ``m_i`` must reconstruct that image's flow-matching target, so the
+        slider learns a calibrated, monotonic response across the axis rather than
+        just two poles. Binary before/after poles (``coordinate in {-1, +1}``,
+        ``gain_k == strength``) recover ``_slider_image_pair_loss`` exactly.
+
+        Args:
+            run_velocity_for_sample: ``(sample_index, multiplier) -> velocity`` --
+                the host sets the multiplier, builds sample ``i``'s noised latent
+                under that image's (axis-stripped) conditioning, returns velocity.
+            targets: per-sample flow-matching target velocity (e.g. noise - image).
+            multipliers: per-sample adapter multiplier, index-aligned with targets.
+        """
+        if loss_fn is None:
+            loss_fn = F.mse_loss
+        if not targets:
+            raise ValueError("targets must be non-empty")
+        if len(targets) != len(multipliers):
+            raise ValueError("targets and multipliers must be the same length")
+
+        loss = None
+        for i, (target, mult) in enumerate(zip(targets, multipliers, strict=True)):
+            set_multiplier(float(mult))
+            term = loss_fn(run_velocity_for_sample(i, float(mult)), target)
+            loss = term if loss is None else loss + term
+        set_multiplier(1.0)
+        return loss / len(targets)

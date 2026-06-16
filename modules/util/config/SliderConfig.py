@@ -40,3 +40,48 @@ class SliderPromptConfig(BaseConfig):
         data.append(("weight", 1.0, float, False))
 
         return SliderPromptConfig(data)
+
+
+class SliderAxisConfig(BaseConfig):
+    """One declared slider axis for coordinate-labeled image sliders (docs §10).
+
+    The training data is vanilla OneTrainer concepts whose captions carry an
+    a1111-style coordinate token per image, e.g. ``(distance:-2)``. ``name`` is
+    the token key matched (case-insensitively) and stripped from the caption
+    before tokenization, so the conditioning stays orthogonal to the axis.
+
+    Exactly one enabled axis must be flagged ``is_target``: its per-image
+    coordinate ``value`` becomes the training-time adapter multiplier
+    ``m = gain_k * value`` (coordinate-scaled reconstruction). The remaining
+    declared axes are still stripped from the caption (so confounders the user
+    knows about are kept out of the conditioning) and, when ``stratify`` is set,
+    are reserved for the balanced sampler (a fast-follow; unused in v1).
+
+    ``gain_k`` is the global gain mapping raw coordinate units onto the adapter
+    multiplier; v1 consumes coordinates as-is (ordinal recommended but not
+    enforced), so a per-axis rescale lives in dataset prep.
+    """
+
+    uuid: str
+    enabled: bool
+    name: str
+    gain_k: float
+    is_target: bool
+    stratify: bool
+
+    def __init__(self, data: list[(str, Any, type, bool)]):
+        super().__init__(data)
+
+    @staticmethod
+    def default_values():
+        data = []
+
+        # name, default value, data type, nullable
+        data.append(("uuid", str(uuid.uuid4()), str, False))
+        data.append(("enabled", True, bool, False))
+        data.append(("name", "distance", str, False))
+        data.append(("gain_k", 1.0, float, False))
+        data.append(("is_target", True, bool, False))
+        data.append(("stratify", False, bool, False))
+
+        return SliderAxisConfig(data)

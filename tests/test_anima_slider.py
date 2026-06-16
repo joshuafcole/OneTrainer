@@ -27,9 +27,10 @@ sys.modules["modules.util.quantization_util"] = _stub
 
 from modules.dataLoader.AnimaSliderDataLoader import AnimaSliderDataLoader  # noqa: E402
 from modules.modelSetup.AnimaSliderSetup import AnimaSliderSetup  # noqa: E402
-from modules.util.config.SliderConfig import SliderPromptConfig  # noqa: E402
+from modules.util.config.SliderConfig import SliderAxisConfig, SliderPromptConfig  # noqa: E402
 from modules.util.config.TrainConfig import TrainConfig  # noqa: E402
 from modules.util.enum.ConceptType import ConceptType  # noqa: E402
+from modules.util.slider_caption_util import parse_slider_coordinates  # noqa: E402
 
 
 def _config(**overrides) -> TrainConfig:
@@ -164,6 +165,91 @@ def test_caching_encodes_each_prompt_once():
     assert model.encoded == ["hello", "world"], "encode_text should run once per unique prompt"
 
 
+# --------------------------------------------------------------------------
+# coordinate-labeled image regime (docs §10)
+# --------------------------------------------------------------------------
+
+def test_parse_extracts_declared_axis_and_strips():
+    clean, coords = parse_slider_coordinates("a car on a road, (distance:-2)", ["distance"])
+    assert coords == {"distance": -2.0}
+    assert clean == "a car on a road", f"axis token not cleanly stripped: {clean!r}"
+
+
+def test_parse_passes_through_undeclared_emphasis():
+    # a1111 emphasis on a non-axis token must survive untouched
+    clean, coords = parse_slider_coordinates("(red car:1.2), (distance:3)", ["distance"])
+    assert coords == {"distance": 3.0}
+    assert "(red car:1.2)" in clean
+
+
+def test_parse_case_insensitive_float_and_multi_axis():
+    clean, coords = parse_slider_coordinates("x, (Distance:+0.5), (Lighting:-1)", ["distance", "lighting"])
+    assert coords == {"distance": 0.5, "lighting": -1.0}
+    assert clean == "x"
+
+
+def test_parse_no_declared_axes_is_identity():
+    text = "a car, (distance:1)"
+    clean, coords = parse_slider_coordinates(text, [])
+    assert coords == {} and clean == text
+
+
+def _axis(name, gain_k=1.0, is_target=True, enabled=True):
+    a = SliderAxisConfig.default_values()
+    a.name, a.gain_k, a.is_target, a.enabled = name, gain_k, is_target, enabled
+    return a
+
+
+def test_resolve_target_axis_picks_the_single_target():
+    config = _config(slider_axes=[
+        _axis("distance", gain_k=2.0, is_target=True),
+        _axis("lighting", is_target=False),
+    ])
+    ax = AnimaSliderSetup._resolve_target_axis(config)
+    assert ax.name == "distance" and ax.gain_k == 2.0
+
+
+def test_resolve_target_axis_requires_exactly_one():
+    for axes in ([], [_axis("a", is_target=True), _axis("b", is_target=True)]):
+        try:
+            AnimaSliderSetup._resolve_target_axis(_config(slider_axes=axes))
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"expected RuntimeError for axes={axes!r}")
+
+
+def test_make_flow_target_is_rectified_flow():
+    setup = _bare_setup()
+    x0 = torch.randn(1, 16, 1, 8, 8)
+    sigma = 0.3
+    x_t, target = setup._make_flow_target(x0, sigma, torch.float32, torch.Generator().manual_seed(0))
+    # target = noise - x0  =>  noise = target + x0; x_t must be (1-σ)x0 + σ·noise
+    noise = target + x0
+    expected_xt = (1.0 - sigma) * x0 + sigma * noise
+    assert torch.allclose(x_t, expected_xt, atol=1e-5), "x_t is not the rectified-flow interpolation"
+    assert x_t.shape == x0.shape and target.shape == x0.shape
+
+
+def test_coordinate_loss_sets_per_sample_multipliers():
+    setup = _bare_setup()
+    set_calls = []
+    seen = []
+    targets = [torch.zeros(1, 16, 1, 4, 4), torch.ones(1, 16, 1, 4, 4)]
+    multipliers = [-0.5, 1.5]
+
+    def run(i, m):
+        seen.append((i, m))
+        return torch.zeros(1, 16, 1, 4, 4)  # predict zeros for both samples
+
+    loss = setup._slider_coordinate_loss(run, set_calls.append, targets, multipliers)
+    # each sample's multiplier is applied in order, then the adapter is reset to 1.0
+    assert set_calls == [-0.5, 1.5, 1.0], f"multiplier schedule wrong: {set_calls}"
+    assert seen == [(0, -0.5), (1, 1.5)]
+    # mean of mse(0, 0)=0 and mse(0, 1)=1
+    assert abs(loss.item() - 0.5) < 1e-6
+
+
 if __name__ == "__main__":
     test_loader_drives_step_count_and_concept_type()
     test_loader_validation_override()
@@ -172,4 +258,12 @@ if __name__ == "__main__":
     test_build_pairs_preservation_augments_each_context()
     test_latent_shape_parsing()
     test_caching_encodes_each_prompt_once()
+    test_parse_extracts_declared_axis_and_strips()
+    test_parse_passes_through_undeclared_emphasis()
+    test_parse_case_insensitive_float_and_multi_axis()
+    test_parse_no_declared_axes_is_identity()
+    test_resolve_target_axis_picks_the_single_target()
+    test_resolve_target_axis_requires_exactly_one()
+    test_make_flow_target_is_rectified_flow()
+    test_coordinate_loss_sets_per_sample_multipliers()
     print("all anima_slider tests passed")

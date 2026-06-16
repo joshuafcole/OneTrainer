@@ -12,13 +12,20 @@ It implements the BaseDataLoader surface the trainer actually touches
 (``get_data_set().start_next_epoch()`` / ``.approximate_length()`` and
 ``get_data_loader()`` as an iterable), bypassing BaseDataLoader.__init__'s
 MGDS construction.
+
+The (ANIMA, SLIDER) factory slot is owned by a small dispatcher at the bottom of
+this module: the coordinate-labeled IMAGE regime trains on a real dataset, so it
+routes to AnimaSliderImageDataLoader; the PROMPT_PAIR regime uses this
+datasetless loader.
 """
 
+from modules.dataLoader.AnimaSliderImageDataLoader import AnimaSliderImageDataLoader
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.ModelType import ModelType
+from modules.util.enum.SliderRegime import SliderRegime
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.TrainProgress import TrainProgress
 
@@ -94,4 +101,25 @@ class AnimaSliderDataLoader(BaseDataLoader):
         return None
 
 
-factory.register(BaseDataLoader, AnimaSliderDataLoader, ModelType.ANIMA, TrainingMethod.SLIDER)
+def _create_slider_data_loader(
+        train_device: torch.device,
+        temp_device: torch.device,
+        config: TrainConfig,
+        model,
+        model_setup,
+        train_progress: TrainProgress,
+        is_validation: bool = False,
+):
+    """Dispatch the (ANIMA, SLIDER) loader by regime: coordinate-labeled IMAGE
+    sliders train on a real dataset (AnimaSliderImageDataLoader); prompt-pair
+    sliders use this datasetless step-driver."""
+    if config.slider_regime == SliderRegime.IMAGE:
+        return AnimaSliderImageDataLoader(
+            train_device, temp_device, config, model, model_setup, train_progress, is_validation,
+        )
+    return AnimaSliderDataLoader(
+        train_device, temp_device, config, model, model_setup, train_progress, is_validation,
+    )
+
+
+factory.register(BaseDataLoader, _create_slider_data_loader, ModelType.ANIMA, TrainingMethod.SLIDER)

@@ -7,9 +7,12 @@ class SliderRegime(Enum):
     # generated on-manifold by partial flow-matching denoising.
     PROMPT_PAIR = 'PROMPT_PAIR'
 
-    # Image-pair / visual sliders (Eq. 9): before/after image pairs supply the
-    # target velocity; x_t is the noised real latent under an empty prompt.
-    IMAGE_PAIR = 'IMAGE_PAIR'
+    # Coordinate-labeled image sliders (docs §10): a real image dataset whose
+    # captions carry a declared-axis coordinate token, e.g. "(distance:-2)". The
+    # coordinate is stripped from the conditioning and becomes the training-time
+    # adapter multiplier m = k*value (coordinate-scaled reconstruction, CS Eq. 9
+    # generalized). Binary before/after poles are the value in {-1, +1} case.
+    IMAGE = 'IMAGE'
 
     def __str__(self):
         return self.value
