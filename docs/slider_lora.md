@@ -301,3 +301,62 @@ direction it must learn. Leapfrog. Works for both LoRA and LoKr.
   - **Deferred:** image-pair regime (raises NotImplementedError for now); multiplier-
     sweep sampling (samples currently show the adapter at the last-set multiplier,
     ≈ +strength); high-σ timestep weighting (currently uniform in [sigma_min,max]).
+- **2026-06-16** — **S5 image-pair done** (branch `feat/slider-image` off
+  `feat/slider-anima`): the visual (CS Eq. 9) regime is now runnable on Anima.
+  - Config: `SliderImagePairConfig` (before/after/prompt/weight triple) +
+    `TrainConfig.slider_image_pairs` (round-trips via the same BaseConfig list path
+    as `slider_prompts`).
+  - `AnimaSliderSetup`: `predict` now dispatches by regime — `_predict_prompt_pair`
+    (unchanged) and the new `_predict_image_pair`. The image-pair step picks a
+    weighted pair, VAE-encodes before/after to scaled latents (cached per path via
+    `_encode_image`, mirroring AnimaBaseDataLoader: RGB→[-1,1]→5D→`vae.encode().
+    latent_dist.mean`→`scale_latents`), builds the rectified-flow target at a
+    sampled σ (`_make_flow_target`: `x_t=(1-σ)x0+σ·noise`, `v=noise-x0`), and runs
+    the existing `_slider_image_pair_loss` (−strength⇒before/A, +strength⇒after/B)
+    under the pair's conditioning. **No frozen-base forward and no eta** — the flow
+    target IS the supervision. The datasetless loader is reused as-is (it just
+    drives the step count; the setup owns the images).
+  - UI: a "Image pairs · edit image pairs…" button on the Slider tab opens a popup
+    (`SliderImagePairWindow`) hosting a before/after `ConfigList` with image
+    `path_entry`s — kept out of the main tab so it doesn't crowd the prompt-triple
+    list the prompt-pair user is testing.
+  - Tests (CPU, `tests/test_anima_slider.py`): weighted pair selection,
+    `_make_flow_target` rectified-flow identity, `_encode_image` preprocessing
+    (cover-crop to the configured resolution → 5D → /8 latent) + per-path caching,
+    and the empty-pairs guard. GPU-validated forward path still pending.
+  - **`prompt` field = the combined-regime hook** (see §9): empty ⇒ pure
+    empty-prompt image-pair slider; non-empty ⇒ the visual A/B target is learned in
+    that prompt's context (a prompt-anchored image example).
+
+---
+
+## 9. Combined / hybrid regime (forward-looking — not yet built)
+
+Prompt-pair and image-pair are the two CS objectives; a *combined* regime fuses
+them so the slider gets both a **semantic direction** (from the frozen base's
+c+/c− guidance) and **visual grounding** (from concrete before/after exemplars).
+The pieces are already in place to add it as a third `SliderRegime.COMBINED`:
+
+- **Hooks that exist now:** the mixin exposes *both* losses
+  (`_slider_prompt_loss`, `_slider_image_pair_loss`); the setup has both predict
+  paths and both caches; the config carries both lists; image pairs already carry
+  an optional `prompt`.
+- **Design A — prompt-anchored image pairs (cheapest, partially live):** set a
+  `prompt` on each image pair. The visual A/B reconstruction is then learned in
+  that prompt's context, improving locality/disentanglement without a second
+  objective. Already runnable today via the `prompt` field.
+- **Design B — joint loss:** per step, sum `λ·prompt_pair_loss +
+  (1-λ)·image_pair_loss` on a shared adapter (and ideally a shared (x_t, σ)
+  schedule). The prompt pair sets the direction; the image pair pins it to real
+  exemplars. Needs a `slider_combined_lambda` field and a `_predict_combined` that
+  calls both bodies and blends — small once the σ sampling is factored out (a
+  `_sample_sigma(config, rand)` helper both paths can share).
+- **Design C — visual guidance direction:** replace c+/c− text with a *latent*
+  direction `v(x_after) − v(x_before)` under empty prompt as the guidance delta fed
+  into the prompt-style target `v(c_t)+η·Δ`. Lets a slider be defined purely by
+  example images yet still trained with the guided-diff (not just reconstruction)
+  objective — useful when the attribute is hard to phrase but easy to show.
+- **Open question:** whether B/C beat plain prompt-pair enough to justify the
+  per-step cost (B roughly doubles forwards). Decide empirically after the
+  prompt-pair and image-pair baselines are GPU-validated. Until then the `prompt`
+  field (Design A) is the no-cost entry point.

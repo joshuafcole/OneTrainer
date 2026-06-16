@@ -40,3 +40,47 @@ class SliderPromptConfig(BaseConfig):
         data.append(("weight", 1.0, float, False))
 
         return SliderPromptConfig(data)
+
+
+class SliderImagePairConfig(BaseConfig):
+    """One before/after image pair for image-pair (visual) Concept Sliders.
+
+    No text guidance: the flow-matching reconstruction target itself is the
+    supervision (CS Eq. 9). The negative-scaled adapter is trained to
+    reconstruct ``before`` (the A pole) and the positive-scaled adapter to
+    reconstruct ``after`` (the B pole), both under the same conditioning, so the
+    slider's +/- directions align with the visual A->B effect. 3-6 pairs is the
+    recommended range.
+
+    ``prompt`` is the conditioning used for both reconstructions. Empty string =
+    the bare empty-prompt image-pair slider (pure CS Eq. 9). A non-empty prompt
+    turns the pair into a *combined* (prompt-anchored image) example: the visual
+    target is still A/B, but it is learned in the context of that prompt -- the
+    hook the prompt+image hybrid regime builds on (docs/slider_lora.md S5).
+
+    ``weight`` mixes several pairs with unequal sampling probability.
+    """
+
+    uuid: str
+    enabled: bool
+    before: str
+    after: str
+    prompt: str
+    weight: float
+
+    def __init__(self, data: list[(str, Any, type, bool)]):
+        super().__init__(data)
+
+    @staticmethod
+    def default_values():
+        data = []
+
+        # name, default value, data type, nullable
+        data.append(("uuid", str(uuid.uuid4()), str, False))
+        data.append(("enabled", True, bool, False))
+        data.append(("before", "", str, False))
+        data.append(("after", "", str, False))
+        data.append(("prompt", "", str, False))
+        data.append(("weight", 1.0, float, False))
+
+        return SliderImagePairConfig(data)
