@@ -327,6 +327,23 @@ direction it must learn. Leapfrog. Works for both LoRA and LoKr.
   - **`prompt` field = the combined-regime hook** (see §9): empty ⇒ pure
     empty-prompt image-pair slider; non-empty ⇒ the visual A/B target is learned in
     that prompt's context (a prompt-anchored image example).
+- **2026-06-16** — **Image-slider design pivot (design discussion, §10).**
+  The explicit-pair image path above (`slider_image_pairs` list + datasetless
+  self-encoding) is **superseded as design-of-record** by coordinate-labeled image
+  sliders (§10): vanilla concepts + declared-axis caption tokens `(axis:value)`,
+  routed through the real MGDS pipeline. Rationale chain (derived in discussion,
+  not yet built): pairs aren't load-bearing — the only real constraint is *the
+  systematic pole difference must be the attribute and nothing else*, satisfied by
+  matched pairs (cancel confounds per-example) **or** balanced shuffled sets
+  (average them out). "0 = base" is accepted as the neutral, which selects the
+  *reconstruction* objective (no A↔B coupling) over *transport* (where pairs would
+  be in-gradient but 0≠neutral). Per-sample captions risk leaking the axis into the
+  prompt (entangled control); the fix is attribute-⊥ conditioning, achieved cleanly
+  by carrying the axis as an extracted caption coordinate and leaving the rest as
+  context. The explicit-pair code on `feat/slider-image` is now a throwaway
+  prototype; keepers = the mixin loss (unchanged), the regime split, and
+  `_make_flow_target`/`_encode_image` plumbing (reusable). Prompt-pair
+  (`feat/slider-anima`) is unaffected.
 
 ---
 
@@ -360,3 +377,104 @@ The pieces are already in place to add it as a third `SliderRegime.COMBINED`:
   per-step cost (B roughly doubles forwards). Decide empirically after the
   prompt-pair and image-pair baselines are GPU-validated. Until then the `prompt`
   field (Design A) is the no-cost entry point.
+
+---
+
+## 10. Coordinate-labeled image sliders (design of record — supersedes explicit pairs)
+
+The image-slider data model. Replaces the explicit `slider_image_pairs` prototype.
+Derived from first principles in design discussion (see §10.0); not yet built.
+
+### 10.0 What actually constrains slider data (the reasoning)
+
+- **One load-bearing constraint:** the adapter learns whatever *systematically
+  differs between the two poles*, so the systematic pole difference must be the
+  target attribute and **nothing else**. Confounds must be either **shared** (so
+  they cancel) or **balanced/averaged** (so they integrate out).
+- **Fixed pairs are NOT required.** They're one way to satisfy the constraint
+  (cancel confounds per-example, data-efficient). Balanced, shuffled pole-sets are
+  an equally valid way (average confounds out, data-hungry). The mixin's image-pair
+  loss has **zero A↔B coupling** (two independent reconstructions), so co-occurrence
+  of a "pair" in one step does nothing in-gradient — its only value is set balance.
+- **"0 = base" (accepted).** The base model at multiplier 0 is the neutral. This
+  selects the **reconstruction** objective (−s→pole−, +s→pole+, independent), for
+  which 0=base is native — over a **transport** objective (noise around A, target
+  shifts A→B) where pairs *would* be in-gradient but 0 would equal a pole or a
+  blurry midpoint. Transport is parked behind the 0=base decision (a possible
+  future objective, opt-in, knowingly trades away base-as-neutral).
+- **Caption ⊥ polarity is mandatory.** If the conditioning text correlates with the
+  axis (esp. naming the attribute — "close up" vs "far away"), the base reads the
+  attribute from the prompt and the adapter only learns the residual ⇒ entangled,
+  weak control whose effect depends on the inference prompt. So the axis must NOT
+  live in the conditioning text.
+
+### 10.1 The model
+
+Vanilla OT **concepts**, unchanged (folders + sidecar captions + full MGDS
+pipeline: aspect buckets, latent caching, augmentation). The slider axis lives in
+the **caption**, per image, as a declared-axis coordinate token:
+
+```
+caption sidecar:   1girl, red dress, (distance:-2)
+                   1boy, (distance:+1), (age:+1)
+slider config:     declares axis names = ["distance", ...]
+```
+
+A pre-tokenize pipeline step (one `MapData` node) splits each caption into
+`(clean_caption, {axis: float})`: it extracts `(<declared-axis>:<number>)` for the
+declared axes only — passing every other `(token:weight)` through verbatim, so
+a1111 attention weights are untouched — and the **coordinate leaves the
+conditioning** (clean_caption goes to the encoder, coordinate rides as batch
+metadata). That extraction is what makes the conditioning attribute-⊥ for the
+labeled axis automatically.
+
+### 10.2 Objective
+
+Coordinate-scaled reconstruction. For an image at coordinate `ℓ` on the trained
+axis, train the adapter at multiplier `m = k·ℓ` to reconstruct it (flow target
+`v=noise−x0` at a sampled σ, via `_make_flow_target`). Binary polarity is the
+special case `ℓ∈{−1,+1}`; a continuum of `ℓ` teaches a **calibrated, monotonic**
+response across the whole sweep (= our definition of slider quality). The learned
+single low-rank direction `d` must satisfy `base + m·d ≈ reconstruct(image@ℓ)` for
+all samples; off-axis variation is residual and averages out (low rank = the
+disentangler). `ℓ=0` samples are inert for the adapter (delta scaled by 0) — free
+"this is neutral" assertions, usable for eval, not direct training signal.
+
+### 10.3 v1 scope vs fast-follows
+
+**v1 (the build):**
+- Vanilla concepts; declared-axis token extraction; clean_caption → encoder,
+  coordinate → multiplier `m=k·ℓ`.
+- Coordinate is a **float**, consumed roughly as-is (single global gain `k`).
+  Ordinal use (a few levels) is **recommended in docs, not enforced** — so strong
+  continuous labels (lidar distance, measured age) flow through unquantized.
+- **Balancing:** default **coordinate-symmetric** sampling (equalize across the
+  coordinate sign/range so asymmetric datasets don't bias the direction). Opt-in
+  **stratify over a declared confounder axis** (hold a labeled confounder's
+  distribution constant across the trained coordinate — the continuous Eq. 8
+  preservation mean; this is the payoff of *labeling* confounders rather than
+  curating matched folders).
+- Image sliders route through a **real MGDS dataloader** (not the prompt-pair
+  datasetless loader), tagging each item with its coordinate(s).
+
+**Required dataset-prep discipline in v1** (each becomes an automated fast-follow):
+- Keep attribute *prose* out of captions → fast-follow: a configured list of
+  **axis-linked phrases** to auto-strip from the conditioning.
+- Put axis positions on a sane scale (matching the multiplier band) →
+  fast-follow: **per-axis label rescaling/normalization** (so analog units just
+  work without manual scaling).
+
+**Deferred (agreed valuable, later):**
+- **Caption-cluster stratification** — infer confounder contexts from the stripped
+  captions and balance within them, for users who won't explicitly label
+  confounders.
+- **Transport objective** (§10.0) for true in-gradient paired training.
+- Auto-rescale, auto-strip (the two prep steps above).
+
+### 10.4 What carries over from the explicit-pair prototype
+
+Keep: `_slider_image_pair_loss` (mixin, unchanged — coordinate scaling just sets
+the multiplier it's already given), the `predict` regime split,
+`_make_flow_target`, and `_encode_image` (VAE encode → scaled latent). Drop:
+`SliderImagePairConfig` / `slider_image_pairs` / the popup pair editor / the
+datasetless loader for the image path.
