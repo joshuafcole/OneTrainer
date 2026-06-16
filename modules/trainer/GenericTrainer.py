@@ -735,7 +735,7 @@ class GenericTrainer(BaseTrainer):
         config = self.config
         if config.lokr_init_mode != LokrInitMode.GRADIENT or config.peft_type not in (PeftType.LOKR, PeftType.LORA):
             return
-        if config.training_method != TrainingMethod.LORA:
+        if config.training_method not in (TrainingMethod.LORA, TrainingMethod.SLIDER):
             return
         if self.model.train_progress.global_step > 0:
             print("GA init: skipping, training is being resumed.")

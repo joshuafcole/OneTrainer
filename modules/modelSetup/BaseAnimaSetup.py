@@ -217,7 +217,8 @@ class BaseAnimaSetup(
                 config.weight_dtypes().transformer,
                 config.weight_dtypes().text_encoder,
                 config.weight_dtypes().vae,
-                config.weight_dtypes().lora if config.training_method == TrainingMethod.LORA else None,
+                config.weight_dtypes().lora
+                if config.training_method in (TrainingMethod.LORA, TrainingMethod.SLIDER) else None,
                 config.weight_dtypes().embedding if config.train_any_embedding() else None,
             ],
             config.enable_autocast_cache,

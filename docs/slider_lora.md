@@ -273,3 +273,31 @@ direction it must learn. Leapfrog. Works for both LoRA and LoKr.
   tab for `peft_type==LORA`, not just LoKr. Decision (user): prompt-pair is the
   primary S4 regime. All files py-compile. **Next:** S4 — AnimaSliderSetup + minimal
   datasetless prompt-pair loader + factory wiring (setup/saver/loader for ANIMA×SLIDER).
+- **2026-06-16** — **S4 done** (branch `feat/slider-anima` off `feat/slider-config`):
+  prompt-pair Concept Sliders now runnable on Anima.
+  - `AnimaSliderDataLoader` (datasetless): bypasses MGDS, emits
+    `slider_steps_per_epoch` trivial step-driver batches carrying only
+    `concept_type=[STANDARD]*batch_size` (keeps the trainer's prior-prediction
+    paths inert). Implements just the BaseDataLoader surface the trainer touches.
+  - `AnimaSliderSetup(AnimaLoRASetup, ModelSetupSliderMixin)`: reuses all LoRA
+    adapter construction; overrides `predict` to (1) pick a weighted prompt
+    triple, (2) encode c_t/c+/c− (cached per prompt — prompts are fixed all run,
+    so Qwen3+conditioner run once each), (3) build preservation-augmented pairs
+    (bare pair + each `|`-delimited context; mixin averages the delta = CS Eq. 8),
+    (4) generate on-manifold `x_t` by Euler SDEdit under the target at adapter=0
+    (anchor_steps; 0 ⇒ off-manifold Gaussian), (5) run `_slider_prompt_loss` via a
+    `run_velocity` closure over the Cosmos forward + `wrapper.set_multiplier`.
+    `predict` returns `{loss}`; `calculate_loss` unwraps it (the multi-forward
+    objective doesn't fit the single-forward predict/loss split). `setup_train_device`
+    keeps Qwen3+conditioner (+VAE for sampling) resident — no text/latent cache.
+  - Wiring: registered setup + (reused) LoRA saver/loader for ANIMA×SLIDER; sampler
+    works via the existing model-type fallback. Broadened two `==LORA` gates to
+    include SLIDER: BaseAnimaSetup autocast lora-dtype, and **GenericTrainer's GA
+    init gate** — so GA-init now pre-orients a slider adapter along the
+    guidance-difference direction (the §6 leapfrog) automatically.
+  - Test `tests/test_anima_slider.py` (CPU): loader contract + setup helpers
+    (weighted selection, preservation-pair construction, resolution parsing,
+    per-prompt encode caching). Heavier forward path validated on GPU.
+  - **Deferred:** image-pair regime (raises NotImplementedError for now); multiplier-
+    sweep sampling (samples currently show the adapter at the last-set multiplier,
+    ≈ +strength); high-σ timestep weighting (currently uniform in [sigma_min,max]).
