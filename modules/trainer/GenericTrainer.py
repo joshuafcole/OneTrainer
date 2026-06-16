@@ -696,28 +696,35 @@ class GenericTrainer(BaseTrainer):
             self.model.optimizer.eval()
 
     def __lokr_init_cache_path(self) -> str | None:
-        """Cache file for the estimated Kron-GA Van Loan factors.
+        """Cache file for the estimated GA Van Loan factors.
 
         The factors depend on the base model, the dataset, the estimation
-        length and the Kronecker factorization — but NOT on rank (dim), alpha
-        or gain, so one estimation pass serves a whole hyperparameter sweep.
-        Keyed by the inputs that change the estimate; lives under cache_dir
-        next to the latent cache, which has the same reuse semantics.
+        length and the Kronecker factorization — but NOT on LoKr rank (dim),
+        alpha or gain, so one estimation pass serves a whole LoKr sweep. The
+        key also carries peft_type so a LoRA-GA cache (1-tuple right-singular
+        matrices) never collides with a GA cache (2-tuple Van Loan pairs);
+        the LoRA-GA factors are truncated to rank on replay, so lora_rank is
+        included only for LoRA to keep the cached matrices wide enough.
+        Lives under cache_dir next to the latent cache (same reuse semantics).
         """
         config = self.config
         if not config.cache_dir:
             return None
-        key = json.dumps({
+        key_data = {
             "base_model_name": config.base_model_name,
             "concept_file_name": config.concept_file_name,
             "lokr_init_steps": config.lokr_init_steps,
             "lokr_decompose_factor": config.lokr_decompose_factor,
-        }, sort_keys=True)
+            "peft_type": str(config.peft_type),
+        }
+        if config.peft_type == PeftType.LORA:
+            key_data["lora_rank"] = config.lora_rank
+        key = json.dumps(key_data, sort_keys=True)
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         return os.path.join(config.cache_dir, "kron_ga", f"{digest}.pt")
 
     def __run_lokr_gradient_init(self):
-        """Kron-GA: gradient-aligned LoKr initialization (LoRA-GA ported to LoKr).
+        """GA: gradient-aligned LoKr initialization (LoRA-GA ported to LoKr).
 
         Estimates per-layer dL/dW of the frozen base weights over the first
         lokr_init_steps batches, then re-initializes the nonzero LoKr factors
@@ -726,18 +733,18 @@ class GenericTrainer(BaseTrainer):
         first real optimizer step.
         """
         config = self.config
-        if config.peft_type != PeftType.LOKR or config.lokr_init_mode != LokrInitMode.GRADIENT:
+        if config.lokr_init_mode != LokrInitMode.GRADIENT or config.peft_type not in (PeftType.LOKR, PeftType.LORA):
             return
         if config.training_method != TrainingMethod.LORA:
             return
         if self.model.train_progress.global_step > 0:
-            print("Kron-GA init: skipping, training is being resumed.")
+            print("GA init: skipping, training is being resumed.")
             return
         if config.model_names().lora:
-            print("Kron-GA init: skipping, an existing LoKr checkpoint is being loaded.")
+            print("GA init: skipping, an existing LoKr checkpoint is being loaded.")
             return
         if multi.world_size() > 1:
-            print("Kron-GA init: skipping, multi-GPU training is not supported yet.")
+            print("GA init: skipping, multi-GPU training is not supported yet.")
             return
 
         wrappers = [
@@ -752,10 +759,10 @@ class GenericTrainer(BaseTrainer):
             try:
                 cached = torch.load(cache_path, map_location="cpu", weights_only=True)
             except Exception as e:
-                print(f"Kron-GA init: ignoring unreadable cache {cache_path}: {e}")
+                print(f"GA init: ignoring unreadable cache {cache_path}: {e}")
                 cached = None
             if cached is not None:
-                self.callbacks.on_update_status("Kron-GA factor initialization")
+                self.callbacks.on_update_status("GA factor initialization")
                 applied = skipped = 0
                 for wrapper in wrappers:
                     factors = {
@@ -767,10 +774,10 @@ class GenericTrainer(BaseTrainer):
                         factors, config.lokr_init_gain)
                     applied += wrapper_applied
                     skipped += wrapper_skipped
-                print(f"Kron-GA init: applied to {applied} layers ({skipped} skipped) from cache {cache_path}")
+                print(f"GA init: applied to {applied} layers ({skipped} skipped) from cache {cache_path}")
                 return
 
-        self.callbacks.on_update_status("Kron-GA gradient estimation")
+        self.callbacks.on_update_status("GA gradient estimation")
         self.callbacks.on_update_aux_progress("kron-ga", 0, config.lokr_init_steps)
 
         # The fp32 accumulators are weight-shaped, one per adapted Linear:
@@ -832,7 +839,7 @@ class GenericTrainer(BaseTrainer):
                 if step_count >= config.lokr_init_steps:
                     break
 
-        self.callbacks.on_update_status("Kron-GA factor initialization")
+        self.callbacks.on_update_status("GA factor initialization")
         applied = skipped = 0
         all_factors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         for wrapper, estimator in zip(wrappers, estimators, strict=True):
@@ -853,14 +860,14 @@ class GenericTrainer(BaseTrainer):
             try:
                 os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                 torch.save(all_factors, cache_path)
-                print(f"Kron-GA init: cached Van Loan factors to {cache_path}")
+                print(f"GA init: cached Van Loan factors to {cache_path}")
             except OSError as e:
-                print(f"Kron-GA init: failed to write cache {cache_path}: {e}")
+                print(f"GA init: failed to write cache {cache_path}: {e}")
 
         self.model.optimizer.zero_grad(set_to_none=True)
         torch_gc()
         self.callbacks.on_update_aux_progress("kron-ga", 0, 0)
-        print(f"Kron-GA init: applied to {applied} layers ({skipped} skipped) from {step_count} batches.")
+        print(f"GA init: applied to {applied} layers ({skipped} skipped) from {step_count} batches.")
 
     def train(self):
         train_device = torch.device(self.config.train_device)

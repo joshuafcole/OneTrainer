@@ -220,6 +220,19 @@ direction it must learn. Leapfrog. Works for both LoRA and LoKr.
   ‖v(c+)−v(c−)‖/‖v(c_t)‖ over prompt triples × timesteps via OT's own
   encode_text + Cosmos forward. Run on GPU before building S3.
 - Next: run both (test + probe) in venv; then GA-LoRA backport (§6) and S2/S3.
+- **2026-06-16** — **GA-LoRA backport done** (branch `feat/lora-ga-init` off
+  `feat/peft-multiplier`). `LoRAModule.init_from_gradient`/`init_from_factors`
+  (SVD of dL/dW → lora_down = top-r right singular vectors, norm-matched;
+  lora_up stays 0). `LoRAModuleWrapper.init_lokr_from_gradients`/`_from_factors`
+  now dispatch by type (Kron-GA for LoKr 2-tuple, LoRA-GA for LoRA 1-tuple,
+  DoRA skipped). `GenericTrainer` GA gate broadened to `peft_type ∈ {LOKR,
+  LORA}`; cache digest keyed by `peft_type` (+ `lora_rank` for LoRA) to avoid
+  cross-type collisions; user-facing logs say "GA" not "Kron-GA". Test
+  `tests/test_lora_grad_init.py`.
+  **Known limitation:** the trigger is the LoKr-named `lokr_init_mode=GRADIENT`
+  flag; surfacing a GA toggle on the LoRA UI tab is a follow-up (will fold into
+  the S2 slider config). For sliders, the estimated dL/dW *is* the
+  guidance-difference direction, so this pre-orients the adapter (the leapfrog).
 - **2026-06-16** — Tests pass in venv (`test_peft_multiplier`, `test_lora_grad_init`).
   **Probe v1 result:** mean rel_guid=0.018 on *off-manifold Gaussian* x_t with raw
   (un-amplified) differences — borderline by an arbitrary 0.02 cutoff, BUT

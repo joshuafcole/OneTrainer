@@ -642,6 +642,60 @@ class LoRAModule(PeftBase):
         assert self.lora_down is not None
         assert self.lora_up is not None
 
+    def init_from_gradient(self, grad: Tensor, gain: float = 1.0) -> Tensor | None:
+        """Gradient-aligned (LoRA-GA) initialization -- the LoRA analogue of
+        LoKrModule.init_from_gradient.
+
+        Sets lora_down to the top-rank right singular vectors of the estimated
+        weight gradient (norm-matched to the kaiming init) and leaves lora_up at
+        zero, so the adapter output stays exactly zero. The first optimizer step
+        then drives the delta toward the rank-r truncation of the gradient: with
+        A = lora_down = Vᵣᵀ and B = lora_up = 0, dL/dB ∝ G·Aᵀ = Uᵣ·Σᵣ, so after
+        one step B·A ∝ -Gᵣ -- the LoRA-GA first-step property. For slider
+        training the estimated gradient is itself the guidance-difference
+        direction, so this pre-orients the slider along what it must learn.
+
+        Returns the top-rank right singular vectors (shape (r, in_features)) so
+        they can be cached and replayed via init_from_factors, or None if the
+        layer is unsupported or the gradient is degenerate. (Only the top r rows
+        are kept, so the cache stays small for wide DiT layers; the cache key
+        therefore carries lora_rank.)
+        """
+        if not isinstance(self.orig_module, nn.Linear):
+            return None
+        device = self.lora_down.weight.device
+        g = grad.to(device=device, dtype=torch.float32)
+        try:
+            _, s, vh = torch.linalg.svd(g, full_matrices=False)
+        except Exception:  # noqa: BLE001 -- a non-converging SVD just skips the layer
+            return None
+        if s.numel() == 0 or not torch.isfinite(s[0]) or s[0] == 0:
+            return None
+        vh_r = vh[: self.rank, :].contiguous()
+        return vh_r if self.init_from_factors(vh_r, gain) else None
+
+    def init_from_factors(self, vh: Tensor, gain: float = 1.0) -> bool:
+        """Applies a fresh-or-cached right-singular matrix (rows are the
+        input-space directions of the gradient) to lora_down -- truncated to
+        rank, norm-matched to the existing init. lora_up stays zero so the
+        adapter output remains exactly zero. Shape-checked so a stale cache is
+        rejected rather than misapplied."""
+        if not isinstance(self.orig_module, nn.Linear):
+            return False
+        in_features = self.lora_down.weight.shape[1]
+        if vh.dim() != 2 or vh.shape[1] != in_features:
+            return False
+        r = min(self.rank, vh.shape[0])
+        device = self.lora_down.weight.device
+        vh = vh.to(device=device, dtype=torch.float32)
+        with torch.no_grad():
+            target_norm = self.lora_down.weight.detach().float().norm()
+            new_down = self.lora_down.weight.detach().float().clone()
+            new_down[:r, :] = vh[:r, :]
+            new_down *= gain * target_norm / new_down.norm().clamp_min(1e-12)
+            self.lora_down.weight.copy_(new_down.to(self.lora_down.weight.dtype))
+        return True
+
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
         if isinstance(self.orig_module, BaseLinearSVD):
@@ -1117,45 +1171,58 @@ class LoRAModuleWrapper:
 
     def init_lokr_from_gradients(
             self, grads: Mapping[str, Tensor], gain: float = 1.0,
-    ) -> tuple[int, int, dict[str, tuple[Tensor, Tensor]]]:
-        """Applies gradient-aligned (Kron-GA) initialization to all LoKr modules.
+    ) -> tuple[int, int, dict[str, tuple[Tensor, ...]]]:
+        """Gradient-aligned init for every adapter module that supports it:
+        Kron-GA for LoKr, LoRA-GA for LoRA. DoRA is skipped (its
+        magnitude/direction split has no clean gradient-aligned init).
 
-        grads maps the same short names used by lora_modules to estimated
-        dL/dW tensors of the original weights. Returns (applied, skipped,
-        factors), where factors holds each applied layer's Van Loan pair on
-        CPU for caching (replayable via init_lokr_from_factors).
+        grads maps lora_modules short names to estimated dL/dW of the original
+        weights. Returns (applied, skipped, factors); factors caches each
+        applied layer's replayable tensors on CPU -- a 2-tuple (Van Loan pair)
+        for LoKr, a 1-tuple (right-singular matrix) for LoRA -- for
+        init_lokr_from_factors.
         """
         applied = 0
         skipped = 0
-        factors: dict[str, tuple[Tensor, Tensor]] = {}
+        factors: dict[str, tuple[Tensor, ...]] = {}
         for name, module in self.lora_modules.items():
             grad = grads.get(name)
-            pair = (
-                module.init_from_gradient(grad, gain)
-                if isinstance(module, LoKrModule) and grad is not None
-                else None
-            )
-            if pair is not None:
-                factors[name] = (pair[0].detach().cpu(), pair[1].detach().cpu())
+            cached: tuple[Tensor, ...] | None = None
+            if grad is not None:
+                if isinstance(module, LoKrModule):
+                    pair = module.init_from_gradient(grad, gain)
+                    if pair is not None:
+                        cached = (pair[0].detach().cpu(), pair[1].detach().cpu())
+                elif isinstance(module, DoRAModule):
+                    cached = None  # unsupported -- skip (DoRAModule subclasses LoRAModule)
+                elif isinstance(module, LoRAModule):
+                    vh = module.init_from_gradient(grad, gain)
+                    if vh is not None:
+                        cached = (vh.detach().cpu(),)
+            if cached is not None:
+                factors[name] = cached
                 applied += 1
             else:
                 skipped += 1
         return applied, skipped, factors
 
     def init_lokr_from_factors(
-            self, factors: Mapping[str, tuple[Tensor, Tensor]], gain: float = 1.0,
+            self, factors: Mapping[str, tuple[Tensor, ...]], gain: float = 1.0,
     ) -> tuple[int, int]:
-        """Replays cached Kron-GA Van Loan factor pairs (see
-        init_lokr_from_gradients) onto all LoKr modules. Returns (applied, skipped)."""
+        """Replays cached gradient-aligned factors (see init_lokr_from_gradients)
+        onto LoKr (2-tuple) and LoRA (1-tuple) modules. Returns (applied,
+        skipped). Type/shape/arity mismatches are skipped, not misapplied."""
         applied = 0
         skipped = 0
         for name, module in self.lora_modules.items():
-            pair = factors.get(name)
-            if (
-                isinstance(module, LoKrModule)
-                and pair is not None
-                and module.init_from_factors(pair[0], pair[1], gain)
-            ):
+            f = factors.get(name)
+            ok = False
+            if f is not None and not isinstance(module, DoRAModule):
+                if isinstance(module, LoKrModule) and len(f) == 2:
+                    ok = module.init_from_factors(f[0], f[1], gain)
+                elif isinstance(module, LoRAModule) and len(f) == 1:
+                    ok = module.init_from_factors(f[0], gain)
+            if ok:
                 applied += 1
             else:
                 skipped += 1
