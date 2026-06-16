@@ -220,3 +220,14 @@ direction it must learn. Leapfrog. Works for both LoRA and LoKr.
   ‖v(c+)−v(c−)‖/‖v(c_t)‖ over prompt triples × timesteps via OT's own
   encode_text + Cosmos forward. Run on GPU before building S3.
 - Next: run both (test + probe) in venv; then GA-LoRA backport (§6) and S2/S3.
+- **2026-06-16** — Tests pass in venv (`test_peft_multiplier`, `test_lora_grad_init`).
+  **Probe v1 result:** mean rel_guid=0.018 on *off-manifold Gaussian* x_t with raw
+  (un-amplified) differences — borderline by an arbitrary 0.02 cutoff, BUT
+  `cos_align` consistently positive (mean ~0.4) and the signal scaled correctly
+  with timestep → a real, coherent conditioning direction, not a distilled/blind
+  model. Two confounds identified: off-manifold latents and no "does it use
+  conditioning at all" baseline. **Probe v2** (default now): on-manifold x_t via a
+  short flow-matching Euler denoise, an empty-prompt baseline
+  `rel_cfg=‖v(c_t)−v(∅)‖/‖v(c_t)‖`, and stronger polar prompts. Verdict keys on
+  rel_cfg (conditioning-blind?) + cos_align (coherent axis?). Awaiting v2 numbers
+  before committing to S3.
