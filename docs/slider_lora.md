@@ -1,24 +1,55 @@
 # Slider LoRA training in OneTrainer — design & working doc
 
-> Living reference for adding **slider-LoRA (Concept Sliders)** training to OneTrainer.
-> Initial target: **Anima** (flow-matching Cosmos-Predict2 DiT). Status log at the bottom.
+> Living reference for **slider-LoRA (Concept Sliders)** training in OneTrainer.
+> Target: **Anima** (flow-matching Cosmos-Predict2 DiT). Both regimes are
+> implemented; see **Current status** below, the chronological **§8 status log**,
+> and **§10 Deferred / future work** at the very bottom.
+
+---
+
+## Current status (as implemented)
+
+Both training regimes are wired end-to-end for Anima and unit-tested; **first
+end-to-end GPU validation is still pending** (the authoring sandbox has no
+torch/mgds, so the multi-forward predict paths are verified only by py-compile +
+pure-function tests).
+
+- **Prompt-pair sliders** — text-only, no dataset (§1, §2). Implemented in
+  `AnimaSliderSetup._predict_prompt_pair` + `ModelSetupSliderMixin._slider_prompt_loss`,
+  datasetless `AnimaSliderDataLoader`.
+- **Coordinate-labeled image sliders** — real dataset; each caption carries an
+  axis coordinate token `(distance:-2)` that becomes the adapter multiplier
+  `m = k·coordinate` (§9). Implemented in `_predict_coordinate` +
+  `_slider_coordinate_loss`, `AnimaSliderImageDataLoader`. **Supersedes** the
+  explicit before/after-pair prototype (abandoned on `feat/slider-image`).
+- **GA-init leapfrog** — gradient-aligned init backported from LoKr to plain LoRA
+  (§6) and auto-engaged for slider runs.
+- **UI** — `SliderTab` (regime-aware), TopBar "Slider" method for Anima only,
+  shared LoRA tab. See §8 for the plumbing audit.
+- A separate web-UI configuration/handoff spec lives in
+  `docs/slider_training_config_spec.md`.
+
+Branch stack (origin = the fork): `feat/peft-multiplier` → `feat/lora-ga-init` →
+`feat/slider-core` → `feat/slider-config` → `feat/slider-anima` →
+**`feat/slider-coordinate`** (current tip). `feat/slider-image` is abandoned.
 
 ---
 
 ## 0. Goal & scope
 
-Add high-quality slider-LoRA training to OneTrainer. A *slider* is a LoRA whose
-**signed multiplier** is a continuous control knob: `+α` pushes a concept one way,
-`−α` the other, `0` is the base model. Both methodologies are in scope:
+A *slider* is a LoRA whose **signed multiplier** is a continuous control knob:
+`+α` pushes a concept one way, `−α` the other, `0` is the base model. Both
+methodologies are implemented:
 
-- **Prompt-pair sliders** (Concept Sliders, text-only, no image dataset)
-- **Image-pair / anchor sliders** (Concept Sliders Eq. 9, 3–6 before/after pairs)
-- **Novel hybrid:** gradient-aligned (GA) init of the slider from the
-  guidance-difference gradient — leapfrog training. See §6.
+- **Prompt-pair sliders** (Concept Sliders, text-only, no image dataset) — §1, §2.
+- **Coordinate-labeled image sliders** (real dataset; per-image caption coordinate
+  → adapter multiplier; CS Eq. 9 generalized) — §9.
+- **Gradient-aligned (GA) init** of the slider from the guidance-difference
+  gradient — leapfrog training — §6.
 
-PEFT network: default **low-rank standard LoRA**; LoKr supported but considered
-overkill for sliders. GA-init (currently LoKr-only) to be **backported to plain
-LoRA** so sliders can leapfrog regardless of network type.
+PEFT network: default **low-rank standard LoRA**; LoKr supported but overkill for
+sliders. GA-init was **backported from LoKr to plain LoRA** so sliders leapfrog
+regardless of network type.
 
 ---
 
@@ -53,6 +84,11 @@ stays invariant to them.
 No text. Train the LoRA in **both** directions on a before/after pair with an
 empty prompt — negative-scaled LoRA reconstructs image A, positive-scaled
 reconstructs image B. Works with **3–6 pairs**.
+
+> *Implementation note:* OT generalizes this to **coordinate-labeled** sliders
+> (per-image caption coordinate → multiplier `m=k·ℓ`; binary poles `ℓ∈{−1,+1}`
+> are the special case). The explicit-pair form is the conceptual ancestor; see
+> §9 for what was actually built and why pairs were dropped.
 
 ### 1.4 Inference strength is decoupled from training η
 
@@ -138,6 +174,10 @@ locally disentangled, base fidelity preserved at multiplier 0.
 
 ## 4. OT gap analysis (code-grounded)
 
+> **Resolved.** This was the original gap analysis. Every row below is now
+> implemented (S1–S4 + §9); the one remaining ◑ is multiplier-sweep sampling,
+> tracked in §10. Kept for context on what the work entailed.
+
 | Capability | Status in OT | Needed |
 |---|---|---|
 | Velocity slider objective | ✗ `BaseAnimaSetup.predict` is single-forward `{predicted, target=noise−image}` | new multi-forward predict + loss |
@@ -159,21 +199,23 @@ Key files: `modules/modelSetup/BaseAnimaSetup.py` (predict :394, loss :626),
 
 ## 5. Stacked-branch plan
 
-Stacked on `feat/ga-init`. Each branch = one reviewable PR.
+Stacked on `feat/ga-init`. Each branch = one reviewable PR. **S1–S4 + the
+coordinate-image branch are done and pushed; S5 is not built.**
 
-- **S1 · `feat/peft-multiplier`** *(in progress)* — runtime signed multiplier on
+- **S1 · `feat/peft-multiplier`** ✅ — runtime signed multiplier on
   `PeftBase`/`LoRAModuleWrapper`; enables base passes (m=0), ± training passes,
   and the inference slider knob. Foundational, model-agnostic.
-- **S2 · `feat/slider-config`** — `TrainingMethod.SLIDER` + `TrainConfig` fields
-  (target/positive/unconditional/neutral prompts, preservation set P, η, direction
-  mode, regime, x_t-gen settings) + UI.
-- **S3 · `feat/slider-core`** — model-agnostic slider objective mixin: velocity
-  guided-diff loss (Eq. 7/8), image-pair loss (Eq. 9), SDEdit `x_t` generator.
-- **S4 · `feat/slider-anima`** — `AnimaSliderSetup` wiring, data paths, factory
-  registration, saver/spec, multiplier-sweep sampling.
-- **S5 · `feat/slider-eval`** *(optional)* — CLIP monotonicity + disentanglement.
-
-GA-init backport (§6) slots in as a prerequisite enhancement consumed by S3/S4.
+- **GA-init backport · `feat/lora-ga-init`** ✅ — §6; consumed by S3/S4.
+- **S3 · `feat/slider-core`** ✅ — model-agnostic slider objective mixin: velocity
+  guided-diff loss (Eq. 7/8), image-pair / coordinate loss, SDEdit `x_t` generator.
+- **S2 · `feat/slider-config`** ✅ — `TrainingMethod.SLIDER` + `TrainConfig` fields
+  (prompts, preservation set P, η, regime, x_t-gen settings) + `SliderTab` UI.
+- **S4 · `feat/slider-anima`** ✅ — `AnimaSliderSetup` prompt-pair wiring, datasetless
+  loader, factory + saver/loader registration.
+- **Coordinate image · `feat/slider-coordinate`** ✅ (current tip) — §9.
+  Superseded the explicit-pair `feat/slider-image` (abandoned).
+- **S5 · `feat/slider-eval`** ☐ *(optional, not built)* — CLIP monotonicity +
+  disentanglement eval callback. See §10.
 
 ---
 
@@ -197,12 +239,17 @@ direction it must learn. Leapfrog. Works for both LoRA and LoKr.
 
 ## 7. Open experiments (literature can't answer)
 
-1. **Anima CFG response / not distilled** — `v(c+) − v(c−)` must be non-trivial.
-   Highest risk, cheapest. Probe script: `scripts/util/probe_anima_cfg_response.py`.
+**Resolved:**
+1. ✅ **Anima CFG response / not distilled** — probe v2 verdict **VIABLE**
+   (rel_guid≈0.029, rel_cfg≈0.024, cos≈0.54, ratio≈1.2; signal concentrates at
+   high σ). The §2 core assumption holds. Script:
+   `scripts/util/probe_anima_cfg_response.py`. (See §8.)
+
+**Still open (need the first real training runs):**
 2. Which conditioning path (Qwen3 vs frozen T5 adapter) carries c+/c−; best preset.
 3. LoKr + Kron-GA vs low-rank LoRA (+ GA) for disentanglement & multiplier linearity.
 4. η / rank / alpha / step-count envelope; verify α/η decoupling holds in velocity space.
-5. Prompt-only SDEdit `x_t` vs image-pair on Anima — quality/cost tradeoff.
+5. Prompt-pair SDEdit `x_t` vs coordinate-image on Anima — quality/cost tradeoff.
 
 ---
 
@@ -261,7 +308,8 @@ direction it must learn. Leapfrog. Works for both LoRA and LoKr.
   mirrors +strength. **Next:** S2 (config/enum + GA UI toggle) and S4 (AnimaSliderSetup
   wiring: build x_t, the run_velocity closure, factory reg, multiplier-sweep sampling).
 - **2026-06-16** — **S2 done** (branch `feat/slider-config` off `feat/slider-core`):
-  `TrainingMethod.SLIDER`; `SliderRegime` enum (PROMPT_PAIR / IMAGE_PAIR);
+  `TrainingMethod.SLIDER`; `SliderRegime` enum (PROMPT_PAIR / IMAGE_PAIR — the
+  latter later renamed `IMAGE`, see §9.3);
   `SliderPromptConfig` (target/positive/negative/weight triple) + `TrainConfig`
   fields `slider_{regime,prompts,preservation_prompts,eta,strength,symmetric,
   steps_per_epoch,anchor_steps,sigma_min,sigma_max}` (round-trips via BaseConfig
@@ -298,9 +346,9 @@ direction it must learn. Leapfrog. Works for both LoRA and LoKr.
   - Test `tests/test_anima_slider.py` (CPU): loader contract + setup helpers
     (weighted selection, preservation-pair construction, resolution parsing,
     per-prompt encode caching). Heavier forward path validated on GPU.
-  - **Deferred:** image-pair regime (raises NotImplementedError for now); multiplier-
-    sweep sampling (samples currently show the adapter at the last-set multiplier,
-    ≈ +strength); high-σ timestep weighting (currently uniform in [sigma_min,max]).
+  - *(At this point the image regime raised NotImplementedError; it was later
+    implemented as coordinate-labeled sliders — §9. Remaining deferrals are
+    consolidated in §10.)*
 
 ## 9. Coordinate-labeled image sliders (design of record + as-built)
 
@@ -388,10 +436,8 @@ What genuinely carries over: `_make_flow_target`, the `predict` regime split, th
   slider datasets (extraction runs before it, but a dropout-eaten coordinate tag
   would be lost).
 - **Decisions (user):** single target axis; defer the stratified sampler; build now.
-- **Fast-follows:** auto-strip an axis-linked phrase list; per-axis label rescale;
-  **caption-cluster / confounder stratified sampler** (the `stratify` flag is the
-  hook); coordinate-symmetric sampling default; high-σ timestep weighting; transport
-  objective.
+- **Fast-follows:** consolidated in §10 (auto-strip phrase list, per-axis rescale,
+  stratified sampler, etc.).
 
 - **2026-06-16** — **§9 coordinate image sliders implemented** (branch
   `feat/slider-coordinate` off `feat/slider-anima`; the explicit-pair
@@ -420,3 +466,49 @@ What genuinely carries over: `_make_flow_target`, the `predict` regime split, th
   validation framework is per-widget; cross-field slider validation is a
   fast-follow). Multiplier-sweep sampling still deferred (samples use the adapter's
   last-set multiplier).
+
+---
+
+## 10. Deferred / future work
+
+Nothing below is implemented. Ordered roughly by value.
+
+**Validation now (first GPU runs).**
+- End-to-end GPU validation of both regimes — the multi-forward predict paths are
+  verified only by py-compile + pure-function unit tests. Confirms: prompt-pair
+  guidance forward; coordinate MGDS pipeline (in-place caption strip ordering +
+  `slider_coordinate` surviving the cache) + per-sample forward/scale shapes.
+- The open experiments in §7 (#2–#5): conditioning path, network type, η/rank/step
+  envelope, prompt-pair vs coordinate-image quality/cost.
+
+**Training quality.**
+- **High-σ timestep weighting.** The probe found the attribute signal concentrates
+  at high σ; both regimes currently sample σ uniformly in `[sigma_min, sigma_max]`.
+- **Confounder-stratified sampler** (coordinate regime). The `SliderAxisConfig.stratify`
+  flag is the hook; v1 relies on a coordinate-balanced dataset prepared by hand.
+  Includes a coordinate-symmetric sampling default.
+- **Transport objective** (coordinate regime, parked): pairs become in-gradient but
+  `0 ≠ neutral`; we chose reconstruction so `0 = base` (§9.0).
+
+**Dataset-prep automation (coordinate regime).** v1 requires manual prep:
+- Auto-strip an axis-linked phrase list from captions (so the user need not keep
+  attribute prose out by hand).
+- Per-axis coordinate auto-rescale (v1 consumes raw coordinates × `gain_k`).
+
+**Sampling / preview.**
+- **Multiplier-sweep sampling.** During-training samples render at the adapter's
+  last-set multiplier, not a `−s…0…+s` sweep, so they are not a true slider preview.
+  True previews require post-train inference at several multipliers.
+
+**Evaluation (S5, optional).** CLIP attribute-score monotonicity across a multiplier
+sweep + disentanglement (unrelated attributes stay flat) + base fidelity at `m=0`.
+
+**Combined / hybrid regime.** Joint prompt + image objective on a shared adapter/σ
+(per-pair `prompt` is the hook), and/or a visual guidance direction
+`v(x_after) − v(x_before)` fed into a prompt-style target. Decide empirically after
+the baselines are GPU-validated.
+
+**UX / platform.**
+- Pre-flight cross-field slider validation surfaced in the UI (today misconfig is a
+  clear RuntimeError at train start).
+- Slider support for base models beyond Anima.
