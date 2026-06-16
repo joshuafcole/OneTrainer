@@ -22,6 +22,7 @@ from modules.ui.CloudTab import CloudTab
 from modules.ui.ConceptTab import ConceptTab
 from modules.ui.ConvertModelUI import ConvertModelUI
 from modules.ui.LoraTab import LoraTab
+from modules.ui.SliderTab import SliderTab
 from modules.ui.ModelTab import ModelTab
 from modules.ui.ProfilingWindow import ProfilingWindow
 from modules.ui.SampleWindow import SampleWindow
@@ -122,6 +123,7 @@ class TrainUI(ctk.CTk):
         self.model_tab = None
         self.training_tab = None
         self.lora_tab = None
+        self.slider_tab = None
         self.cloud_tab = None
         self.additional_embeddings_tab = None
 
@@ -588,6 +590,9 @@ class TrainUI(ctk.CTk):
         if self.lora_tab:
             self.lora_tab.refresh_ui()
 
+        if self.slider_tab:
+            self.slider_tab.refresh_ui()
+
     def change_training_method(self, training_method: TrainingMethod):
         if not self.tabview:
             return
@@ -595,14 +600,23 @@ class TrainUI(ctk.CTk):
         if self.model_tab:
             self.model_tab.refresh_ui()
 
-        if training_method != TrainingMethod.LORA and "LoRA" in self.tabview._tab_dict:
+        # The LoRA tab is shared by LoRA and Slider training (a slider IS a LoRA
+        # adapter; the Slider tab only adds the slider objective config).
+        lora_methods = (TrainingMethod.LORA, TrainingMethod.SLIDER)
+
+        if training_method not in lora_methods and "LoRA" in self.tabview._tab_dict:
             self.tabview.delete("LoRA")
             self.lora_tab = None
+        if training_method != TrainingMethod.SLIDER and "slider" in self.tabview._tab_dict:
+            self.tabview.delete("slider")
+            self.slider_tab = None
         if training_method != TrainingMethod.EMBEDDING and "embedding" in self.tabview._tab_dict:
             self.tabview.delete("embedding")
 
-        if training_method == TrainingMethod.LORA and "LoRA" not in self.tabview._tab_dict:
+        if training_method in lora_methods and "LoRA" not in self.tabview._tab_dict:
             self.lora_tab = LoraTab(self.tabview.add("LoRA"), self.train_config, self.ui_state)
+        if training_method == TrainingMethod.SLIDER and "slider" not in self.tabview._tab_dict:
+            self.slider_tab = SliderTab(self.tabview.add("slider"), self.train_config, self.ui_state)
         if training_method == TrainingMethod.EMBEDDING and "embedding" not in self.tabview._tab_dict:
             self.embedding_tab(self.tabview.add("embedding"))
 
@@ -626,6 +640,9 @@ class TrainUI(ctk.CTk):
 
         if self.lora_tab:
             self.lora_tab.refresh_ui()
+
+        if self.slider_tab:
+            self.slider_tab.refresh_ui()
 
         if self.additional_embeddings_tab:
             self.additional_embeddings_tab.refresh_ui()

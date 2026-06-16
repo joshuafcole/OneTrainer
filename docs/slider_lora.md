@@ -260,3 +260,16 @@ direction it must learn. Leapfrog. Works for both LoRA and LoKr.
   loss learns the guidance direction (cos>0.99, rel_err<0.1) and the −strength pole
   mirrors +strength. **Next:** S2 (config/enum + GA UI toggle) and S4 (AnimaSliderSetup
   wiring: build x_t, the run_velocity closure, factory reg, multiplier-sweep sampling).
+- **2026-06-16** — **S2 done** (branch `feat/slider-config` off `feat/slider-core`):
+  `TrainingMethod.SLIDER`; `SliderRegime` enum (PROMPT_PAIR / IMAGE_PAIR);
+  `SliderPromptConfig` (target/positive/negative/weight triple) + `TrainConfig`
+  fields `slider_{regime,prompts,preservation_prompts,eta,strength,symmetric,
+  steps_per_epoch,anchor_steps,sigma_min,sigma_max}` (round-trips via BaseConfig
+  list handling, like additional_embeddings). UI: new `SliderTab` (prompt-pair list
+  + scalar settings; preservation prompts pipe-delimited single-line) shown for
+  SLIDER alongside the shared LoRA tab; TopBar exposes "Slider" for Anima only.
+  **GA toggle resolved:** the gradient-aligned init controls (mode/steps/gain/offload,
+  reusing the `lokr_init_*` fields the GA backport generalized) now appear on the LoRA
+  tab for `peft_type==LORA`, not just LoKr. Decision (user): prompt-pair is the
+  primary S4 regime. All files py-compile. **Next:** S4 — AnimaSliderSetup + minimal
+  datasetless prompt-pair loader + factory wiring (setup/saver/loader for ANIMA×SLIDER).

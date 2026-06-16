@@ -88,6 +88,29 @@ class LoraTab:
                              tooltip="Apply the weight decomposition on the output axis instead of the input axis.")
             components.switch(master, 3, 4, self.ui_state, "lora_decompose_output_axis")
 
+            # Gradient-aligned (GA) initialization. Shares the lokr_init_* fields
+            # (GenericTrainer's GA pass dispatches on peft_type). Not applicable to
+            # DoRA, which is initialized to the identity; leaving it on Default there
+            # is the safe no-op.
+            components.label(master, 4, 3, "Initialization",
+                             tooltip="Default: random (Kaiming) initialization. Gradient (GA): estimates the base weight gradients over the first few batches and points lora_down at the top-r right singular vectors of the mean gradient (norm-matched), keeping lora_up=0 so the model output is unchanged until the first optimizer step. Speeds up early convergence; for sliders it pre-orients the adapter along the guidance-difference direction. Not used for DoRA.")
+            components.options_kv(master, 4, 4, [
+                ("Default", LokrInitMode.DEFAULT),
+                ("Gradient (GA)", LokrInitMode.GRADIENT),
+            ], self.ui_state, "lokr_init_mode")
+
+            components.label(master, 5, 3, "Init Estimation Steps",
+                             tooltip="Number of batches used to estimate the gradients for the GA initialization.")
+            components.entry(master, 5, 4, self.ui_state, "lokr_init_steps")
+
+            components.label(master, 6, 3, "Init Gain",
+                             tooltip="Multiplier on the norm of the gradient-aligned initial factors, relative to the default initialization's norm. 1.0 matches the default magnitudes exactly.")
+            components.entry(master, 6, 4, self.ui_state, "lokr_init_gain")
+
+            components.label(master, 7, 3, "Offload Init Grads",
+                             tooltip="Accumulates the GA gradient estimates in CPU memory instead of VRAM. Slower (one device-to-host transfer per layer per batch), but frees one fp32 weight-sized buffer per adapted layer from VRAM during the estimation pass.")
+            components.switch(master, 7, 4, self.ui_state, "lokr_init_offload")
+
         # LoRA and LoHA shared settings
         if peft_type == PeftType.LORA or peft_type == PeftType.LOHA:
             # rank

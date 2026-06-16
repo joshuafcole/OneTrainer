@@ -146,6 +146,10 @@ class TopBar:
                 ("LoRA", TrainingMethod.LORA),
             ]
 
+        # Slider (Concept Sliders) training is only wired for Anima so far.
+        if self.train_config.model_type.is_anima():
+            values.append(("Slider", TrainingMethod.SLIDER))
+
         # training method
         self.training_method = components.options_kv(
             master=self.frame,

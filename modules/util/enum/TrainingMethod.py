@@ -6,6 +6,7 @@ class TrainingMethod(Enum):
     LORA = 'LORA'
     EMBEDDING = 'EMBEDDING'
     FINE_TUNE_VAE = 'FINE_TUNE_VAE'
+    SLIDER = 'SLIDER'
 
     def __str__(self):
         return self.value
