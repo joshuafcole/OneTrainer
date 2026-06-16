@@ -28,6 +28,7 @@ class PeftBase(nn.Module):
     prefix: str
     layer_kwargs: dict  # Applied during the forward op() call.
     _initialized: bool  # Tracks whether we've created the layers or not.
+    multiplier: float  # Signed scale on the adapter delta (the "slider" knob).
 
     def __init__(self, prefix: str, orig_module: nn.Module | None):
         super().__init__()
@@ -36,6 +37,12 @@ class PeftBase(nn.Module):
         self.is_applied = False
         self.layer_kwargs = {}
         self._initialized = False
+        # Runtime scale applied to the adapter's *delta* contribution only
+        # (orig_forward(x) is never scaled). 1.0 is a no-op so normal LoRA
+        # training/inference is unchanged. Slider training drives this to
+        # 0.0 (frozen-base pass) and +/- values (the +/- direction passes),
+        # and it doubles as the user-facing inference slider strength.
+        self.multiplier = 1.0
 
         if orig_module is not None:
             match orig_module:
@@ -77,6 +84,16 @@ class PeftBase(nn.Module):
     def _wrap_eval(self):
         self.orig_eval()
         self.eval()
+
+    def set_multiplier(self, multiplier: float):
+        """Set the signed scale applied to this adapter's delta contribution.
+
+        Additive PEFT types (LoRA, LoHa, LoKr without weight-decompose) honour
+        any real multiplier, including negatives. Non-additive types
+        (DoRA / OFT / SVD-merged) raise on a non-default multiplier in their
+        forward, since a signed delta scale isn't well-defined there.
+        """
+        self.multiplier = float(multiplier)
 
     def make_weight(self, A: Tensor, B: Tensor):
         """Layer-type-independent way of creating a weight matrix from LoRA A/B.
@@ -272,7 +289,7 @@ class LoHaModule(PeftBase):
         # Lycoris defines them in the opposite order. Yeah, it's confusing.
         W1 = self.make_weight(self.dropout(self.hada_w1_b), self.dropout(self.hada_w1_a))
         W2 = self.make_weight(self.dropout(self.hada_w2_b), self.dropout(self.hada_w2_a))
-        W = (W1 * W2) * (self.alpha / self.rank)
+        W = (W1 * W2) * (self.alpha / self.rank) * self.multiplier
         return self.orig_forward(x) + self.op(x, W, bias=None, **self.layer_kwargs)
 
     def apply_to_module(self):
@@ -532,6 +549,10 @@ class LoKrModule(PeftBase):
 
         # DoRA for LoKr
         if self.weight_decompose:
+            if self.multiplier != 1.0:
+                raise NotImplementedError(
+                    "Signed multiplier is not supported for weight-decomposed (DoRA) LoKr."
+                )
 
             if isinstance(self.orig_module, nn.Linear):
                 orig_weight = get_unquantized_weight(self.orig_module, torch.float, self.train_device)
@@ -568,12 +589,12 @@ class LoKrModule(PeftBase):
                 )
 
                 # Reshape back to [Batch, ..., Out_Features]
-                delta_output = delta_output.reshape(*x_shape[:-1], -1) * scale
+                delta_output = delta_output.reshape(*x_shape[:-1], -1) * scale * self.multiplier
 
                 return self.orig_forward(x) + delta_output
             else:
                 # Fallback for Conv2d layers or when lokr_vec_trick is disabled
-                w = self.get_weight() * scale
+                w = self.get_weight() * scale * self.multiplier
                 return self.orig_forward(x) + self.op(x, w.to(x.dtype), bias=None, **self.layer_kwargs)
 
     def apply_to_module(self):
@@ -624,10 +645,14 @@ class LoRAModule(PeftBase):
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
         if isinstance(self.orig_module, BaseLinearSVD):
+            if self.multiplier != 1.0:
+                raise NotImplementedError(
+                    "Signed multiplier is not supported for SVD-merged linears (forward_with_lora)."
+                )
             return self.orig_module.forward_with_lora(x, self.lora_down, self.lora_up, self.dropout, self.alpha)
 
         ld = self.lora_up(self.dropout(self.lora_down(x)))
-        return self.orig_forward(x) + ld * (self.alpha / self.rank)
+        return self.orig_forward(x) + ld * (self.alpha / self.rank) * self.multiplier
 
     def apply_to_module(self):
         # TODO
@@ -730,6 +755,11 @@ class OFTModule(PeftBase):
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
 
+        if self.multiplier != 1.0:
+            raise NotImplementedError(
+                "Signed multiplier is not supported for OFT (orthogonal rotation has no signed delta scale)."
+            )
+
         # For Linear layers, rotating the input is mathematically equivalent to rotating the weights.
         if isinstance(self.orig_module, nn.Linear):
             rotated_x = self.oft_R(x)
@@ -826,6 +856,10 @@ class DoRAModule(LoRAModule):
 
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
+        if self.multiplier != 1.0:
+            raise NotImplementedError(
+                "Signed multiplier is not supported for DoRA (magnitude/direction split has no signed delta scale)."
+            )
         A = self.lora_down.weight
         B = self.lora_up.weight
 
@@ -1070,6 +1104,16 @@ class LoRAModuleWrapper:
             module.requires_grad_(requires_grad)
         for module in self.frozen_lora_modules.values():
             module.requires_grad_(False)
+
+    def set_multiplier(self, multiplier: float):
+        """Set the signed adapter-delta scale on every module in this wrapper.
+
+        This is the "slider" knob: 0.0 disables the adapter (frozen-base pass),
+        +/- values steer the concept. Applies to the trainable and any frozen
+        adapters alike. Raises (at forward time) for non-additive PEFT types.
+        """
+        for module in self.__iter_real_modules():
+            module.set_multiplier(multiplier)
 
     def init_lokr_from_gradients(
             self, grads: Mapping[str, Tensor], gain: float = 1.0,
