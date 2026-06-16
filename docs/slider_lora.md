@@ -405,3 +405,18 @@ What genuinely carries over: `_make_flow_target`, the `predict` regime split, th
   py-compile; parser smoke-tested. **Unverified beyond py-compile:** the real
   MGDS coordinate pipeline and the per-sample forward (no torch/mgds in the
   authoring sandbox) — first GPU run validates both regimes.
+- **2026-06-16** — **UI plumbing audit + regime-aware Slider tab.** Verified the
+  full config→UI→trainer path for both regimes: TopBar exposes "Slider" for Anima
+  only; TrainUI adds the Slider + shared LoRA tabs for SLIDER and restores them on
+  config/preset load (training-method selector fires its callback on init); the
+  always-present Concepts tab supplies the IMAGE dataset; the pre-train gate
+  (`flush_and_validate_all`) is field-level and does not hard-require concepts, so
+  the datasetless PROMPT_PAIR regime is not blocked. Made `SliderTab` regime-aware:
+  the regime selector now shows only the relevant block (prompt-pair settings +
+  triple list, or the coordinate-axes editor) and a per-regime hint, hiding the
+  prompt-triple list in IMAGE mode. **Known limitation:** misconfiguration (no
+  enabled prompt triple / not exactly one target axis) surfaces as a clear
+  RuntimeError at train start rather than a pre-flight field error (their
+  validation framework is per-widget; cross-field slider validation is a
+  fast-follow). Multiplier-sweep sampling still deferred (samples use the adapter's
+  last-set multiplier).

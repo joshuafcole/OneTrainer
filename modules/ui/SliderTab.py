@@ -36,62 +36,98 @@ class SliderTab(ConfigList):
     def __build_settings_frame(self):
         frame = ctk.CTkFrame(self.top_frame, fg_color="transparent")
         frame.grid(row=1, column=0, columnspan=6, sticky="nsew", pady=(8, 0))
-        frame.grid_columnconfigure(1, weight=1)
-        frame.grid_columnconfigure(4, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
 
-        # regime
-        components.label(frame, 0, 0, "Regime",
-                         tooltip="Prompt pair: text-only Concept Sliders (no image dataset); the frozen base supplies the guidance direction and x_t is generated on-manifold. Image (coordinate): a real image dataset whose captions carry a declared-axis coordinate token like (distance:-2); the coordinate is stripped from the conditioning and becomes the training-time adapter multiplier m=k*value.")
-        components.options_kv(frame, 0, 1, [
+        # --- common (both regimes) ------------------------------------------
+        # sigma range is sampled by both objectives; regime + a per-regime hint
+        # sit above it. The two regime-specific blocks below are shown/hidden by
+        # the regime selector's callback so only the relevant fields appear.
+        common = ctk.CTkFrame(frame, fg_color="transparent")
+        common.grid(row=0, column=0, sticky="new")
+        common.grid_columnconfigure(1, weight=1)
+        common.grid_columnconfigure(4, weight=1)
+
+        components.label(common, 0, 0, "Regime",
+                         tooltip="Prompt pair: text-only Concept Sliders (no image dataset); the frozen base supplies the guidance direction and x_t is generated on-manifold. Image (coordinate): a real image dataset (configure it on the Concepts tab) whose captions carry a declared-axis coordinate token like (distance:-2); the coordinate is stripped from the conditioning and becomes the training-time adapter multiplier m=k*value.")
+        # created here so the callback (which fires on init) finds the blocks below
+        self.__regime_blocks_built = False
+        self.__prompt_frame = None
+        self.__image_frame = None
+
+        components.label(common, 1, 3, "Sigma min",
+                         tooltip="Lower bound of the noise level sampled for the trained timestep.")
+        components.entry(common, 1, 4, self.ui_state, "slider_sigma_min")
+        components.label(common, 2, 3, "Sigma max",
+                         tooltip="Upper bound of the noise level sampled for the trained timestep. Higher sigma (more noise) concentrates the attribute signal.")
+        components.entry(common, 2, 4, self.ui_state, "slider_sigma_max")
+
+        # per-regime hint line
+        self.__regime_hint = components.label(common, 3, 0, "")
+        self.__regime_hint.grid(row=3, column=0, columnspan=5, sticky="w", pady=(6, 0))
+
+        # --- prompt-pair-only block -----------------------------------------
+        prompt_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        prompt_frame.grid(row=1, column=0, sticky="new", pady=(6, 0))
+        prompt_frame.grid_columnconfigure(1, weight=1)
+        prompt_frame.grid_columnconfigure(4, weight=1)
+        self.__prompt_frame = prompt_frame
+
+        components.label(prompt_frame, 0, 0, "Guidance scale (eta)",
+                         tooltip="Training-time guidance scale applied to v(c+) - v(c-). Paper uses ~3-4. Independent of the inference slider strength (the adapter multiplier).")
+        components.entry(prompt_frame, 0, 1, self.ui_state, "slider_eta")
+        components.label(prompt_frame, 1, 0, "Training strength",
+                         tooltip="Adapter multiplier magnitude used for the trained passes (+/- this). The inference strength range is decoupled from this.")
+        components.entry(prompt_frame, 1, 1, self.ui_state, "slider_strength")
+        components.label(prompt_frame, 2, 0, "Symmetric",
+                         tooltip="Also train the -strength pole toward v(c_t) - eta*delta, so the slider is linear around 0 (both poles learned).")
+        components.switch(prompt_frame, 2, 1, self.ui_state, "slider_symmetric")
+        components.label(prompt_frame, 0, 3, "Steps per epoch",
+                         tooltip="Prompt-pair sliders have no dataset, so this sets how many synthetic training steps make up one epoch.")
+        components.entry(prompt_frame, 0, 4, self.ui_state, "slider_steps_per_epoch")
+        components.label(prompt_frame, 1, 3, "x_t anchor steps",
+                         tooltip="Euler steps used to denoise random noise down to the sampled sigma, producing an on-manifold x_t (SDEdit). More steps = more on-manifold but slower per training step. 0 falls back to off-manifold Gaussian x_t.")
+        components.entry(prompt_frame, 1, 4, self.ui_state, "slider_anchor_steps")
+        components.label(prompt_frame, 3, 0, "Preservation prompts",
+                         tooltip="Optional disentanglement set P (CS Eq. 8), pipe-delimited (a|b|c). The guidance direction is averaged over the preservation-augmented pairs to keep the slider from entangling unrelated attributes. Empty = bare positive/negative pair.")
+        entry = components.entry(prompt_frame, 3, 1, self.ui_state, "slider_preservation_prompts")
+        entry.grid(row=3, column=1, columnspan=4, sticky="ew")
+
+        # --- image-coordinate-only block ------------------------------------
+        image_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        image_frame.grid(row=1, column=0, sticky="new", pady=(6, 0))
+        image_frame.grid_columnconfigure(2, weight=1)
+        self.__image_frame = image_frame
+
+        components.label(image_frame, 0, 0, "Coordinate axes",
+                         tooltip="Declared axes for the coordinate-labeled image regime. Each axis name is the caption token key (e.g. 'distance' for (distance:-2)); it is stripped from the conditioning. Exactly one enabled axis must be the target axis -- its coordinate drives the multiplier m=k*value (k = the axis gain).")
+        components.button(image_frame, 0, 1, "edit slider axes...", command=self.__open_axes_window)
+
+        self.__regime_blocks_built = True
+        # regime selector last, so its init callback finds the blocks above
+        components.options_kv(common, 0, 1, [
             ("Prompt pair", SliderRegime.PROMPT_PAIR),
             ("Image (coordinate)", SliderRegime.IMAGE),
-        ], self.ui_state, "slider_regime")
+        ], self.ui_state, "slider_regime", command=self.__on_regime_change)
 
-        # eta
-        components.label(frame, 1, 0, "Guidance scale (eta)",
-                         tooltip="Training-time guidance scale applied to v(c+) - v(c-). Paper uses ~3-4. Independent of the inference slider strength (the adapter multiplier).")
-        components.entry(frame, 1, 1, self.ui_state, "slider_eta")
+    __PROMPT_HINT = ("Prompt-pair regime: add positive/negative prompt triples below; no image dataset is used. "
+                     "The Concepts tab is ignored.")
+    __IMAGE_HINT = ("Image (coordinate) regime: configure a normal dataset on the Concepts tab whose captions carry "
+                    "an axis token like (distance:-2). The prompt-pair list below is unused.")
 
-        # strength
-        components.label(frame, 2, 0, "Training strength",
-                         tooltip="Adapter multiplier magnitude used for the trained passes (+/- this). The inference strength range is decoupled from this.")
-        components.entry(frame, 2, 1, self.ui_state, "slider_strength")
+    def __on_regime_change(self, regime):
+        if not getattr(self, "_SliderTab__regime_blocks_built", False):
+            return
+        is_image = (regime == SliderRegime.IMAGE)
 
-        # symmetric
-        components.label(frame, 3, 0, "Symmetric",
-                         tooltip="Also train the -strength pole toward v(c_t) - eta*delta, so the slider is linear around 0 (both poles learned).")
-        components.switch(frame, 3, 1, self.ui_state, "slider_symmetric")
-
-        # steps per epoch
-        components.label(frame, 0, 3, "Steps per epoch",
-                         tooltip="Prompt-pair sliders have no dataset, so this sets how many synthetic training steps make up one epoch.")
-        components.entry(frame, 0, 4, self.ui_state, "slider_steps_per_epoch")
-
-        # anchor steps
-        components.label(frame, 1, 3, "x_t anchor steps",
-                         tooltip="Euler steps used to denoise random noise down to the sampled sigma, producing an on-manifold x_t (SDEdit). More steps = more on-manifold but slower per training step. 0 falls back to off-manifold Gaussian x_t.")
-        components.entry(frame, 1, 4, self.ui_state, "slider_anchor_steps")
-
-        # sigma range
-        components.label(frame, 2, 3, "Sigma min",
-                         tooltip="Lower bound of the noise level sampled for x_t / the trained timestep.")
-        components.entry(frame, 2, 4, self.ui_state, "slider_sigma_min")
-        components.label(frame, 3, 3, "Sigma max",
-                         tooltip="Upper bound of the noise level sampled for x_t / the trained timestep. Higher sigma (more noise) concentrates the attribute signal.")
-        components.entry(frame, 3, 4, self.ui_state, "slider_sigma_max")
-
-        # preservation prompts (disentanglement, CS Eq. 8). Pipe-delimited so it
-        # fits a single-line entry; empty falls back to the bare pair (Eq. 7).
-        components.label(frame, 4, 0, "Preservation prompts",
-                         tooltip="Optional disentanglement set P (CS Eq. 8), pipe-delimited (a|b|c). The guidance direction is averaged over the preservation-augmented pairs to keep the slider from entangling unrelated attributes. Empty = bare positive/negative pair.")
-        entry = components.entry(frame, 4, 1, self.ui_state, "slider_preservation_prompts")
-        entry.grid(row=4, column=1, columnspan=4, sticky="ew")
-
-        # slider axes (IMAGE regime). The coordinate axes are edited in a popup so
-        # the prompt-triple list above stays the tab's primary surface.
-        components.label(frame, 5, 0, "Coordinate axes (image regime)",
-                         tooltip="Declared axes for the coordinate-labeled image regime. Each axis name is the caption token key (e.g. 'distance' for (distance:-2)); it is stripped from the conditioning. Exactly one enabled axis must be the target axis -- its coordinate drives the multiplier m=k*value.")
-        components.button(frame, 5, 1, "edit slider axes...", command=self.__open_axes_window)
+        if self.__prompt_frame is not None:
+            self.__prompt_frame.grid_remove() if is_image else self.__prompt_frame.grid()
+        if self.__image_frame is not None:
+            self.__image_frame.grid() if is_image else self.__image_frame.grid_remove()
+        # the tab body is the prompt-triple list; it is meaningless in IMAGE mode
+        if getattr(self, "element_list", None) is not None and self.element_list.winfo_exists():
+            self.element_list.grid_remove() if is_image else self.element_list.grid()
+        if self.__regime_hint is not None and self.__regime_hint.winfo_exists():
+            self.__regime_hint.configure(text=self.__IMAGE_HINT if is_image else self.__PROMPT_HINT)
 
     def __open_axes_window(self):
         window = SliderAxisWindow(self.master, self.train_config, self.ui_state)
@@ -103,6 +139,9 @@ class SliderTab(ConfigList):
             self.element_list = None
         self.widgets_initialized = False
         self._create_element_list()
+        # _create_element_list re-grids the prompt list at row 1; re-apply the
+        # regime-conditional visibility so IMAGE mode keeps it hidden.
+        self.__on_regime_change(self.train_config.slider_regime)
 
     def create_widget(self, master, element, i, open_command, remove_command, clone_command, save_command):
         return SliderPromptWidget(master, element, i, open_command, remove_command, clone_command, save_command)
