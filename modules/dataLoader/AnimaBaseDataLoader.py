@@ -24,6 +24,25 @@ from mgds.pipelineModules.SaveText import SaveText
 from mgds.pipelineModules.Tokenize import Tokenize
 
 
+# Hard cap on an aspect bucket's longest edge, in pixels.
+#
+# Cosmos's RoPE precomputes a positional table sized from max_size=(128, 240, 240) //
+# patch=(1, 2, 2) -> [128, 120, 120] (temporal, height, width in patches). The shared
+# position index is seq = arange(max(...)) = arange(128). CosmosRotaryPosEmbed then
+# slices seq[:pe_size] per axis, which SILENTLY TRUNCATES once a side's patch count
+# exceeds the table -- and the freqs torch.cat downstream blows up on the resulting
+# shape mismatch (the symptom: e.g. a 2176-wide bucket from extreme aspect rungs at
+# high training resolution).
+#
+# Patches relate to pixels by vae_scale_factor(8) * patch(2) = 16, so:
+#   - 128 patches == 2048 px is the hard crash boundary (the seq table length).
+#   - 120 patches == 1920 px is the model's pretrained spatial range (max_size's
+#     spatial axes). We cap here rather than at the crash boundary so buckets stay
+#     in-distribution and avoid extrapolating RoPE past positions the model ever saw.
+# 1920 is a multiple of the bucket quantization (64), so capped edges quantize cleanly.
+ANIMA_MAX_BUCKET_RESOLUTION = 1920
+
+
 class AnimaBaseDataLoader(
     BaseDataLoader,
     DataLoaderText2ImageMixin,
@@ -264,6 +283,9 @@ class AnimaBaseDataLoader(
         # aspect_bucketing_quantization=64: Cosmos requires (H, W)
         # divisible by vae_scale_factor*2 = 16; we pick 64 to align
         # with ZImage / Flux conventions and keep aspect buckets sane.
+        #
+        # aspect_bucketing_max_resolution caps the bucket long edge to keep
+        # extreme aspect rungs within Cosmos's RoPE range; see the constant.
         return DataLoaderText2ImageMixin._create_dataset(
             self,
             config,
@@ -273,6 +295,7 @@ class AnimaBaseDataLoader(
             is_validation,
             aspect_bucketing_quantization=64,
             vae_frame_dim=True,
+            aspect_bucketing_max_resolution=ANIMA_MAX_BUCKET_RESOLUTION,
         )
 
 

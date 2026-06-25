@@ -279,7 +279,11 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         return modules
 
     def _aspect_bucketing_in(
-        self, config: TrainConfig, aspect_bucketing_quantization: int, frame_dim_enabled: bool = False
+        self,
+        config: TrainConfig,
+        aspect_bucketing_quantization: int,
+        frame_dim_enabled: bool = False,
+        aspect_bucketing_max_resolution: int | None = None,
     ):
         calc_aspect = CalcAspect(image_in_name="image", resolution_out_name="original_resolution")
 
@@ -314,6 +318,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             repeat_out_name=None if consumer_mode else BUCKET_REPEAT_NAME,
             override_aspect_in_name=BUCKET_OVERRIDE_NAME if consumer_mode else None,
             resolution_mode=config.aspect_ratio_bucket_resolution_mode,
+            max_resolution=aspect_bucketing_max_resolution,
         )
 
         single_aspect_calculation = SingleAspectCalculation(
@@ -335,7 +340,12 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         return modules
 
-    def _bucket_rebalance_modules(self, config: TrainConfig, aspect_bucketing_quantization: int):
+    def _bucket_rebalance_modules(
+        self,
+        config: TrainConfig,
+        aspect_bucketing_quantization: int,
+        aspect_bucketing_max_resolution: int | None = None,
+    ):
         """Path-stage rebalancing planner, inserted only when borrow-copy is asked
         for. It reads aspect ratios from file headers, plans every rung's fate, and
         appends re-cropped duplicate rows for borrow-copy *before* images load --
@@ -365,6 +375,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             keep_out_name=BUCKET_KEEP_NAME,
             repeat_out_name=BUCKET_REPEAT_NAME,
             override_aspect_out_name=BUCKET_OVERRIDE_NAME,
+            max_resolution=aspect_bucketing_max_resolution,
         )
         return [rebalance]
 
@@ -722,15 +733,20 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         allow_video_files: bool = False,
         vae_frame_dim: bool = False,
         supports_inpainting: bool = True,  # TODO many models probably don't support inpainting, but this has been enabled in most dataloaders before refactoring, too
+        aspect_bucketing_max_resolution: int | None = None,
     ):
         enumerate_input = self._enumerate_input_modules(config, allow_videos=allow_video_files)
-        bucket_rebalance = self._bucket_rebalance_modules(config, aspect_bucketing_quantization)
+        bucket_rebalance = self._bucket_rebalance_modules(
+            config, aspect_bucketing_quantization, aspect_bucketing_max_resolution
+        )
         # Derived sibling paths must follow the rebalance so they cover its minted
         # borrow-copy rows (see _derive_path_modules).
         derive_paths = self._derive_path_modules(config)
         load_input = self._load_input_modules(config, model.train_dtype, vae_frame_dim=vae_frame_dim)
         mask_augmentation = self._mask_augmentation_modules(config)
-        aspect_bucketing_in = self._aspect_bucketing_in(config, aspect_bucketing_quantization, frame_dim_enabled)
+        aspect_bucketing_in = self._aspect_bucketing_in(
+            config, aspect_bucketing_quantization, frame_dim_enabled, aspect_bucketing_max_resolution
+        )
         crop_modules = self._crop_modules(config)
         augmentation_modules = self._augmentation_modules(config)
         if supports_inpainting:
