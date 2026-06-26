@@ -8,7 +8,15 @@ only when) an input that changes the cached tensors changes.
 
 import importlib.util
 import os
+import sys
 import types
+
+# cache_key now imports modules.util.bucket_limits, so the repo root must be on the
+# path for its isolated file-location load to resolve (repo test convention).
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from modules.util.bucket_limits import ANIMA_MAX_BUCKET_RESOLUTION, max_bucket_resolution_for
+from modules.util.enum.ModelType import ModelType
 
 _spec = importlib.util.spec_from_file_location(
     "cache_key",
@@ -82,6 +90,29 @@ def test_image_salt_tracks_vae_resolution_bucketing():
 
 def test_image_salt_ignores_text_only_changes():
     assert image_cache_salt(_cfg()) == image_cache_salt(_cfg(text_encoder=_Part("other")))
+
+
+def test_bucket_cap_only_for_capped_model_types():
+    # The salt folds in only the model types bucket_limits actually caps.
+    assert max_bucket_resolution_for(ModelType.ANIMA) == ANIMA_MAX_BUCKET_RESOLUTION
+    assert max_bucket_resolution_for(ModelType.STABLE_DIFFUSION_XL_10_BASE) is None
+
+
+def test_image_salt_folds_in_bucket_cap_for_capped_models():
+    # An Anima cache built before the cap existed lacked the field, so the capped
+    # salt must differ from an otherwise-identical uncapped one. Isolate the cap:
+    # `_SameStr` stringifies to "ANIMA" exactly like the real enum (so the
+    # model_type field matches) but is not a genuine ModelType member, so the cap
+    # helper returns None for it. The only payload difference is the cap field --
+    # proving it is actually included in the digest, not silently dropped.
+    class _SameStr:
+        def __str__(self):
+            return str(ModelType.ANIMA)
+
+    capped = _cfg(model_type=ModelType.ANIMA)
+    uncapped = _cfg(model_type=_SameStr())
+    assert image_cache_salt(capped) == image_cache_salt(_cfg(model_type=ModelType.ANIMA))
+    assert image_cache_salt(capped) != image_cache_salt(uncapped)
 
 
 def test_text_salt_tracks_encoders_and_embeddings():

@@ -26,6 +26,8 @@ import hashlib
 import json
 from typing import Any
 
+from modules.util.bucket_limits import max_bucket_resolution_for
+
 
 def _digest(payload: Any) -> str:
     blob = json.dumps(
@@ -62,6 +64,14 @@ def image_cache_salt(config) -> str:
         "bucket_resolution_mode": getattr(config, "aspect_ratio_bucket_resolution_mode", None),
         "bucket_min_tiers": config.aspect_ratio_bucket_min_tiers or [],
     }
+    # A model-type long-edge cap changes the crop resolution of extreme aspect
+    # rungs, so a cache built before the cap existed (or with a different cap)
+    # must not be reused. Added only when a cap applies: omitting the key for
+    # uncapped models keeps their salt byte-identical to pre-cap builds, so they
+    # don't pay a spurious one-time re-cache.
+    bucket_max_resolution = max_bucket_resolution_for(config.model_type)
+    if bucket_max_resolution is not None:
+        payload["bucket_max_resolution"] = bucket_max_resolution
     return _digest(payload)
 
 
