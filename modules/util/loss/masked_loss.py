@@ -13,7 +13,11 @@ def masked_losses(
     losses *= clamped_mask
 
     if normalize_masked_area_loss:
-        losses = losses / clamped_mask.mean(dim=(1, 2, 3), keepdim=True)
+        # Reduce over every non-batch dim so 5D latents (B, C, T, H, W) from
+        # video/frame-dim models normalize over their full spatial+frame area,
+        # not just (C, T, H) -- identical to (1, 2, 3) for 4D image latents.
+        spatial_dims = tuple(range(1, clamped_mask.ndim))
+        losses = losses / clamped_mask.mean(dim=spatial_dims, keepdim=True)
 
     return losses
 
@@ -30,8 +34,13 @@ def masked_losses_with_prior(
 
     losses *= clamped_mask
 
+    # Reduce over every non-batch dim so 5D latents (B, C, T, H, W) from
+    # video/frame-dim models normalize over their full spatial+frame area,
+    # not just (C, T, H) -- identical to (1, 2, 3) for 4D image latents.
+    spatial_dims = tuple(range(1, clamped_mask.ndim))
+
     if normalize_masked_area_loss:
-        losses = losses / clamped_mask.mean(dim=(1, 2, 3), keepdim=True)
+        losses = losses / clamped_mask.mean(dim=spatial_dims, keepdim=True)
 
     if masked_prior_preservation_weight == 0 or prior_losses is None:
         return losses
@@ -40,6 +49,6 @@ def masked_losses_with_prior(
     prior_losses *= clamped_mask * masked_prior_preservation_weight
 
     if normalize_masked_area_loss:
-        prior_losses = prior_losses / clamped_mask.mean(dim=(1, 2, 3), keepdim=True)
+        prior_losses = prior_losses / clamped_mask.mean(dim=spatial_dims, keepdim=True)
 
     return losses + prior_losses

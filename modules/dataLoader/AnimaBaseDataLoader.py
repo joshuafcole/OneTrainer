@@ -22,6 +22,7 @@ from mgds.pipelineModules.RescaleImageChannels import RescaleImageChannels
 from mgds.pipelineModules.SampleVAEDistribution import SampleVAEDistribution
 from mgds.pipelineModules.SaveImage import SaveImage
 from mgds.pipelineModules.SaveText import SaveText
+from mgds.pipelineModules.ScaleImage import ScaleImage
 from mgds.pipelineModules.Tokenize import Tokenize
 
 
@@ -76,6 +77,12 @@ class AnimaBaseDataLoader(
             out_name="latent_image",
             mode="mean",
         )
+        # Anima's VAE downsamples by 8 (vae_scale_factor=8), so the latent
+        # mask scales 1/8 to match latent_image's spatial dims. The mask has
+        # already gained a T=1 frame axis via ImageToVideo in the input
+        # modules (vae_frame_dim=True), so ScaleImage yields a 5D latent_mask
+        # aligned with the 5D latent_image -- mirrors HunyuanVideo.
+        downscale_mask = ScaleImage(in_name="mask", out_name="latent_mask", factor=0.125)
 
         # Substitute TI placeholder strings with their per-encoder
         # generated tokens before tokenizing. Each encoder gets its own
@@ -139,6 +146,8 @@ class AnimaBaseDataLoader(
             tokenize_qwen,
             tokenize_t5,
         ]
+        if config.masked_training or config.model_type.has_mask_input():
+            modules.append(downscale_mask)
         # When training a TI embedding, Qwen3 must run live at step time
         # (under grad), so skip pre-computing/caching its hidden states.
         if not config.train_text_encoder_or_embedding():
@@ -147,6 +156,8 @@ class AnimaBaseDataLoader(
 
     def _cache_modules(self, config: TrainConfig, model: AnimaModel, model_setup: BaseAnimaSetup):
         image_split_names = ["latent_image", "original_resolution", "crop_offset"]
+        if config.masked_training or config.model_type.has_mask_input():
+            image_split_names.append("latent_mask")
         image_aggregate_names = ["crop_resolution", "image_path"]
         # When training a TI embedding, nothing text-side is cached: tokens
         # are re-derived live each step and Qwen3 runs under grad so the
@@ -198,6 +209,8 @@ class AnimaBaseDataLoader(
             "crop_resolution",
             "crop_offset",
         ]
+        if config.masked_training or config.model_type.has_mask_input():
+            output_names.append("latent_mask")
         # text_encoder_hidden_state only exists when not training an
         # embedding (otherwise Qwen3 runs live in predict()).
         if not config.train_text_encoder_or_embedding():
