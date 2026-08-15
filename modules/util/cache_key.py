@@ -65,7 +65,11 @@ def image_cache_salt(config) -> str:
     vae = getattr(config, "vae", None)
     vae_name = (getattr(vae, "model_name", "") or "") if vae is not None else ""
     payload = {
-        "v": 1,
+        # v2: aspect bucketing routes by canonical rung index instead of snapping an
+        # aspect against the budget's quantized ladder, so an image can land in a
+        # different crop than v1 chose for it. The latents are keyed to the crop, so
+        # every v1 image cache is stale by construction — bump rather than serve it.
+        "v": 2,
         "model_type": str(config.model_type),
         # Empty vae.model_name means "use the base model's VAE", so fall back to it.
         "vae": vae_name or config.base_model_name,

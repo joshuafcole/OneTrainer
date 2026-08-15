@@ -161,7 +161,7 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             min_bucket_tiers=[] if consumer_mode else tiers,
             keep_out_name=None if consumer_mode else BUCKET_KEEP_NAME,
             repeat_out_name=None if consumer_mode else BUCKET_REPEAT_NAME,
-            override_aspect_in_name=BUCKET_OVERRIDE_NAME if consumer_mode else None,
+            override_rung_in_name=BUCKET_OVERRIDE_NAME if consumer_mode else None,
             resolution_mode=config.aspect_ratio_bucket_resolution_mode,
         )
 
@@ -205,7 +205,7 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             concept_out_name="concept",
             keep_out_name=BUCKET_KEEP_NAME,
             repeat_out_name=BUCKET_REPEAT_NAME,
-            override_aspect_out_name=BUCKET_OVERRIDE_NAME,
+            override_rung_out_name=BUCKET_OVERRIDE_NAME,
         )
         return [rebalance]
 

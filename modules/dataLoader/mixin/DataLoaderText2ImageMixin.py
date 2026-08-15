@@ -71,7 +71,7 @@ BUCKET_BUDGET_NAME = "bucket_budget"
 # Per-row aspect override emitted by AspectBucketRebalance (borrow-copy mode) and
 # consumed by AspectBucketing. Unlike keep/repeat it is read mid-pipeline (before
 # the crop), so it is neither cached nor carried to the sorter.
-BUCKET_OVERRIDE_NAME = "bucket_override_aspect"
+BUCKET_OVERRIDE_NAME = "bucket_override_rung"
 
 
 def has_copy_tier(tiers: list[BucketTier]) -> bool:
@@ -316,7 +316,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             min_bucket_tiers=[] if consumer_mode else tiers,
             keep_out_name=None if consumer_mode else BUCKET_KEEP_NAME,
             repeat_out_name=None if consumer_mode else BUCKET_REPEAT_NAME,
-            override_aspect_in_name=BUCKET_OVERRIDE_NAME if consumer_mode else None,
+            override_rung_in_name=BUCKET_OVERRIDE_NAME if consumer_mode else None,
             resolution_mode=config.aspect_ratio_bucket_resolution_mode,
             max_resolution=aspect_bucketing_max_resolution,
         )
@@ -351,6 +351,11 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         appends re-cropped duplicate rows for borrow-copy *before* images load --
         so each copy becomes a first-class item the disk cache encodes at the borrow
         crop. Empty (no module) for every other configuration => unchanged pipeline.
+
+        The quantization / cap are NOT what decides an image's rung -- that is the
+        budget-free canonical ladder. They only let the planner pool rungs that every
+        budget renders identically, so it doesn't split one bucket's population across
+        two units. They must match what ``_aspect_bucketing_in`` passes.
         """
         tiers = parse_bucket_tiers(config.aspect_ratio_bucket_min_tiers)
         if not (config.aspect_ratio_bucketing and has_copy_tier(tiers)):
@@ -374,7 +379,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             concept_out_name="concept",
             keep_out_name=BUCKET_KEEP_NAME,
             repeat_out_name=BUCKET_REPEAT_NAME,
-            override_aspect_out_name=BUCKET_OVERRIDE_NAME,
+            override_rung_out_name=BUCKET_OVERRIDE_NAME,
             max_resolution=aspect_bucketing_max_resolution,
         )
         return [rebalance]
