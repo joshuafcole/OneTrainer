@@ -1,5 +1,6 @@
 import io
 import os
+import traceback
 from abc import ABCMeta, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
@@ -9,6 +10,7 @@ from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.FileType import FileType
 from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.VideoFormat import VideoFormat
+from modules.util.sample_metadata import SampleProvenance, build_png_info
 
 import torch
 
@@ -59,6 +61,13 @@ class BaseModelSampler(metaclass=ABCMeta):
 
         self.train_device = train_device
         self.temp_device = temp_device
+        self._provenance: SampleProvenance | None = None
+
+    def set_provenance(self, prov: SampleProvenance | None):
+        """Provenance for the next ``save_sampler_output`` call. Set by the
+        trainer, which is the only layer that knows the training state a
+        sample corresponds to; the sampler itself has no notion of step/epoch."""
+        self._provenance = prov
 
     @abstractmethod
     def sample(
@@ -77,8 +86,8 @@ class BaseModelSampler(metaclass=ABCMeta):
     def quantize_resolution(resolution: int, quantization: int) -> int:
         return round(resolution / quantization) * quantization
 
-    @staticmethod
     def save_sampler_output(
+            self,
             sampler_output: ModelSamplerOutput,
             destination: str,
             image_format: ImageFormat | None,
@@ -92,7 +101,22 @@ class BaseModelSampler(metaclass=ABCMeta):
             if image_format is None:
                 raise ValueError("Image format required for sampling an image")
             image = sampler_output.data
-            image.save(destination + image_format.extension(), format=image_format.pil_format())
+
+            pnginfo = None
+            if self._provenance is not None and image_format == ImageFormat.PNG:
+                try:
+                    pnginfo = build_png_info(self._provenance)
+                except Exception:
+                    # A broken provenance chunk must never cost a training run
+                    # its sample -- log and fall through to a plain save.
+                    traceback.print_exc()
+                    print("Could not build sample provenance metadata, saving without it")
+                    pnginfo = None
+
+            if pnginfo is not None:
+                image.save(destination + image_format.extension(), format=image_format.pil_format(), pnginfo=pnginfo)
+            else:
+                image.save(destination + image_format.extension(), format=image_format.pil_format())
         elif sampler_output.file_type == FileType.VIDEO:
             if video_format is None:
                 raise ValueError("Video format required for sampling a video")
