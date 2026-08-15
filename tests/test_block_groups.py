@@ -14,7 +14,10 @@ import importlib.util
 import os
 import sys
 
+import torch
+
 import pytest
+from safetensors.torch import save_file
 
 _here = os.path.dirname(__file__)
 
@@ -300,3 +303,50 @@ def test_patterns_for_rejects_an_unknown_group_name(config):
         block_groups.patterns_for("nonexistent.part", synthetic_prefixes(3), config)
     with pytest.raises(BlockGroupError):
         block_groups.patterns_for("early.nonexistent", synthetic_prefixes(3), config)
+
+
+# --------------------------------------------------------------------------
+# LoKr checkpoints resolve to the same coordinate system
+# --------------------------------------------------------------------------
+
+def test_lokr_keys_collapse_to_the_same_layer_prefixes(tmp_path):
+    """A LoKr checkpoint names its layers under ``.lokr_*`` instead of
+    ``.lora_{down,up}.weight``. The taxonomy is over *layers*, not over
+    factorizations, so it must resolve identically -- and the failure mode if it
+    doesn't is an empty table that looks like an answer rather than an error."""
+    prefixes = synthetic_prefixes(3)
+    state_dict = {}
+    for i, prefix in enumerate(prefixes):
+        # A mix of the w1/w2 forms, so every family gets exercised at least once.
+        if i % 3 == 0:
+            state_dict[prefix + ".lokr_w1"] = torch.zeros(4, 4)
+            state_dict[prefix + ".lokr_w2_a"] = torch.zeros(4, 2)
+            state_dict[prefix + ".lokr_w2_b"] = torch.zeros(2, 4)
+        elif i % 3 == 1:
+            state_dict[prefix + ".lokr_w1_a"] = torch.zeros(4, 2)
+            state_dict[prefix + ".lokr_w1_b"] = torch.zeros(2, 4)
+            state_dict[prefix + ".lokr_w2"] = torch.zeros(4, 4)
+        else:
+            state_dict[prefix + ".lokr_w1"] = torch.zeros(4, 4)
+            state_dict[prefix + ".lokr_t2"] = torch.zeros(2, 2, 3, 3)
+            state_dict[prefix + ".lokr_w2_a"] = torch.zeros(2, 4)
+            state_dict[prefix + ".lokr_w2_b"] = torch.zeros(2, 4)
+        state_dict[prefix + ".alpha"] = torch.tensor(2.0)
+
+    path = tmp_path / "lokr.safetensors"
+    save_file(state_dict, str(path))
+
+    read = block_groups.read_layer_prefixes(path)
+    assert read == sorted(prefixes)
+
+
+def test_lokr_w1_suffix_does_not_swallow_lokr_w1_a():
+    """``.lokr_w1`` is a prefix of ``.lokr_w1_a`` as a *string*, but not as a
+    suffix -- so the endswith match is safe and the layer prefix comes out
+    whole. Pinned because a startswith-flavored split here would silently
+    invent a layer called ``...to_q.lokr_w1``."""
+    keys = [
+        f"{BLOCK_PREFIX}.0.attn1.to_q.lokr_w1_a",
+        f"{BLOCK_PREFIX}.0.attn1.to_q.lokr_w1_b",
+    ]
+    assert block_groups._layer_prefixes_from_keys(keys) == [f"{BLOCK_PREFIX}.0.attn1.to_q"]

@@ -1,4 +1,4 @@
-"""Merge N LoRA safetensors files into one, in delta-weight space.
+"""Merge N LoRA/LoKr safetensors files into one, in delta-weight space.
 
 This is the merge engine for the preference-soup arc (cinema-studio phases
 454-457): a greedy soup, a block ablation, a coefficient search and a warm
@@ -7,6 +7,13 @@ in where the coefficients come from.
 
 Method
 ------
+The engine works in **delta space**. All it ever needs from an adapter is a
+closed-form ``dW`` per layer; the factor shapes that produced it are an input
+detail, not part of the arithmetic. We reconstruct each input's ``dW_i``, form
+``dW = sum_i c_i * dW_i``, and only then re-factor. **Never average factors
+directly** -- the average of factorizations is not a factorization of the
+average (``test_lora_soup.py`` pins this).
+
 For every LoRA-decomposable layer, OneTrainer stores three tensors under a
 common prefix (``modules/module/LoRAModule.py``)::
 
@@ -19,10 +26,42 @@ and the delta the model actually sees is (``LoRAModule.forward``, and
 
     dW = (alpha / rank) * B @ A
 
-We reconstruct each input's ``dW_i``, form ``dW = sum_i c_i * dW_i``, and only
-then re-factor. **Never average (B, A) factors directly** -- the average of
-factorizations is not a factorization of the average (``test_lora_soup.py``
-pins this).
+**LoKr has a closed-form delta too**, so it merges here on exactly the same
+footing. Per ``LoKrModule._get_factors`` / ``get_weight`` / ``forward``::
+
+    w1 = lokr_w1                                        if stored whole
+       = lokr_w1_a @ lokr_w1_b                          if decompose_both
+    w2 = lokr_w2                                        if stored whole
+       = rebuild_tucker(lokr_t2, lokr_w2_a, lokr_w2_b)  if tucker
+       = lokr_w2_a @ lokr_w2_b                          otherwise
+
+    dW = make_kron(w1, w2).view(shape) * (alpha / dim)
+
+exact, no approximation. ``make_kron`` and ``rebuild_tucker`` are imported from
+``modules.util.lokr_utils`` rather than reimplemented -- a second copy of the
+Kronecker/Tucker index convention is exactly how a plausible-but-wrong delta
+gets written.
+
+The ``dim`` in that scale is the *factor* rank (``lokr_dim``), and the
+checkpoint does not store it directly, so it is read back off the factor
+shapes: ``lokr_w1_a``'s inner dim, else ``lokr_t2``'s leading dim, else
+``lokr_w2_a``'s inner dim. When **both** factors are stored whole there is no
+inner dim to read -- and in exactly that case ``LoKrModule.initialize_weights``
+does ``self.alpha.fill_(lokr_dim)``, so the scale is 1.0 and ``dim`` is both
+unrecoverable and irrelevant. Every shape that carries ``dim`` is cross-checked
+against every other; a disagreement is refused, not averaged.
+
+``.view(shape)``: the checkpoint has no ``shape`` key, but it does not need one.
+``make_kron`` already returns ``(out_l*out_k, in_m*in_n)`` for Linear, and
+unsqueezes ``w1`` so a 4-D ``w2`` yields ``(out, in, k1, k2)`` for Conv2d -- the
+view is a no-op in both. The one case where it is *not* a no-op is a Conv2d
+whose ``w2`` is factored, where ``lokr_w2_b`` folds the kernel into its trailing
+dim: ``make_kron`` returns ``(out, in*k1*k2)`` and only ``.view(shape)`` splits
+it back out. Nothing in the file distinguishes that from a Linear layer of
+``in_features = in*k1*k2``, so this reads it as Linear. The **delta is exact
+either way** -- same numbers, same order -- only the emitted factor *shape*
+differs, and if a plain-LoRA input in the same soup says otherwise,
+``merge_deltas``'s geometry check is what fires.
 
 Coefficients are used exactly as given. They are *not* normalized behind the
 user's back: a soup passes coefficients that already sum to 1, a rescale passes
@@ -34,10 +73,17 @@ cast back on write.
 
 Re-factoring, and the alpha convention
 --------------------------------------
+**The output is always plain LoRA**, whatever went in. A merged sum of
+Kronecker products is not generally a Kronecker product, so there is no exact
+LoKr-shaped answer to emit; plain LoRA is the format the sum actually has.
+
 ``--method svd`` (default) truncates an SVD of ``dW`` back to a target rank
 (default: the largest rank any input used for that layer), so the output is
 loadable by the same plan config that produced the inputs -- which is the whole
-point for a warm start.
+point for a warm start. For a LoKr input "the rank it used" is *not*
+``lokr_dim``: ``rank(kron(w1, w2)) = rank(w1) * rank(w2)``, so the default is
+that algebraic bound. Defaulting to ``lokr_dim`` would truncate the delta hard
+and silently, which is the opposite of what a default is for.
 
 **The output always sets ``alpha = rank``, so the loader's ``alpha/rank`` scale
 is exactly 1.0 and ``dW == B @ A``.** The alternative -- preserving an input's
@@ -52,14 +98,39 @@ neither side carries the whole magnitude into fp16 storage.
 factors (B columns / A rows) with each input's ``c_i * alpha_i / rank_i`` folded
 into its B block, giving an output of rank ``sum_i rank_i`` whose ``B @ A`` is
 the weighted sum with no truncation error at all. It requires every input to
-contribute the same key set (there is no meaningful "absent" block to stack).
+contribute the same key set (there is no meaningful "absent" block to stack),
+and it is **plain-LoRA only**: the trick works because ``B @ A`` is bilinear in
+a shared rank axis, and a LoKr layer has no such axis to stack along. That
+combination is refused by name rather than quietly falling back to the SVD path.
+
+There is no LoKr-shaped output mode, not even a lossy one.
+``modules.util.lokr_utils.nearest_kron_factors`` would give the best
+``kron(w1, w2)`` approximation of the merged delta, but a LoKr file's scale is
+``alpha/dim`` with ``dim`` coming from the *training config*, not the file --
+so a whole-``w1``/whole-``w2`` output (the only shape a Van Loan rearrangement
+produces) has no way to pin its own scale to 1.0 the way ``alpha == rank`` does
+for LoRA. It would load correctly only under the config that happened to match.
+An approximation that is also silently mis-scaled is worse than no mode at all.
 
 What this refuses
 -----------------
-Only plain LoRA decomposes as ``(alpha/rank)*B@A``. LoHa (``hada_w*``), LoKr
-(``lokr_w*``), OFT (``oft_*``) and DoRA (``dora_scale``) do not, and this script
-**refuses a file containing any key it does not understand**, naming the keys.
-It never merges them approximately. That refusal is a deliverable.
+This script **refuses a file containing any key it does not understand**, naming
+the keys, and never merges them approximately. That refusal is a deliverable.
+Understood: plain LoRA (``lora_down``/``lora_up``/``alpha``), LoKr (``lokr_*``),
+and ``bundle_emb.*``.
+
+The reasons the rest are refused are *not* the same reason, and the message says
+which one applies:
+
+- **OFT** (``oft_*``) is an orthogonal, **multiplicative** transform of the base
+  weight. There is no additive ``dW`` to sum.
+- **DoRA** (``dora_scale``) renormalizes the *combined* weight --
+  ``dora_scale * (W + dW) / ||W + dW||`` -- which is not a sum of additive
+  deltas either. Two DoRAs' contributions do not add.
+- **LoHa** (``hada_w*``) *does* have a closed-form additive delta
+  (``(W1 * W2) * alpha/rank``, a Hadamard product of two low-rank products) and
+  could be carried here on the same footing as LoKr. It simply is not, yet.
+  That is a gap, not an impossibility, and it is refused as one.
 
 Bundled TI vectors (``bundle_emb.<placeholder>.<qwen|qwen_out|t5>``, written by
 ``AnimaLoRASaver`` when ``bundle_additional_embeddings`` is set) are carried
@@ -91,6 +162,7 @@ Importable, too: 454's greedy walk and 456's search call ``load_lora`` /
 
 from __future__ import annotations
 
+import abc
 import argparse
 import dataclasses
 import fnmatch
@@ -101,6 +173,7 @@ import subprocess
 import sys
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
+from math import prod
 from pathlib import Path
 
 import torch
@@ -109,10 +182,32 @@ from torch import Tensor
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+# Reach ``modules/`` the way ``scripts/util/import_util.py`` does -- repo root at
+# the head of sys.path -- but without its ZLUDA half: this module is *imported*
+# as a library by 454's greedy walk, and a library import must not have platform
+# side effects. ``modules`` is a namespace package and ``lokr_utils`` imports
+# nothing but torch, so this costs an already-paid import.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from modules.util.lokr_utils import make_kron, rebuild_tucker  # noqa: E402
+
 DOWN_SUFFIX = ".lora_down.weight"
 UP_SUFFIX = ".lora_up.weight"
 ALPHA_SUFFIX = ".alpha"
 BUNDLE_PREFIX = "bundle_emb."
+
+# The LoKr key families, as ``LoKrModule`` registers them. Matched with
+# ``endswith``, so ``.lokr_w1`` never swallows ``.lokr_w1_a``.
+LOKR_W1 = "lokr_w1"
+LOKR_W1_A = "lokr_w1_a"
+LOKR_W1_B = "lokr_w1_b"
+LOKR_W2 = "lokr_w2"
+LOKR_W2_A = "lokr_w2_a"
+LOKR_W2_B = "lokr_w2_b"
+LOKR_T2 = "lokr_t2"
+LOKR_NAMES: tuple[str, ...] = (LOKR_W1, LOKR_W1_A, LOKR_W1_B, LOKR_W2, LOKR_W2_A, LOKR_W2_B, LOKR_T2)
 
 METHOD_SVD = "svd"
 METHOD_CONCAT = "concat"
@@ -123,14 +218,39 @@ DTYPE_ALIASES: dict[str, torch.dtype] = {
     "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
 }
 
-# Distinctive key fragments of the PEFT types that do *not* decompose as
-# (alpha/rank)*B@A, so the refusal can say which one it is looking at.
-FOREIGN_PEFT_MARKERS: list[tuple[str, str]] = [
-    ("hada_w", "LoHa"),
-    ("lokr_w", "LoKr"),
-    ("oft_", "OFT"),
-    ("dora_scale", "DoRA"),
+# Distinctive key fragments of the PEFT types this engine does not merge, each
+# with *why* refusing it is correct. The reasons are not interchangeable and the
+# message must not lump them: OFT and DoRA have no additive delta to sum at all,
+# whereas LoHa has one and merely isn't wired up. Naming the wrong reason is how
+# a future reader concludes LoHa is impossible.
+FOREIGN_PEFT_MARKERS: list[tuple[str, str, str]] = [
+    (
+        "hada_w", "LoHa",
+        ("its delta is additive and closed-form ((W1 * W2) * alpha/rank), so this "
+         "engine could carry it -- it just does not, yet"),
+    ),
+    (
+        "oft_", "OFT",
+        ("it is an orthogonal, multiplicative transform of the base weight; there "
+         "is no additive delta to sum"),
+    ),
+    (
+        "dora_scale", "DoRA",
+        ("it renormalizes the combined weight (dora_scale * W/||W||), so its "
+         "contributions are not additive deltas"),
+    ),
 ]
+
+# Said in one place because ``soup`` refuses this up front and ``refactor_concat``
+# refuses it again for a direct caller.
+CONCAT_NEEDS_LORA = (
+    "--method concat stacks LoRA (A, B) factor blocks, which is exact only "
+    "because dW = (alpha/rank)*B@A is bilinear in a rank axis the blocks share. "
+    "A LoKr layer has no such axis: its delta is a Kronecker product, and a sum "
+    "of Kronecker products is not generally a Kronecker product, so there is "
+    "nothing to concatenate and no exact LoKr-shaped result to concatenate into. "
+    "Use --method svd, which re-factors the summed delta to plain LoRA."
+)
 
 
 class SoupError(Exception):
@@ -141,8 +261,45 @@ def _stderr(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+class AdapterLayer(abc.ABC):
+    """One adapted layer, reduced to what a delta-space merge actually needs.
+
+    That is the whole contract: a ``dW``, the geometry to re-factor it, and the
+    rank to re-factor it *at*. A PEFT type belongs behind this interface exactly
+    when it has a closed-form additive delta -- not when it merely has factors,
+    and not when it merely has a ``get_weight()``. ``merge_deltas`` sees nothing
+    else, which is why adding LoKr did not touch it.
+    """
+
+    @property
+    @abc.abstractmethod
+    def rank(self) -> int:
+        """The rank the SVD path should default to for this layer.
+
+        For LoRA that is the stored rank. For LoKr it is the algebraic rank
+        bound of the Kronecker delta, **not** ``lokr_dim``.
+        """
+
+    @abc.abstractmethod
+    def geometry(self) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+        """``(out_features, a_trailing, b_trailing)`` -- what must agree across
+        inputs before their deltas may be summed. The rank deliberately is not
+        in here, and neither is the PEFT type: two adapters of different types
+        over the same layer describe the same weight and add fine."""
+
+    @abc.abstractmethod
+    def delta(self) -> Tensor:
+        """``dW``, flattened to 2-D ``(out, prod(in, *kernel))``, float32."""
+
+    @property
+    @abc.abstractmethod
+    def storage_dtype(self) -> torch.dtype:
+        """The dtype this layer's factors are stored at -- what the output
+        inherits when no ``--dtype`` is given. Arithmetic is float32 regardless."""
+
+
 @dataclasses.dataclass
-class LoraLayer:
+class LoraLayer(AdapterLayer):
     """One LoRA-decomposable layer, exactly as stored in a safetensors file."""
 
     down: Tensor  # A, (rank, in, *kernel)
@@ -169,6 +326,10 @@ class LoraLayer:
     def scale(self) -> float:
         return self.alpha / self.rank
 
+    @property
+    def storage_dtype(self) -> torch.dtype:
+        return self.down.dtype
+
     def geometry(self) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
         """What must agree across inputs. The rank deliberately is not in here."""
         return (self.out_features, self.a_trailing, self.b_trailing)
@@ -186,12 +347,144 @@ class LoraLayer:
 
 
 @dataclasses.dataclass
+class LokrLayer(AdapterLayer):
+    """One LoKr-decomposable layer, exactly as stored in a safetensors file.
+
+    ``dim`` and ``alpha`` are resolved once at load time (see
+    ``build_lokr_layer``), which is where every structural refusal lives; by the
+    time one of these exists, the factor set is known well-formed and mutually
+    consistent, so the methods below assert rather than re-check.
+    """
+
+    w1: Tensor | None  # (out_l, in_m), whole
+    w1_a: Tensor | None  # (out_l, dim)
+    w1_b: Tensor | None  # (dim, in_m)
+    w2: Tensor | None  # (out_k, in_n[, k1, k2]), whole
+    w2_a: Tensor | None  # (out_k, dim), or (dim, out_k) under Tucker
+    w2_b: Tensor | None  # (dim, in_n*prod(kernel)), or (dim, in_n) under Tucker
+    t2: Tensor | None  # (dim, dim, k1, k2), Tucker only
+    alpha: float
+    dim: int
+
+    @property
+    def scale(self) -> float:
+        return self.alpha / self.dim
+
+    @property
+    def storage_dtype(self) -> torch.dtype:
+        w1 = self.w1 if self.w1 is not None else self.w1_a
+        assert w1 is not None
+        return w1.dtype
+
+    def _w1_shape(self) -> tuple[int, int]:
+        if self.w1 is not None:
+            return (self.w1.shape[0], self.w1.shape[1])
+        assert self.w1_a is not None and self.w1_b is not None
+        return (self.w1_a.shape[0], self.w1_b.shape[1])
+
+    def _w2_shape(self) -> tuple[int, ...]:
+        if self.w2 is not None:
+            return tuple(self.w2.shape)
+        assert self.w2_a is not None and self.w2_b is not None
+        if self.t2 is not None:
+            # rebuild_tucker's einsum 'ijkl,ip,jr->prkl': (out_k, in_n, k1, k2).
+            return (self.w2_a.shape[1], self.w2_b.shape[1], *self.t2.shape[2:])
+        return (self.w2_a.shape[0], self.w2_b.shape[1])
+
+    def weight_shape(self) -> tuple[int, ...]:
+        """The shape ``make_kron(w1, w2)`` produces -- which is ``get_weight``'s
+        ``self.shape`` in every case the file can distinguish (see the module
+        docstring on ``.view(shape)``)."""
+        out_l, in_m = self._w1_shape()
+        w2_shape = self._w2_shape()
+        return (out_l * w2_shape[0], in_m * w2_shape[1], *w2_shape[2:])
+
+    @property
+    def out_features(self) -> int:
+        return self.weight_shape()[0]
+
+    @property
+    def rank(self) -> int:
+        """The algebraic rank bound of the Kronecker delta.
+
+        ``rank(kron(w1, w2)) = rank(w1) * rank(w2)``, so this is the product of
+        each factor's own bound -- ``lokr_dim`` where that factor is stored
+        low-rank (a Tucker ``w2`` too: every row of the rebuilt ``w2`` lies in
+        the span of ``lokr_t2``'s ``dim`` slices), its smaller side where it is
+        stored whole -- capped at the delta's own smaller side.
+
+        Emphatically **not** ``lokr_dim`` itself. A dim-4 LoKr over a 256x256
+        Linear carries a delta of rank up to 64; defaulting the SVD to 4 would
+        throw away 94% of it without a word.
+        """
+        out_l, in_m = self._w1_shape()
+        w2_shape = self._w2_shape()
+        w1_rank = min(out_l, in_m) if self.w1 is not None else min(self.dim, out_l, in_m)
+        w2_rows, w2_cols = w2_shape[0], prod(w2_shape[1:])
+        w2_rank = min(w2_rows, w2_cols) if self.w2 is not None else min(self.dim, w2_rows, w2_cols)
+        shape = self.weight_shape()
+        return max(1, min(w1_rank * w2_rank, shape[0], prod(shape[1:])))
+
+    def geometry(self) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+        """The same triple a LoRA over this layer would report, so the two merge.
+
+        ``b_trailing`` is reconstructed rather than read: OneTrainer emits a 1x1
+        ``lora_up`` per kernel dim, so a delta with a kernel implies ``(1, 1)``
+        and a Linear one implies ``()``.
+        """
+        shape = self.weight_shape()
+        a_trailing = tuple(shape[1:])
+        return (shape[0], a_trailing, (1,) * (len(a_trailing) - 1))
+
+    def factors(self) -> tuple[Tensor, Tensor]:
+        """``(w1, w2)`` in float32, reproducing ``LoKrModule._get_factors``
+        minus the training-only dropout."""
+        if self.w1 is not None:
+            w1 = self.w1.to(torch.float32)
+        else:
+            assert self.w1_a is not None and self.w1_b is not None
+            w1 = self.w1_a.to(torch.float32) @ self.w1_b.to(torch.float32)
+
+        if self.w2 is not None:
+            w2 = self.w2.to(torch.float32)
+        elif self.t2 is not None:
+            assert self.w2_a is not None and self.w2_b is not None
+            w2 = rebuild_tucker(
+                self.t2.to(torch.float32),
+                self.w2_a.to(torch.float32),
+                self.w2_b.to(torch.float32),
+            )
+        else:
+            assert self.w2_a is not None and self.w2_b is not None
+            w2 = self.w2_a.to(torch.float32) @ self.w2_b.to(torch.float32)
+        return w1, w2
+
+    def weight(self) -> Tensor:
+        """``make_kron(w1, w2).view(shape) * (alpha/dim)`` -- the delta in its
+        natural (out, in, *kernel) shape, float32."""
+        w1, w2 = self.factors()
+        return make_kron(w1, w2).reshape(self.weight_shape()) * self.scale
+
+    def delta(self) -> Tensor:
+        """The same weight flattened to 2-D (out, prod(in, *kernel)), float32.
+
+        Flattening a ``.view(shape)`` back to (out, -1) is the identity on
+        contiguous row-major data, so this is exactly ``weight()`` reshaped --
+        no second convention to keep in step.
+        """
+        return self.weight().reshape(self.out_features, -1)
+
+
+@dataclasses.dataclass
 class LoadedLora:
-    """A parsed LoRA file plus the coefficient it enters the merge with."""
+    """A parsed adapter file plus the coefficient it enters the merge with.
+
+    Named for the common case; the layers inside may be LoRA, LoKr, or both.
+    """
 
     path: Path
     coefficient: float
-    layers: dict[str, LoraLayer]
+    layers: dict[str, AdapterLayer]
     bundle: dict[str, Tensor]
     header: dict[str, str]
     dtype: torch.dtype
@@ -263,8 +556,21 @@ def block_scale_for(prefix: str, block_scales: Sequence[tuple[str, float]]) -> f
 
 
 def _describe_foreign_keys(keys: Sequence[str]) -> str:
-    kinds = sorted({name for key in keys for marker, name in FOREIGN_PEFT_MARKERS if marker in key})
-    return f" (looks like {', '.join(kinds)})" if kinds else ""
+    """Name the PEFT type(s) the stray keys look like, *and why each is out*.
+
+    "LoHa/LoKr/OFT/DoRA are not plain LoRA" was true and useless: it read as one
+    verdict over four types, three of which are now wrong (LoKr merges here, and
+    LoHa is a gap rather than an impossibility).
+    """
+    kinds = {
+        name: reason
+        for key in keys
+        for marker, name, reason in FOREIGN_PEFT_MARKERS
+        if marker in key
+    }
+    if not kinds:
+        return ""
+    return " (looks like " + "; ".join(f"{name}, which {reason}" for name, reason in sorted(kinds.items())) + ")"
 
 
 def _file_sha256(path: Path) -> str:
@@ -305,8 +611,139 @@ def fork_revision() -> str:
         return "unknown"
 
 
+def _lokr_key_name(key: str) -> str | None:
+    """The LoKr family a key belongs to, or None.
+
+    ``endswith`` on the dotted name, so ``.lokr_w1`` cannot swallow
+    ``.lokr_w1_a`` -- the trap a startswith/prefix split would walk into.
+    """
+    return next((name for name in LOKR_NAMES if key.endswith("." + name)), None)
+
+
+def build_lokr_layer(
+    path: Path,
+    prefix: str,
+    parts: dict[str, Tensor],
+    alpha_tensor: Tensor | None,
+) -> LokrLayer:
+    """Validate one layer's LoKr factor set and resolve its ``dim`` and ``alpha``.
+
+    Every structural refusal for LoKr lives here, so ``LokrLayer``'s methods can
+    assert. The three ``w2`` forms (whole / factored / Tucker) are mutually
+    exclusive by construction in ``LoKrModule.initialize_weights``; a file
+    carrying two of them is corrupt, not ambiguous, and is refused rather than
+    resolved by precedence.
+    """
+    def need(name: str, why: str) -> Tensor:
+        tensor = parts.get(name)
+        if tensor is None:
+            raise SoupError(f"{path}: LoKr layer {prefix!r} {why} but has no {name}")
+        return tensor
+
+    def dims(name: str, tensor: Tensor, expected: int) -> None:
+        if tensor.dim() != expected:
+            raise SoupError(
+                f"{path}: LoKr layer {prefix!r} has {expected}-D {name} expected, "
+                f"got shape {tuple(tensor.shape)}"
+            )
+
+    w1, w1_a, w1_b = parts.get(LOKR_W1), parts.get(LOKR_W1_A), parts.get(LOKR_W1_B)
+    w2, w2_a, w2_b, t2 = parts.get(LOKR_W2), parts.get(LOKR_W2_A), parts.get(LOKR_W2_B), parts.get(LOKR_T2)
+
+    # -- w1: whole, or a_b pair, never both, never neither.
+    if w1 is not None and (w1_a is not None or w1_b is not None):
+        raise SoupError(
+            f"{path}: LoKr layer {prefix!r} carries both a whole lokr_w1 and a "
+            "decomposed lokr_w1_a/lokr_w1_b; only one of the two forms is written"
+        )
+    if w1 is not None:
+        dims(LOKR_W1, w1, 2)
+    elif w1_a is not None or w1_b is not None:
+        w1_a, w1_b = need(LOKR_W1_A, "decomposes w1"), need(LOKR_W1_B, "decomposes w1")
+        dims(LOKR_W1_A, w1_a, 2)
+        dims(LOKR_W1_B, w1_b, 2)
+        if w1_a.shape[1] != w1_b.shape[0]:
+            raise SoupError(
+                f"{path}: LoKr layer {prefix!r} has a broken w1 pair: "
+                f"lokr_w1_a is {tuple(w1_a.shape)}, lokr_w1_b is {tuple(w1_b.shape)}"
+            )
+    else:
+        raise SoupError(f"{path}: LoKr layer {prefix!r} has no w1 factor (lokr_w1 or lokr_w1_a/_b)")
+
+    # -- w2: whole, or a_b pair, or Tucker (t2 + the pair). Same exclusivity.
+    if w2 is not None and (w2_a is not None or w2_b is not None or t2 is not None):
+        raise SoupError(
+            f"{path}: LoKr layer {prefix!r} carries a whole lokr_w2 alongside "
+            "lokr_w2_a/lokr_w2_b/lokr_t2; only one w2 form is written"
+        )
+    if w2 is not None:
+        if w2.dim() not in (2, 4):
+            raise SoupError(
+                f"{path}: LoKr layer {prefix!r} has a whole lokr_w2 of shape "
+                f"{tuple(w2.shape)}; only 2-D (Linear) and 4-D (Conv2d) are written"
+            )
+    else:
+        w2_a, w2_b = need(LOKR_W2_A, "decomposes w2"), need(LOKR_W2_B, "decomposes w2")
+        dims(LOKR_W2_A, w2_a, 2)
+        dims(LOKR_W2_B, w2_b, 2)
+        if t2 is not None:
+            dims(LOKR_T2, t2, 4)
+            if t2.shape[0] != w2_a.shape[0] or t2.shape[1] != w2_b.shape[0]:
+                raise SoupError(
+                    f"{path}: LoKr layer {prefix!r} has a broken Tucker w2: lokr_t2 is "
+                    f"{tuple(t2.shape)}, lokr_w2_a is {tuple(w2_a.shape)}, "
+                    f"lokr_w2_b is {tuple(w2_b.shape)}"
+                )
+        elif w2_a.shape[1] != w2_b.shape[0]:
+            raise SoupError(
+                f"{path}: LoKr layer {prefix!r} has a broken w2 pair: "
+                f"lokr_w2_a is {tuple(w2_a.shape)}, lokr_w2_b is {tuple(w2_b.shape)}"
+            )
+
+    # -- dim. Not stored; read off whichever factor shapes carry it, and made to
+    # agree. Every candidate below is lokr_dim by construction in
+    # LoKrModule.initialize_weights, so a disagreement means the file is not
+    # what it claims and there is no defensible scale to pick.
+    candidates: list[tuple[str, int]] = []
+    if w1_a is not None and w1_b is not None:
+        candidates.append((LOKR_W1_A, w1_a.shape[1]))
+    if t2 is not None:
+        candidates.append((LOKR_T2, t2.shape[0]))
+        candidates.append((f"{LOKR_T2}[1]", t2.shape[1]))
+    elif w2_a is not None:
+        candidates.append((LOKR_W2_A, w2_a.shape[1]))
+
+    if candidates:
+        distinct = sorted({value for _name, value in candidates})
+        if len(distinct) > 1:
+            detail = ", ".join(f"{name} says {value}" for name, value in candidates)
+            raise SoupError(
+                f"{path}: LoKr layer {prefix!r} disagrees with itself about lokr_dim ({detail}); "
+                "the alpha/dim scale is not recoverable from this file"
+            )
+        dim = distinct[0]
+        alpha = float(alpha_tensor.item()) if alpha_tensor is not None else float(dim)
+    else:
+        # Both factors whole: no inner dim anywhere, so lokr_dim cannot be read
+        # back. It does not need to be. LoKrModule.initialize_weights does
+        # `self.alpha.fill_(lokr_dim)` in exactly this case, so alpha == dim and
+        # the scale is 1.0 -- the stored alpha is deliberately *not* consulted,
+        # because on its own it is a numerator with no denominator.
+        alpha, dim = 1.0, 1
+
+    if dim < 1:
+        raise SoupError(f"{path}: LoKr layer {prefix!r} resolved a lokr_dim of {dim}, which is not a rank")
+
+    return LokrLayer(w1=w1, w1_a=w1_a, w1_b=w1_b, w2=w2, w2_a=w2_a, w2_b=w2_b, t2=t2, alpha=alpha, dim=dim)
+
+
 def load_lora(path: Path | str, coefficient: float) -> LoadedLora:
-    """Read one LoRA safetensors file, refusing anything not plain LoRA."""
+    """Read one adapter safetensors file, refusing anything without a closed-form
+    additive delta.
+
+    Plain LoRA and LoKr are both understood, per layer, in the same file: they
+    reduce to the same ``dW`` and the merge never learns which was which.
+    """
     path = Path(path)
     if not path.exists():
         raise SoupError(f"input does not exist: {path}")
@@ -317,16 +754,20 @@ def load_lora(path: Path | str, coefficient: float) -> LoadedLora:
         for key in f.keys():  # noqa: SIM118 -- safe_open is not a Mapping
             tensors[key] = f.get_tensor(key)
 
-    layers: dict[str, LoraLayer] = {}
+    layers: dict[str, AdapterLayer] = {}
     bundle: dict[str, Tensor] = {}
     downs: dict[str, Tensor] = {}
     ups: dict[str, Tensor] = {}
     alphas: dict[str, Tensor] = {}
+    lokrs: dict[str, dict[str, Tensor]] = {}
     foreign: list[str] = []
 
     for key, tensor in tensors.items():
+        lokr_name = _lokr_key_name(key)
         if key.startswith(BUNDLE_PREFIX):
             bundle[key] = tensor
+        elif lokr_name is not None:
+            lokrs.setdefault(key[: -(len(lokr_name) + 1)], {})[lokr_name] = tensor
         elif key.endswith(DOWN_SUFFIX):
             downs[key[: -len(DOWN_SUFFIX)]] = tensor
         elif key.endswith(UP_SUFFIX):
@@ -340,11 +781,10 @@ def load_lora(path: Path | str, coefficient: float) -> LoadedLora:
         shown = ", ".join(sorted(foreign)[:5])
         more = f" (+{len(foreign) - 5} more)" if len(foreign) > 5 else ""
         raise SoupError(
-            f"{path}: {len(foreign)} key(s) are not plain-LoRA and cannot be merged in delta space"
-            f"{_describe_foreign_keys(foreign)}: {shown}{more}. "
-            "Only lora_down/lora_up/alpha and bundle_emb.* are understood; "
-            "LoHa/LoKr/OFT/DoRA do not decompose as (alpha/rank)*B@A and this script "
-            "will not merge them approximately."
+            f"{path}: {len(foreign)} key(s) belong to no PEFT type this script can merge "
+            f"in delta space{_describe_foreign_keys(foreign)}: {shown}{more}. "
+            "Understood: plain LoRA (lora_down/lora_up/alpha), LoKr (lokr_*), and "
+            "bundle_emb.*. Nothing else is merged approximately."
         )
 
     for prefix in sorted(set(downs) | set(ups)):
@@ -374,14 +814,22 @@ def load_lora(path: Path | str, coefficient: float) -> LoadedLora:
         alpha = float(alphas[prefix].item()) if prefix in alphas else float(rank)
         layers[prefix] = LoraLayer(down=down, up=up, alpha=alpha)
 
+    for prefix in sorted(lokrs):
+        if prefix in layers:
+            raise SoupError(
+                f"{path}: layer {prefix!r} carries both plain-LoRA and LoKr factors; "
+                "one layer has one delta and this file claims two"
+            )
+        layers[prefix] = build_lokr_layer(path, prefix, lokrs[prefix], alphas.get(prefix))
+
     orphan_alphas = sorted(set(alphas) - set(layers))
     if orphan_alphas:
         raise SoupError(f"{path}: alpha without factors for layer(s): {', '.join(orphan_alphas[:5])}")
 
     if not layers:
-        raise SoupError(f"{path}: no LoRA layers found")
+        raise SoupError(f"{path}: no LoRA or LoKr layers found")
 
-    dtype = next(iter(layers.values())).down.dtype
+    dtype = next(iter(layers.values())).storage_dtype
     return LoadedLora(
         path=path,
         coefficient=coefficient,
@@ -501,6 +949,11 @@ def refactor_concat(
     ups: list[Tensor] = []
     for loaded in inputs:
         layer = loaded.layers[prefix]
+        if not isinstance(layer, LoraLayer):
+            # ``soup`` refuses this up front, with the offending files named.
+            # Repeated here so a direct caller gets the reason, not an
+            # AttributeError about a missing ``.down``.
+            raise SoupError(f"{loaded.path}: layer {prefix!r} is not plain LoRA. {CONCAT_NEEDS_LORA}")
         factor = loaded.coefficient * scale * layer.scale
         root = math.sqrt(abs(factor))
         downs.append(layer.down.to(torch.float32) * root)
@@ -580,6 +1033,21 @@ def soup(
     merged, report = merge_deltas(inputs, block_scales, log=log)
 
     if method == METHOD_CONCAT:
+        # First, and distinguished from the partial-key-set refusal below: a
+        # LoKr input is not a concat that happens to be missing blocks, it is a
+        # concat that has no blocks. Falling back to SVD silently would hand
+        # back an approximation under a flag that promises exactness.
+        offenders = {
+            loaded.path.name: sorted(p for p, layer in loaded.layers.items() if not isinstance(layer, LoraLayer))
+            for loaded in inputs
+        }
+        offenders = {name: prefixes for name, prefixes in offenders.items() if prefixes}
+        if offenders:
+            named = "; ".join(
+                f"{name} ({len(prefixes)} layer(s), e.g. {prefixes[0]})"
+                for name, prefixes in sorted(offenders.items())
+            )
+            raise SoupError(f"{CONCAT_NEEDS_LORA} Non-LoRA input(s): {named}")
         if report.partial_layers:
             raise SoupError(
                 f"--method concat requires every input to contribute the same key set, but "
@@ -631,11 +1099,12 @@ def main() -> int:
     parser.add_argument("--output", required=True, help="where to write the merged .safetensors")
     parser.add_argument(
         "--input", action="append", required=True, metavar="FILE:COEFF",
-        help="an input LoRA and its coefficient; repeat once per input",
+        help="an input LoRA/LoKr and its coefficient; repeat once per input",
     )
     parser.add_argument(
         "--method", choices=[METHOD_SVD, METHOD_CONCAT], default=METHOD_SVD,
-        help="svd: re-factor at the target rank (default). concat: exact, output rank is the sum of input ranks",
+        help="svd: re-factor at the target rank (default). concat: exact, output rank is the sum of "
+             "input ranks -- plain-LoRA inputs only",
     )
     parser.add_argument(
         "--rank", type=int, default=None,

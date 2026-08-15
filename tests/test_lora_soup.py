@@ -14,6 +14,7 @@ is a synthetic state dict built here. Run with::
 import importlib.util
 import itertools
 import json
+import math
 import os
 import sys
 
@@ -31,6 +32,14 @@ lora_soup = importlib.util.module_from_spec(_spec)
 # sys.modules[cls.__module__], which is None for an unregistered module.
 sys.modules["lora_soup"] = lora_soup
 _spec.loader.exec_module(lora_soup)
+
+# Importing lora_soup puts the repo root on sys.path (it reaches modules/ for
+# the LoKr Kronecker math), so this resolves. The LoKr reference deltas below
+# deliberately go through the *same* make_kron/rebuild_tucker the engine uses:
+# a second copy of the Kronecker index convention here would test torch.kron,
+# not the loader. What the references pin is everything around that call --
+# which factors get assembled, the reshape, the dim inference, the scale.
+from modules.util.lokr_utils import make_kron, rebuild_tucker  # noqa: E402
 
 SoupError = lora_soup.SoupError
 
@@ -379,14 +388,18 @@ def test_concat_refuses_a_partial_key_set(tmp_path):
     ("key", "kind"),
     [
         ("transformer.transformer_blocks.0.attn1.to_q.hada_w1_a", "LoHa"),
-        ("transformer.transformer_blocks.0.attn1.to_q.lokr_w1", "LoKr"),
         ("transformer.transformer_blocks.0.attn1.to_q.oft_R.oft_blocks", "OFT"),
         ("transformer.transformer_blocks.0.attn1.to_q.dora_scale", "DoRA"),
     ],
 )
 def test_non_lora_peft_files_are_refused_by_key_name(tmp_path, key, kind):
     """A file this script cannot decompose is refused, naming the key -- never
-    merged approximately."""
+    merged approximately.
+
+    ``lokr_*`` used to be in this list and no longer is: LoKr has a closed-form
+    additive delta and merges in delta space like everything else. The LoKr
+    section below is what replaced this row.
+    """
     path = tmp_path / "foreign.safetensors"
     down, up, alpha = make_layer(16, 12, 4, seed=19)
     state_dict = {
@@ -402,6 +415,70 @@ def test_non_lora_peft_files_are_refused_by_key_name(tmp_path, key, kind):
     message = str(excinfo.value)
     assert key in message
     assert kind in message
+
+
+@pytest.mark.parametrize(
+    ("key", "kind", "reason_fragment"),
+    [
+        ("transformer.transformer_blocks.0.attn1.to_q.oft_R.oft_blocks", "OFT", "multiplicative"),
+        ("transformer.transformer_blocks.0.attn1.to_q.dora_scale", "DoRA", "renormalizes"),
+    ],
+)
+def test_oft_and_dora_are_refused_for_being_non_additive(tmp_path, key, kind, reason_fragment):
+    """The refusal must give the *real* reason, now that LoKr is merged here.
+
+    "not plain LoRA" was the old reason and it distinguishes nothing any more:
+    LoKr is not plain LoRA either and merges fine. What rules OFT and DoRA out is
+    that neither contributes an additive delta -- OFT rotates the base weight,
+    DoRA renormalizes the combined one -- so there is no dW to sum. A reader who
+    takes the old wording at face value goes on to fix the wrong thing.
+    """
+    path = tmp_path / "foreign.safetensors"
+    down, up, alpha = make_layer(16, 12, 4, seed=19)
+    save_file(
+        {
+            P1 + ".lora_down.weight": down,
+            P1 + ".lora_up.weight": up,
+            P1 + ".alpha": torch.tensor(alpha),
+            key: torch.randn(4, 4),
+        },
+        str(path),
+    )
+
+    with pytest.raises(SoupError) as excinfo:
+        lora_soup.load_lora(path, 1.0)
+    message = str(excinfo.value)
+    assert f"looks like {kind}" in message
+    assert reason_fragment in message
+    # ...and it must not still be lumping LoKr in with them: LoKr appears in
+    # this message only in the list of types that *are* understood.
+    assert "LoKr, which" not in message
+    assert "LoKr (lokr_*)" in message
+
+
+def test_loha_is_refused_as_a_gap_not_an_impossibility(tmp_path):
+    """LoHa's delta *is* additive and closed-form (``(W1 * W2) * alpha/rank``,
+    per ``LoHaModule.forward``), so it could be carried here exactly as LoKr now
+    is. It isn't, and the message has to say that rather than imply the algebra
+    forbids it."""
+    path = tmp_path / "loha.safetensors"
+    down, up, alpha = make_layer(16, 12, 4, seed=21)
+    save_file(
+        {
+            P1 + ".lora_down.weight": down,
+            P1 + ".lora_up.weight": up,
+            P1 + ".alpha": torch.tensor(alpha),
+            P2 + ".hada_w1_a": torch.randn(4, 4),
+        },
+        str(path),
+    )
+
+    with pytest.raises(SoupError) as excinfo:
+        lora_soup.load_lora(path, 1.0)
+    message = str(excinfo.value)
+    assert "LoHa" in message
+    assert "closed-form" in message
+    assert "does not, yet" in message
 
 
 def test_layer_missing_a_factor_is_refused(tmp_path):
@@ -586,3 +663,452 @@ def test_output_dtype_defaults_to_the_anchor(tmp_path):
 
     merged, _ = soup_to_dict(tmp_path, [(low, 0.75), (high, 0.25)])
     assert merged[P1 + ".lora_down.weight"].dtype == torch.float32
+
+
+# --------------------------------------------------------------------------
+# LoKr: fixtures
+#
+# Magnitudes matter here and are not decorative. A LoKr's factors are *not* all
+# the same size: LoKrModule.initialize_weights kaiming-initializes lokr_w1 and
+# lokr_w2_a (bound 1/sqrt(fan_in), so O(1e-1)) and zero-initializes the last
+# factor -- lokr_w2_b, or lokr_w2 in full-matrix mode -- which is then trained,
+# and in a real checkpoint lands around 1e-3. torch.randn everywhere would make
+# every delta ~1000x too large, which is precisely how a previous fp16 precision
+# fault in this file survived its own test.
+# --------------------------------------------------------------------------
+
+def _kaiming(*shape, seed):
+    """nn.init.kaiming_uniform_(a=sqrt(5)): Uniform(-b, b), b = 1/sqrt(fan_in)."""
+    g = torch.Generator().manual_seed(seed)
+    fan_in = shape[1] * math.prod(shape[2:]) if len(shape) > 1 else shape[0]
+    bound = 1.0 / math.sqrt(fan_in)
+    return (torch.rand(*shape, generator=g) * 2 - 1) * bound
+
+
+def _trained(*shape, seed, scale=1e-3):
+    """The factor that starts at zero and is learned -- ~1e-3, not ~1."""
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(*shape, generator=g) * scale
+
+
+def make_lokr(out_l, out_k, in_m, in_n, dim, *, kernel=None, w1="whole", w2="factored", seed=0):
+    """One synthetic LoKr factor set, in the shapes LoKrModule stores.
+
+    Returns ``(parts, shape)``: the tensors keyed by their short names, and the
+    weight shape ``get_weight()`` would ``.view`` to.
+    """
+    parts = {}
+    if w1 == "whole":
+        parts["lokr_w1"] = _kaiming(out_l, in_m, seed=seed)
+    else:
+        parts["lokr_w1_a"] = _kaiming(out_l, dim, seed=seed + 1)
+        parts["lokr_w1_b"] = _kaiming(dim, in_m, seed=seed + 2)
+
+    if w2 == "whole":
+        parts["lokr_w2"] = _trained(out_k, in_n, *(kernel or ()), seed=seed + 3)
+    elif w2 == "tucker":
+        assert kernel is not None, "Tucker only arises for a Conv2d with a real kernel"
+        parts["lokr_t2"] = _kaiming(dim, dim, *kernel, seed=seed + 4)
+        parts["lokr_w2_a"] = _kaiming(dim, out_k, seed=seed + 5)
+        parts["lokr_w2_b"] = _trained(dim, in_n, seed=seed + 6)
+    else:
+        parts["lokr_w2_a"] = _kaiming(out_k, dim, seed=seed + 7)
+        # For a Conv2d with a factored w2, lokr_w2_b folds the kernel into its
+        # trailing dim -- the one case where get_weight()'s .view(shape) is not
+        # a no-op, and the one case the file cannot tell from a Linear.
+        parts["lokr_w2_b"] = _trained(dim, in_n * math.prod(kernel or ()), seed=seed + 8)
+
+    shape = (out_l * out_k, in_m * in_n, *(kernel or ()))
+    return parts, shape
+
+
+def write_lokr(path, layers, header=None, dtype=torch.float16):
+    """Serialize {prefix: (parts, alpha_or_None)} the way LoKrModule's state
+    dict lands in a safetensors file."""
+    state_dict = {}
+    for prefix, (parts, alpha) in layers.items():
+        for name, tensor in parts.items():
+            state_dict[f"{prefix}.{name}"] = tensor.to(dtype).contiguous().clone()
+        if alpha is not None:
+            state_dict[prefix + ".alpha"] = torch.tensor(alpha, dtype=dtype)
+    save_file(state_dict, str(path), header)
+    return path
+
+
+def lokr_delta_of(state_dict, prefix, dim, shape):
+    """``make_kron(w1, w2).view(shape) * (alpha/dim)``, computed independently
+    of the module under test.
+
+    ``dim`` is passed in from how the fixture was *built*. Re-deriving it here
+    would only re-run the loader's own inference and pin nothing -- the whole
+    point is that the file does not store it.
+    """
+    def get(name):
+        return state_dict.get(f"{prefix}.{name}")
+
+    w1 = get("lokr_w1")
+    w1 = w1.float() if w1 is not None else get("lokr_w1_a").float() @ get("lokr_w1_b").float()
+
+    w2 = get("lokr_w2")
+    if w2 is not None:
+        w2 = w2.float()
+    elif get("lokr_t2") is not None:
+        w2 = rebuild_tucker(get("lokr_t2").float(), get("lokr_w2_a").float(), get("lokr_w2_b").float())
+    else:
+        w2 = get("lokr_w2_a").float() @ get("lokr_w2_b").float()
+
+    alpha = float(get("alpha").item()) if get("alpha") is not None else float(dim)
+    return make_kron(w1, w2).view(shape) * (alpha / dim)
+
+
+# The two Linear factorizations used throughout. factorization(256) == (16, 16)
+# and factorization(128) == factorization(96)-ish shapes are what LoKrModule
+# would pick; the tests pass them explicitly so the fixture never depends on it.
+LIN_256 = {"out_l": 16, "out_k": 16, "in_m": 16, "in_n": 16}
+
+
+# --------------------------------------------------------------------------
+# LoKr: the delta is exact, in all three w2 forms
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("w1_form", "w2_form", "kernel", "geom"),
+    [
+        ("whole", "factored", None, LIN_256),
+        ("whole", "whole", None, LIN_256),
+        ("pair", "factored", None, LIN_256),
+        ("pair", "whole", None, LIN_256),
+        # Conv2d 64 -> 96: factorization(96) = (8, 12), factorization(64) = (8, 8).
+        ("whole", "whole", (3, 3), {"out_l": 8, "out_k": 12, "in_m": 8, "in_n": 8}),
+        ("whole", "tucker", (3, 3), {"out_l": 8, "out_k": 12, "in_m": 8, "in_n": 8}),
+    ],
+)
+def test_lokr_delta_is_the_closed_form_kronecker_product(tmp_path, w1_form, w2_form, kernel, geom):
+    """dW = make_kron(w1, w2).view(shape) * (alpha/dim), exactly -- no
+    approximation anywhere on the LoKr path.
+
+    Every combination of w1 form (whole / decompose_both pair) and w2 form
+    (whole / factored / Tucker) is covered, because each picks a different
+    branch of _get_factors and a different place to read lokr_dim back from.
+    """
+    dim = 4
+    parts, shape = make_lokr(**geom, dim=dim, kernel=kernel, w1=w1_form, w2=w2_form, seed=100)
+    path = write_lokr(tmp_path / "lokr.safetensors", {P1: (parts, float(dim))})
+
+    loaded = lora_soup.load_lora(path, 1.0)
+    layer = loaded.layers[P1]
+    assert isinstance(layer, lora_soup.LokrLayer)
+
+    stored = load_file(str(path))
+    expected = lokr_delta_of(stored, P1, dim, shape)
+
+    assert layer.weight_shape() == shape
+    assert rel_err(layer.weight(), expected) < 1e-6
+    # ...and the 2-D form the merge actually consumes is the same numbers.
+    assert rel_err(layer.delta(), expected.reshape(shape[0], -1)) < 1e-6
+
+
+def test_lokr_delta_matches_a_hand_written_kronecker(tmp_path):
+    """One case checked against the textbook definition rather than make_kron,
+    so the suite is not purely self-referential about the index convention:
+    kron(w1, w2)[i*out_k + k, j*in_n + n] == w1[i, j] * w2[k, n]."""
+    dim = 4
+    parts, shape = make_lokr(**LIN_256, dim=dim, seed=200)
+    path = write_lokr(tmp_path / "lokr.safetensors", {P1: (parts, float(dim))})
+
+    layer = lora_soup.load_lora(path, 1.0).layers[P1]
+    w1 = parts["lokr_w1"].to(torch.float16).float()
+    w2 = (parts["lokr_w2_a"].to(torch.float16).float() @ parts["lokr_w2_b"].to(torch.float16).float())
+
+    out_k, in_n = w2.shape
+    expected = torch.empty(shape)
+    for i in range(w1.shape[0]):
+        for j in range(w1.shape[1]):
+            expected[i * out_k:(i + 1) * out_k, j * in_n:(j + 1) * in_n] = w1[i, j] * w2
+
+    assert rel_err(layer.weight(), expected) < 1e-6
+
+
+def test_lokr_scale_is_alpha_over_dim_not_alpha_over_anything_else(tmp_path):
+    """dim is the *factor* rank, read back off the factor shapes -- the file
+    never stores it. Doubling only alpha must double the delta exactly."""
+    dim = 4
+    parts, shape = make_lokr(**LIN_256, dim=dim, seed=300)
+    at_one = write_lokr(tmp_path / "one.safetensors", {P1: (parts, float(dim))})
+    at_two = write_lokr(tmp_path / "two.safetensors", {P1: (parts, float(2 * dim))})
+
+    d1 = lora_soup.load_lora(at_one, 1.0).layers[P1].delta()
+    d2 = lora_soup.load_lora(at_two, 1.0).layers[P1].delta()
+
+    assert lora_soup.load_lora(at_one, 1.0).layers[P1].dim == dim
+    assert rel_err(d2, 2.0 * d1) < 1e-6
+    # And an absent alpha means alpha == dim, i.e. scale 1.0, as for LoRA.
+    bare = write_lokr(tmp_path / "bare.safetensors", {P1: (parts, None)})
+    assert rel_err(lora_soup.load_lora(bare, 1.0).layers[P1].delta(), d1) < 1e-6
+    assert shape == (256, 256)
+
+
+def test_lokr_with_both_factors_whole_reads_a_scale_of_one(tmp_path):
+    """With no inner dim anywhere, lokr_dim is unrecoverable -- and irrelevant,
+    because LoKrModule.initialize_weights does alpha.fill_(lokr_dim) in exactly
+    that case, so alpha/dim is 1.0. The stored alpha must therefore be ignored,
+    not divided by 1."""
+    parts, shape = make_lokr(**LIN_256, dim=8, w1="whole", w2="whole", seed=400)
+    path = write_lokr(tmp_path / "full.safetensors", {P1: (parts, 8.0)})
+
+    layer = lora_soup.load_lora(path, 1.0).layers[P1]
+    assert layer.scale == 1.0
+
+    stored = load_file(str(path))
+    expected = make_kron(stored[P1 + ".lokr_w1"].float(), stored[P1 + ".lokr_w2"].float()).view(shape)
+    assert rel_err(layer.weight(), expected) < 1e-6
+
+
+def test_lokr_conv_with_a_4d_w2_keeps_its_kernel_geometry(tmp_path):
+    """A Conv2d LoKr whose w2 is stored whole (or Tucker) is 4-D, so the kernel
+    is visible in the file and the emitted geometry matches what a conv LoRA
+    over the same layer would report: (out, (in, k1, k2), (1, 1))."""
+    parts, _shape = make_lokr(
+        out_l=8, out_k=12, in_m=8, in_n=8, dim=4, kernel=(3, 3), w2="whole", seed=500
+    )
+    path = write_lokr(tmp_path / "conv.safetensors", {P1: (parts, 4.0)})
+
+    layer = lora_soup.load_lora(path, 1.0).layers[P1]
+    assert layer.geometry() == (96, (64, 3, 3), (1, 1))
+
+
+def test_lokr_conv_with_a_factored_w2_reads_as_linear(tmp_path):
+    """The one shape ambiguity, pinned so it is a known reading rather than a
+    surprise: a Conv2d whose w2 is factored folds the kernel into lokr_w2_b, and
+    nothing in the file distinguishes that from a Linear of in = in*k1*k2. The
+    delta is exact either way -- only the emitted factor shape differs."""
+    parts, shape = make_lokr(
+        out_l=8, out_k=12, in_m=8, in_n=8, dim=2, kernel=(3, 3), w2="factored", seed=600
+    )
+    path = write_lokr(tmp_path / "conv.safetensors", {P1: (parts, 2.0)})
+
+    layer = lora_soup.load_lora(path, 1.0).layers[P1]
+    assert shape == (96, 64, 3, 3)  # what it really was
+    assert layer.geometry() == (96, (576,), ())  # what the file can say
+    # The numbers are still right: viewing the read-as-linear delta back to the
+    # conv shape reproduces the closed form.
+    stored = load_file(str(path))
+    assert rel_err(layer.delta().reshape(shape), lokr_delta_of(stored, P1, 2, shape)) < 1e-6
+
+
+# --------------------------------------------------------------------------
+# LoKr: merging is linear in delta space
+# --------------------------------------------------------------------------
+
+def test_two_lokrs_merge_as_c1_dw1_plus_c2_dw2(tmp_path):
+    """The whole reason LoKr belongs in this engine: it reduces to a dW, and
+    dWs add. Checked against deltas computed outside the module."""
+    dim = 4
+    parts_a, shape = make_lokr(**LIN_256, dim=dim, seed=700)
+    parts_b, _ = make_lokr(**LIN_256, dim=dim, seed=800)
+    a = write_lokr(tmp_path / "a.safetensors", {P1: (parts_a, float(dim))})
+    b = write_lokr(tmp_path / "b.safetensors", {P1: (parts_b, float(2 * dim))})
+
+    c1, c2 = 0.3, 0.7
+    merged, _report = lora_soup.merge_deltas(
+        [lora_soup.load_lora(a, c1), lora_soup.load_lora(b, c2)], log=lambda _m: None
+    )
+
+    expected = (
+        c1 * lokr_delta_of(load_file(str(a)), P1, dim, shape)
+        + c2 * lokr_delta_of(load_file(str(b)), P1, dim, shape)
+    )
+    assert rel_err(merged[P1].delta, expected.reshape(shape[0], -1)) < FP32_REL_TOL
+
+
+def test_a_lora_and_a_lokr_merge_together(tmp_path):
+    """Mixed soups work, because the merge never learns which was which. Both
+    sides describe the same layer, both reduce to a dW over the same geometry,
+    and the sum is the sum."""
+    dim = 4
+    lokr_parts, shape = make_lokr(**LIN_256, dim=dim, seed=900)
+    lokr_path = write_lokr(tmp_path / "lokr.safetensors", {P1: (lokr_parts, float(dim))})
+    # A plain LoRA over the same 256x256 layer, at a comparable magnitude.
+    down = _kaiming(8, 256, seed=901)
+    up = _trained(256, 8, seed=902)
+    lora_path = write_lora(tmp_path / "lora.safetensors", {P1: (down, up, 8.0)})
+
+    c1, c2 = 0.4, 0.6
+    merged, report = lora_soup.merge_deltas(
+        [lora_soup.load_lora(lokr_path, c1), lora_soup.load_lora(lora_path, c2)],
+        log=lambda _m: None,
+    )
+    assert report.partial_layers == 0
+
+    expected = (
+        c1 * lokr_delta_of(load_file(str(lokr_path)), P1, dim, shape).reshape(256, -1)
+        + c2 * delta_of(load_file(str(lora_path)), P1)
+    )
+    assert rel_err(merged[P1].delta, expected) < FP32_REL_TOL
+
+    # ...and it comes out the far end as a loadable plain LoRA.
+    state_dict, _header = soup_to_dict(tmp_path, [(lokr_path, c1), (lora_path, c2)], rank=72)
+    assert rel_err(delta_of(state_dict, P1), expected) < FP16_REL_TOL
+
+
+def test_lokr_svd_output_round_trips_the_merged_delta(tmp_path):
+    """At a rank sufficient to represent it, the emitted plain LoRA reproduces
+    the merged LoKr delta to fp16 storage tolerance -- nothing looser.
+
+    "Sufficient" is 128, not 64. Each input's delta has rank
+    rank(w1)*rank(w2) = 16*4 = 64, and the sum of two rank-64 matrices has rank
+    up to 128. The per-layer default (max over inputs, so 64 here) is therefore
+    a *truncating* default for a multi-input soup -- exactly as it already is
+    for plain LoRA, where two rank-4 inputs also sum to rank 8. LoKr does not
+    change that trade-off, and this test asks for the rank that avoids it rather
+    than loosening the tolerance until 64 passes.
+    """
+    dim = 4
+    parts_a, shape = make_lokr(**LIN_256, dim=dim, seed=1000)
+    parts_b, _ = make_lokr(**LIN_256, dim=dim, seed=1100)
+    a = write_lokr(tmp_path / "a.safetensors", {P1: (parts_a, float(dim))})
+    b = write_lokr(tmp_path / "b.safetensors", {P1: (parts_b, float(dim))})
+
+    expected = (
+        0.5 * lokr_delta_of(load_file(str(a)), P1, dim, shape)
+        + 0.5 * lokr_delta_of(load_file(str(b)), P1, dim, shape)
+    ).reshape(shape[0], -1)
+
+    state_dict, _header = soup_to_dict(tmp_path, [(a, 0.5), (b, 0.5)], rank=128)
+    assert rank_of(state_dict, P1) == 128
+    assert float(state_dict[P1 + ".alpha"].item()) == 128.0
+    assert rel_err(delta_of(state_dict, P1), expected) < FP16_REL_TOL
+
+    # And the default (64) is a real truncation, not a silent equality: if this
+    # ever stops losing anything, the rank bound above has drifted.
+    truncated, _header = soup_to_dict(tmp_path, [(a, 0.5), (b, 0.5)])
+    assert rank_of(truncated, P1) == 64
+    assert rel_err(delta_of(truncated, P1), expected) > FP16_REL_TOL
+
+
+def test_lokr_default_rank_is_the_kronecker_bound_not_lokr_dim(tmp_path):
+    """rank(kron(w1, w2)) = rank(w1) * rank(w2), so a dim-4 LoKr over a 256x256
+    Linear carries a delta of rank up to 64. Defaulting the SVD to lokr_dim
+    would silently discard 94% of it -- the merge would 'succeed' and be
+    wrong."""
+    dim = 4
+    parts, shape = make_lokr(**LIN_256, dim=dim, seed=1200)
+    path = write_lokr(tmp_path / "lokr.safetensors", {P1: (parts, float(dim))})
+
+    assert lora_soup.load_lora(path, 1.0).layers[P1].rank == 64
+
+    state_dict, _header = soup_to_dict(tmp_path, [(path, 1.0)])
+    assert rank_of(state_dict, P1) == 64
+    expected = lokr_delta_of(load_file(str(path)), P1, dim, shape).reshape(shape[0], -1)
+    assert rel_err(delta_of(state_dict, P1), expected) < FP16_REL_TOL
+
+
+def test_lokr_block_scale_applies_in_delta_space(tmp_path):
+    """455's ablation works on a LoKr for the same reason a soup does: the block
+    scale multiplies a delta, and a LoKr has one."""
+    dim = 4
+    parts, _shape = make_lokr(**LIN_256, dim=dim, seed=1300)
+    path = write_lokr(tmp_path / "lokr.safetensors", {P1: (parts, float(dim)), P2: (parts, float(dim))})
+
+    merged, _report = lora_soup.merge_deltas(
+        [lora_soup.load_lora(path, 1.0)], block_scales=[("*attn1*", 0.0)], log=lambda _m: None
+    )
+    assert merged[P1].delta.abs().max().item() == 0.0
+    assert merged[P2].delta.abs().max().item() > 0.0
+
+
+# --------------------------------------------------------------------------
+# LoKr: refusals
+# --------------------------------------------------------------------------
+
+def test_concat_refuses_a_lokr_input_with_its_own_reason(tmp_path):
+    """--method concat is an exact LoRA-only rearrangement: it stacks blocks
+    along a shared rank axis, which a Kronecker delta does not have. Silently
+    falling back to SVD would hand back an approximation under a flag that
+    promises exactness, so this is refused by name -- and distinguishably from
+    the partial-key-set refusal, which is a different problem."""
+    dim = 4
+    parts, _shape = make_lokr(**LIN_256, dim=dim, seed=1400)
+    lokr_path = write_lokr(tmp_path / "lokr.safetensors", {P1: (parts, float(dim))})
+    down = _kaiming(8, 256, seed=1401)
+    up = _trained(256, 8, seed=1402)
+    lora_path = write_lora(tmp_path / "lora.safetensors", {P1: (down, up, 8.0)})
+
+    with pytest.raises(SoupError) as excinfo:
+        lora_soup.soup_files([(lokr_path, 0.5), (lora_path, 0.5)], method="concat", log=lambda _m: None)
+    message = str(excinfo.value)
+    assert "Kronecker" in message
+    assert "--method svd" in message
+    assert "lokr.safetensors" in message
+    # Not the "same key set" refusal, which is about absent layers.
+    assert "same key set" not in message
+
+
+def test_concat_still_works_for_an_all_lora_soup(tmp_path):
+    """The LoKr refusal must not have become a refusal of concat in general."""
+    layers = {P1: make_layer(16, 12, 4, seed=1500)}
+    a = write_lora(tmp_path / "a.safetensors", layers)
+    b = write_lora(tmp_path / "b.safetensors", layers)
+    state_dict, _header = soup_to_dict(tmp_path, [(a, 0.5), (b, 0.5)], method="concat")
+    assert rank_of(state_dict, P1) == 8
+
+
+def test_lokr_missing_a_w2_factor_is_refused(tmp_path):
+    dim = 4
+    parts, _shape = make_lokr(**LIN_256, dim=dim, seed=1600)
+    del parts["lokr_w2_b"]
+    path = write_lokr(tmp_path / "half.safetensors", {P1: (parts, float(dim))})
+
+    with pytest.raises(SoupError, match="lokr_w2_b"):
+        lora_soup.load_lora(path, 1.0)
+
+
+def test_lokr_with_two_w2_forms_at_once_is_refused(tmp_path):
+    """Whole / factored / Tucker are mutually exclusive by construction. A file
+    with two of them is corrupt, not ambiguous, so it is refused rather than
+    resolved by precedence."""
+    dim = 4
+    parts, _shape = make_lokr(**LIN_256, dim=dim, seed=1700)
+    parts["lokr_w2"] = _trained(16, 16, seed=1701)
+    path = write_lokr(tmp_path / "both.safetensors", {P1: (parts, float(dim))})
+
+    with pytest.raises(SoupError, match="only one w2 form"):
+        lora_soup.load_lora(path, 1.0)
+
+
+def test_lokr_disagreeing_about_its_own_dim_is_refused(tmp_path):
+    """Every factor that carries lokr_dim must say the same number. It is the
+    denominator of the scale; guessing which one is right would mis-scale the
+    whole layer silently."""
+    parts, _shape = make_lokr(**LIN_256, dim=4, w1="pair", seed=1800)
+    parts["lokr_w2_a"] = _kaiming(16, 6, seed=1801)  # says dim = 6
+    parts["lokr_w2_b"] = _trained(6, 16, seed=1802)
+    path = write_lokr(tmp_path / "confused.safetensors", {P1: (parts, 4.0)})
+
+    with pytest.raises(SoupError, match="disagrees with itself about lokr_dim"):
+        lora_soup.load_lora(path, 1.0)
+
+
+def test_a_layer_carrying_both_lora_and_lokr_factors_is_refused(tmp_path):
+    """One layer has one delta. A file claiming two for the same prefix is not
+    a merge problem, it is a corrupt file."""
+    dim = 4
+    parts, _shape = make_lokr(**LIN_256, dim=dim, seed=1900)
+    path = tmp_path / "both.safetensors"
+    state_dict = {f"{P1}.{name}": tensor.contiguous().clone() for name, tensor in parts.items()}
+    state_dict[P1 + ".lora_down.weight"] = _kaiming(4, 256, seed=1901)
+    state_dict[P1 + ".lora_up.weight"] = _trained(256, 4, seed=1902)
+    state_dict[P1 + ".alpha"] = torch.tensor(float(dim))
+    save_file(state_dict, str(path))
+
+    with pytest.raises(SoupError, match="both plain-LoRA and LoKr"):
+        lora_soup.load_lora(path, 1.0)
+
+
+def test_a_lokr_file_reports_its_storage_dtype(tmp_path):
+    """The output inherits the anchor's dtype, and a LoKr anchor has no
+    lora_down to read it off."""
+    dim = 4
+    parts, _shape = make_lokr(**LIN_256, dim=dim, seed=2000)
+    path = write_lokr(tmp_path / "bf16.safetensors", {P1: (parts, float(dim))}, dtype=torch.bfloat16)
+    assert lora_soup.load_lora(path, 1.0).dtype == torch.bfloat16

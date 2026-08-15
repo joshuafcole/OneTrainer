@@ -13,7 +13,10 @@ Anatomy (verified against ``BaseAnimaSetup.LAYER_PRESETS`` and the diffusers
 A LoRA-adapted layer's key takes the form
 ``transformer.transformer_blocks.<i>.<remainder>.lora_{down,up}.weight`` (or
 ``.alpha``); *layer prefix* means everything before those suffixes, which is
-what ``lora_soup.block_scale_for`` matches its ``fnmatch`` patterns against.
+what ``lora_soup.block_scale_for`` matches its ``fnmatch`` patterns against. A
+LoKr-adapted layer names the same prefix under ``.lokr_*`` instead, and is
+grouped identically -- the taxonomy is over layers, and the factorization a
+layer was trained with is not one of its coordinates.
 
 Within one ``CosmosTransformerBlock`` the LoRA-decomposable sublayers are:
 
@@ -66,6 +69,19 @@ from safetensors import safe_open
 DOWN_SUFFIX = ".lora_down.weight"
 UP_SUFFIX = ".lora_up.weight"
 ALPHA_SUFFIX = ".alpha"
+# LoKr names one layer under a different key family, so a LoKr checkpoint would
+# otherwise report zero layers rather than an error -- an empty table that looks
+# like an answer. Kept in step with lora_soup's LOKR_NAMES by hand: this module
+# deliberately imports nothing from there, since it is the *taxonomy*, not the
+# merge engine, and the two are used independently.
+LAYER_SUFFIXES: tuple[str, ...] = (
+    DOWN_SUFFIX,
+    UP_SUFFIX,
+    ALPHA_SUFFIX,
+    ".lokr_w1", ".lokr_w1_a", ".lokr_w1_b",
+    ".lokr_w2", ".lokr_w2_a", ".lokr_w2_b",
+    ".lokr_t2",
+)
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("block_groups.json")
 
@@ -310,12 +326,17 @@ def coverage(prefixes: Sequence[str], config: GroupConfig) -> CoverageReport:
 
 
 def _layer_prefixes_from_keys(keys: Iterable[str]) -> list[str]:
-    """Every ``lora_down``/``lora_up``/``alpha`` key collapsed to its shared
-    layer prefix (de-duplicated: a layer names one prefix across all three
-    suffixes)."""
+    """Every adapter key collapsed to its shared layer prefix (de-duplicated: a
+    layer names one prefix across all of its suffixes).
+
+    LoRA's three suffixes and LoKr's seven both land here -- the taxonomy is
+    over *layers*, and which factorization a layer was trained with is not one
+    of its coordinates. Matched with ``endswith`` on the dotted suffix, so
+    ``.lokr_w1`` cannot swallow ``.lokr_w1_a``.
+    """
     prefixes: set[str] = set()
     for key in keys:
-        for suffix in (DOWN_SUFFIX, UP_SUFFIX, ALPHA_SUFFIX):
+        for suffix in LAYER_SUFFIXES:
             if key.endswith(suffix):
                 prefixes.add(key[: -len(suffix)])
                 break
@@ -323,7 +344,7 @@ def _layer_prefixes_from_keys(keys: Iterable[str]) -> list[str]:
 
 
 def read_layer_prefixes(path: str | Path) -> list[str]:
-    """The layer-prefix set of a ``.safetensors`` LoRA file, read from its
+    """The layer-prefix set of a ``.safetensors`` LoRA/LoKr file, read from its
     key set only -- ``safe_open`` never materializes a tensor for this."""
     with safe_open(str(path), framework="pt") as f:
         return _layer_prefixes_from_keys(f.keys())  # noqa: SIM118 -- safe_open is not a Mapping
