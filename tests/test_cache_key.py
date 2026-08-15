@@ -9,12 +9,14 @@ only when) an input that changes the cached tensors changes.
 import importlib.util
 import os
 import sys
+import tempfile
 import types
 
 # cache_key now imports modules.util.bucket_limits, so the repo root must be on the
 # path for its isolated file-location load to resolve (repo test convention).
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from modules.util import dataset_key
 from modules.util.bucket_limits import ANIMA_MAX_BUCKET_RESOLUTION, max_bucket_resolution_for
 from modules.util.enum.ModelType import ModelType
 
@@ -130,6 +132,71 @@ def test_text_salt_ignores_excluded_encoders_and_image_changes():
     assert text_cache_salt(_cfg()) == text_cache_salt(_cfg(text_encoder_3=_Part("garbage", include=False)))
     assert text_cache_salt(_cfg()) == text_cache_salt(_cfg(resolution="768"))
     assert text_cache_salt(_cfg()) == text_cache_salt(_cfg(vae=_Part("/v.safetensors")))
+
+
+# --------------------------------------------------------------------------- #
+# dataset dimension (modules/util/dataset_key.py, folded into both salts)
+# --------------------------------------------------------------------------- #
+
+class _Concept:
+    def __init__(self, path, enabled=True, include_subdirectories=False):
+        self.path = path
+        self.enabled = enabled
+        self.include_subdirectories = include_subdirectories
+
+
+def _write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    mode = "wb" if isinstance(content, bytes) else "w"
+    with open(path, mode) as fh:
+        fh.write(content)
+
+
+def _salts(concept_dir):
+    """Both salts for a config whose sole concept is ``concept_dir``."""
+    dataset_key.reset_memo()  # these tests edit a dataset in place within one process
+    cfg = _cfg(concepts=[_Concept(concept_dir)])
+    return image_cache_salt(cfg), text_cache_salt(cfg)
+
+
+def test_salts_unchanged_when_config_carries_no_concepts():
+    # The pre-existing _cfg() has no `concepts` attribute at all. Its salts must stay
+    # byte-identical to what they were before dataset fingerprinting existed, so
+    # deploying this cannot invalidate a cache it has nothing to say about.
+    assert image_cache_salt(_cfg()) == image_cache_salt(_cfg(concepts=None))
+    assert text_cache_salt(_cfg()) == text_cache_salt(_cfg(concepts=[]))
+
+
+def test_both_salts_move_when_an_image_is_added():
+    """The reported failure: a concept gains a file at an unchanged path. Before
+    this, both caches were reused against a dataset that had grown under them."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        concept_dir = os.path.join(tmp_dir, "concept")
+        _write(os.path.join(concept_dir, "a.png"), b"image a")
+        _write(os.path.join(concept_dir, "a.txt"), "caption a")
+        before_image, before_text = _salts(concept_dir)
+
+        _write(os.path.join(concept_dir, "b.png"), b"image b")
+        after_image, after_text = _salts(concept_dir)
+
+        assert before_image != after_image, "the latent cache must not be reused"
+        assert before_text != after_text, "the text cache must not be reused either"
+
+
+def test_caption_edit_moves_only_the_text_salt():
+    """The split that makes this affordable: rewording a caption must not push every
+    image back through the VAE."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        concept_dir = os.path.join(tmp_dir, "concept")
+        _write(os.path.join(concept_dir, "a.png"), b"image a")
+        _write(os.path.join(concept_dir, "a.txt"), "a cat")
+        before_image, before_text = _salts(concept_dir)
+
+        _write(os.path.join(concept_dir, "a.txt"), "a dog")  # same length on purpose
+        after_image, after_text = _salts(concept_dir)
+
+        assert before_text != after_text, "the text cache must be re-encoded"
+        assert before_image == after_image, "the latent cache must be reused untouched"
 
 
 if __name__ == "__main__":

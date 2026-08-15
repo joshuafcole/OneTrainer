@@ -16,10 +16,21 @@ with stale tensors — and an unchanged identity reuses the cache for free. The 
 and the DiskCache group key compose: salt segregates the global dimensions, the
 group key segregates the per-concept ones.
 
+They also fold in the *dataset* — the contents of every enabled concept dir, via
+``modules/util/dataset_key.py``. The group key holds a concept's ``path`` but never
+its contents, so without this an edited dataset at an unchanged path reuses the cache
+outright. That is not hypothetical: a staging layer that reuses one path across
+re-exports (to get incremental blob sync) produces exactly that shape, and reusing
+the cache under it served a caption's embedding for a different caption, and — when
+the file count moved too — indexed off the end of the cached list entirely. Media and
+captions are fingerprinted separately so a caption edit does not re-encode the VAE.
+
 Identity is path/string based on purpose: hashing multi-GB checkpoint weights at
 every launch would defeat the whole point. The one gap that leaves — swapping a
 different file in at the *same* model path — is rare for checkpoints and is the
-documented limitation of trading weight-hashing for launch speed.
+documented limitation of trading weight-hashing for launch speed. Dataset files take
+the same trade for media (size + mtime) but not for captions, which are small enough
+to hash outright; see ``dataset_key`` for why.
 """
 
 import hashlib
@@ -27,6 +38,7 @@ import json
 from typing import Any
 
 from modules.util.bucket_limits import max_bucket_resolution_for
+from modules.util.dataset_key import dataset_fingerprints
 
 
 def _digest(payload: Any) -> str:
@@ -72,6 +84,12 @@ def image_cache_salt(config) -> str:
     bucket_max_resolution = max_bucket_resolution_for(config.model_type)
     if bucket_max_resolution is not None:
         payload["bucket_max_resolution"] = bucket_max_resolution
+    # The media behind the latents. Captions are deliberately excluded: they change
+    # no VAE output, and folding them in here would push a whole dataset back through
+    # the VAE because one word was reworded.
+    media_fingerprint, _ = dataset_fingerprints(getattr(config, "concepts", None))
+    if media_fingerprint is not None:
+        payload["dataset_media"] = media_fingerprint
     return _digest(payload)
 
 
@@ -121,4 +139,11 @@ def text_cache_salt(config) -> str:
         "encoders": encoders,
         "embeddings": embeddings,
     }
+    # The captions behind the embeddings — plus the media file *list*, since text
+    # embeddings are cached positionally per row and which rows exist is part of the
+    # identity even though their pixels are not. Media size/mtime are excluded, so
+    # re-encoding an image never re-runs the text encoders.
+    _, caption_fingerprint = dataset_fingerprints(getattr(config, "concepts", None))
+    if caption_fingerprint is not None:
+        payload["dataset_captions"] = caption_fingerprint
     return _digest(payload)
