@@ -1,0 +1,26 @@
+{
+    "model": "anima (Cosmos-Predict2 DiT)",
+    "block_prefix": "transformer.transformer_blocks",
+    "depth_bands": {
+        "count": 3,
+        "names": ["early", "mid", "late"]
+    },
+    "parts": {
+        "attn-self": {
+            "regex": "^(?=.*attn1)(?!.*norm).*",
+            "glob": "attn1.to_*"
+        },
+        "attn-cross": {
+            "regex": "^(?=.*attn2)(?!.*norm).*",
+            "glob": "attn2.to_*"
+        },
+        "mlp": {
+            "regex": "^(?=.*ff\\.net).*",
+            "glob": "ff.net.*"
+        },
+        "modulation": {
+            "regex": "^(?=.*norm[123]\\.linear).*",
+            "glob": "norm[123].linear_*"
+        }
+    }
+}
