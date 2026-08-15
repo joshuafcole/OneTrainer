@@ -10,7 +10,7 @@ from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.FileType import FileType
 from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.VideoFormat import VideoFormat
-from modules.util.sample_metadata import SampleProvenance, build_png_info
+from modules.util.sample_metadata import SampleProvenance, build_exif, build_png_info
 
 import torch
 
@@ -102,21 +102,28 @@ class BaseModelSampler(metaclass=ABCMeta):
                 raise ValueError("Image format required for sampling an image")
             image = sampler_output.data
 
-            pnginfo = None
-            if self._provenance is not None and image_format == ImageFormat.PNG:
+            # Provenance rides whichever container the run is configured for --
+            # PNG text chunks, JPEG EXIF. JPG is sample_image_format's default,
+            # so a PNG-only stamp would be inert on most real runs.
+            provenance_kwargs = {}
+            if self._provenance is not None:
                 try:
-                    pnginfo = build_png_info(self._provenance)
+                    if image_format == ImageFormat.PNG:
+                        provenance_kwargs = {"pnginfo": build_png_info(self._provenance)}
+                    elif image_format == ImageFormat.JPG:
+                        provenance_kwargs = {"exif": build_exif(self._provenance)}
                 except Exception:
                     # A broken provenance chunk must never cost a training run
                     # its sample -- log and fall through to a plain save.
                     traceback.print_exc()
                     print("Could not build sample provenance metadata, saving without it")
-                    pnginfo = None
+                    provenance_kwargs = {}
 
-            if pnginfo is not None:
-                image.save(destination + image_format.extension(), format=image_format.pil_format(), pnginfo=pnginfo)
-            else:
-                image.save(destination + image_format.extension(), format=image_format.pil_format())
+            image.save(
+                destination + image_format.extension(),
+                format=image_format.pil_format(),
+                **provenance_kwargs,
+            )
         elif sampler_output.file_type == FileType.VIDEO:
             if video_format is None:
                 raise ValueError("Video format required for sampling a video")

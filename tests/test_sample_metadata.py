@@ -2,8 +2,9 @@
 
 The module is pure stdlib + PIL (no torch/diffusers), so these run without the
 training stack: ``python tests/test_sample_metadata.py`` or under pytest. They
-guard the PNG text-chunk contract that lets a sample image be identified,
-outside the workspace, by the training state that produced it.
+guard the contract that lets a sample image be identified, outside the
+workspace, by the training state that produced it -- in *both* containers, PNG
+text chunks and JPEG EXIF, since JPG is the format real runs actually use.
 """
 
 import os
@@ -12,7 +13,14 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from modules.util.sample_metadata import SampleProvenance, build_png_info, hash_text, provenance_fields
+from modules.util.sample_metadata import (
+    SampleProvenance,
+    build_exif,
+    build_png_info,
+    hash_text,
+    provenance_fields,
+    read_provenance_fields,
+)
 
 from PIL import Image
 
@@ -105,18 +113,88 @@ def test_png_round_trip_omits_none_fields():
         assert "ot.last_save_filename" not in reopened.text
 
 
-def test_non_png_save_is_unaffected_by_provenance():
-    # JPEG (and any other format) is saved exactly as before: no pnginfo kwarg,
-    # no re-encoding to attach metadata. build_png_info is never required to
-    # perform a plain save -- a caller can save without calling it at all.
+def test_jpeg_round_trip_carries_every_field():
+    # JPG is sample_image_format's default and what every real workspace config
+    # sets, so this is the path that actually runs -- a PNG-only stamp would be
+    # inert on the runs this exists for.
+    prov = _prov()
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         path = os.path.join(tmp_dir, "sample.jpg")
         image = Image.new("RGB", (4, 4), color=(4, 5, 6))
-        image.save(path, format="JPEG")  # no pnginfo kwarg -- JPEG doesn't accept one
+        image.save(path, format="JPEG", exif=build_exif(prov))
 
         reopened = Image.open(path)
         reopened.load()
         assert reopened.format == "JPEG"
+
+        # Literal expected map, for the same reason as the PNG round-trip.
+        expected = {
+            "ot.global_step": "100",
+            "ot.epoch": "2",
+            "ot.epoch_step": "5",
+            "ot.seed": "42",
+            "ot.prompt_hash": prov.prompt_hash,
+            "ot.sample_config_hash": prov.sample_config_hash,
+            "ot.last_save_filename": "prefix-100-2-5.safetensors",
+        }
+        assert read_provenance_fields(reopened) == expected
+
+
+def test_jpeg_round_trip_omits_none_fields():
+    prov = _prov(seed=None, last_save_filename=None)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        path = os.path.join(tmp_dir, "sample.jpg")
+        image = Image.new("RGB", (4, 4), color=(4, 5, 6))
+        image.save(path, format="JPEG", exif=build_exif(prov))
+
+        fields = read_provenance_fields(Image.open(path))
+        assert "ot.seed" not in fields
+        assert "ot.last_save_filename" not in fields
+        assert fields["ot.global_step"] == "100"
+
+
+def test_reader_recovers_the_same_map_from_both_formats():
+    # The two containers are an encoding detail; a consumer downstream should
+    # not have to know which one it is holding.
+    prov = _prov()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        png_path = os.path.join(tmp_dir, "sample.png")
+        jpg_path = os.path.join(tmp_dir, "sample.jpg")
+        image = Image.new("RGB", (4, 4), color=(7, 8, 9))
+        image.save(png_path, format="PNG", pnginfo=build_png_info(prov))
+        image.save(jpg_path, format="JPEG", exif=build_exif(prov))
+
+        from_png = read_provenance_fields(Image.open(png_path))
+        from_jpg = read_provenance_fields(Image.open(jpg_path))
+        assert from_png == from_jpg
+        assert from_png["ot.global_step"] == "100"
+
+
+def test_reader_returns_empty_for_an_unstamped_image():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for name, fmt in (("plain.png", "PNG"), ("plain.jpg", "JPEG")):
+            path = os.path.join(tmp_dir, name)
+            Image.new("RGB", (4, 4), color=(1, 1, 1)).save(path, format=fmt)
+            assert read_provenance_fields(Image.open(path)) == {}
+
+
+def test_reader_ignores_a_foreign_image_description():
+    # An unrelated caption in ImageDescription reads as "no provenance", not as
+    # garbage -- sample images get handled by other tools too.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        path = os.path.join(tmp_dir, "captioned.jpg")
+        exif = Image.Exif()
+        exif[0x010E] = "a photo of a cat, by some other tool"
+        Image.new("RGB", (4, 4), color=(2, 2, 2)).save(path, format="JPEG", exif=exif)
+        assert read_provenance_fields(Image.open(path)) == {}
+
+
+def test_exif_bytes_are_stable_for_identical_provenance():
+    # Two samples of identical training state produce identical provenance
+    # bytes -- the property that makes drift detectable by comparison.
+    assert build_exif(_prov()).tobytes() == build_exif(_prov()).tobytes()
 
 
 if __name__ == "__main__":
