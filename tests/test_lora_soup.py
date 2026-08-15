@@ -214,6 +214,55 @@ def test_svd_and_concat_agree_on_a_real_pair(tmp_path):
     assert rel_err(delta_of(by_svd, P1), delta_of(by_concat, P1)) < FP32_REL_TOL
 
 
+def test_concat_survives_a_small_coefficient_in_fp16(tmp_path):
+    """A small coefficient must not be parked entirely on one stored tensor.
+
+    456 searches coefficients bounded at [-0.25, 1.5] and will visit values near
+    zero. Folding the whole per-input factor into B drives fp16 B entries
+    subnormal, so the candidate the search evaluates is not the candidate it
+    asked for -- a degradation that reads as a bad merge coefficient rather than
+    as a storage artifact.
+
+    **The magnitudes matter and `make_layer` does not have them.** ``lora_up``
+    is initialized to *zero* and grows small during training, so a trained
+    adapter's B entries are ~1e-3 while ``randn`` gives ~1. With randn-sized
+    factors this test passes against the unbalanced implementation -- measured,
+    not assumed. At 1e-3 the two diverge sharply: whole-into-B gives 3.4e-3 at
+    c=0.01 and 2.9e-2 at c=0.001, against 3.0e-4 and 7.1e-4 for the sqrt split.
+    """
+    generator = torch.Generator().manual_seed(21)
+    small = {
+        P1: (
+            torch.randn(4, 12, generator=generator),
+            torch.randn(16, 4, generator=generator) * 1e-3,  # a *trained* B
+            2.0,
+        )
+    }
+    a = write_lora(tmp_path / "a.safetensors", small, dtype=torch.float32)
+    b = write_lora(tmp_path / "b.safetensors", small, dtype=torch.float32)
+
+    for coefficient in (0.01, 0.001):
+        specs = [(a, coefficient), (b, coefficient)]
+        reference, _ = soup_to_dict(tmp_path, specs, dtype=torch.float32, method="concat")
+        stored, _ = soup_to_dict(tmp_path, specs, dtype=torch.float16, method="concat")
+        error = rel_err(delta_of(stored, P1), delta_of(reference, P1))
+        assert error < FP16_REL_TOL, f"c={coefficient} lost precision in storage: {error}"
+
+
+def test_concat_handles_a_negative_coefficient(tmp_path):
+    """Negative coefficients are legal (bounded extrapolation), and the sqrt
+    split has to put the sign somewhere -- it rides on B. Without that, the root
+    of a negative factor is either a crash or a dropped sign, and a dropped sign
+    is the silent one."""
+    a = write_lora(tmp_path / "a.safetensors", {P1: make_layer(16, 12, 4, alpha=2.0, seed=13)}, dtype=torch.float32)
+    b = write_lora(tmp_path / "b.safetensors", {P1: make_layer(16, 12, 4, alpha=6.0, seed=14)}, dtype=torch.float32)
+    specs = [(a, 1.0), (b, -0.25)]
+
+    by_concat, _ = soup_to_dict(tmp_path, specs, dtype=torch.float32, method="concat")
+    by_svd, _ = soup_to_dict(tmp_path, specs, dtype=torch.float32, rank=8)
+    assert rel_err(delta_of(by_concat, P1), delta_of(by_svd, P1)) < FP32_REL_TOL
+
+
 def test_merges_deltas_not_factors(tmp_path):
     """The average of factorizations is not a factorization of the average.
 
@@ -361,6 +410,25 @@ def test_layer_missing_a_factor_is_refused(tmp_path):
     save_file({P1 + ".lora_down.weight": down}, str(path))
 
     with pytest.raises(SoupError, match="lora_up.weight"):
+        lora_soup.load_lora(path, 1.0)
+
+
+def test_a_non_1x1_up_kernel_is_refused_and_says_why(tmp_path):
+    """OneTrainer emits a 1x1 ``lora_up`` for conv layers, and ``delta()``'s
+    flattening depends on it. A file whose up carries a real kernel must be
+    refused -- and the message must name *that*, not report an inconsistent
+    rank, which is what the shape check would otherwise conclude."""
+    path = tmp_path / "kerneled.safetensors"
+    save_file(
+        {
+            P1 + ".lora_down.weight": torch.randn(4, 6, 3, 3),
+            P1 + ".lora_up.weight": torch.randn(8, 4, 3, 3),  # rank agrees; kernel doesn't
+            P1 + ".alpha": torch.tensor(4.0),
+        },
+        str(path),
+    )
+
+    with pytest.raises(SoupError, match="non-1x1 lora_up kernel"):
         lora_soup.load_lora(path, 1.0)
 
 

@@ -96,6 +96,7 @@ import dataclasses
 import fnmatch
 import hashlib
 import json
+import math
 import subprocess
 import sys
 from collections import OrderedDict
@@ -353,6 +354,18 @@ def load_lora(path: Path | str, coefficient: float) -> LoadedLora:
         down, up = downs[prefix], ups[prefix]
         rank = down.shape[0]
         if up.numel() // up.shape[0] != rank:
+            # Two different files land here and the message has to distinguish
+            # them: a genuinely inconsistent pair, and a well-formed adapter
+            # whose lora_up carries a real kernel (not the 1x1 OneTrainer emits).
+            # The second is refused because the flattening delta() relies on
+            # would silently mis-fold it -- correct to refuse, wrong to call it
+            # "inconsistent".
+            if up.shape[1] == rank:
+                raise SoupError(
+                    f"{path}: layer {prefix!r} has a non-1x1 lora_up kernel "
+                    f"{tuple(up.shape[2:])}; this is not OneTrainer plain LoRA and "
+                    "will not be merged approximately"
+                )
             raise SoupError(
                 f"{path}: layer {prefix!r} has inconsistent rank: "
                 f"lora_down says {rank}, lora_up is {tuple(up.shape)}"
@@ -470,17 +483,28 @@ def refactor_concat(
 ) -> tuple[Tensor, Tensor, float]:
     """Exact rank-concatenation of every input's factors for one layer.
 
-    Each input's ``c_i * block_scale * alpha_i / rank_i`` is folded into its B
-    block, and ``alpha == sum_i rank_i`` keeps the loader's scale at 1.0, so
+    Each input's ``c_i * block_scale * alpha_i / rank_i`` is folded into its
+    blocks, and ``alpha == sum_i rank_i`` keeps the loader's scale at 1.0, so
     ``B @ A`` is the weighted sum with no truncation whatsoever.
+
+    That factor is applied as its square root to *both* blocks rather than whole
+    to B, matching the SVD path's even split. Folded entirely into B, a small
+    coefficient lands on one stored tensor: at c=0.01 with fp16 output ~99% of
+    B's entries go subnormal and the error is several times the SVD path's; at
+    c=0.001 entries flush to zero outright. 456 searches coefficients down
+    there, so the unbalanced form would degrade precisely the candidates the
+    search is exploring. The sign rides on B, since a negative coefficient is
+    legal (bounded task-arithmetic extrapolation) and has no square root.
     """
     scale = block_scale_for(prefix, block_scales)
     downs: list[Tensor] = []
     ups: list[Tensor] = []
     for loaded in inputs:
         layer = loaded.layers[prefix]
-        downs.append(layer.down.to(torch.float32))
-        ups.append(layer.up.to(torch.float32) * (loaded.coefficient * scale * layer.scale))
+        factor = loaded.coefficient * scale * layer.scale
+        root = math.sqrt(abs(factor))
+        downs.append(layer.down.to(torch.float32) * root)
+        ups.append(layer.up.to(torch.float32) * math.copysign(root, factor))
     down = torch.cat(downs, dim=0)
     up = torch.cat(ups, dim=1)
     return down.contiguous(), up.contiguous(), float(down.shape[0])
