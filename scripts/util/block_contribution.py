@@ -52,11 +52,21 @@ layer's input rows. The model is then released. ``score`` takes those
 activations and the adapters and is pure linear algebra -- no model, no GPU, no
 OneTrainer imports -- which is why it is the part that has tests.
 
+The split is not just tidiness. **A capture depends on the base model and the
+prompts and on nothing about the adapters**, so ``--activations PATH`` writes
+one and reuses it: the GPU half runs once, and every adapter set anyone ever
+scores against those prompts is free. ``--activations-only`` runs the expensive
+half alone (schedule it when the card is idle); ``--require-cached`` runs the
+cheap half alone, and refuses rather than quietly loading a model on a box that
+is training. Reuse is gated on a content key over every capture parameter --
+change one and the run stops rather than serving activations that answer a
+different question.
+
 Usage::
 
     python scripts/util/block_contribution.py a.safetensors b.safetensors ... \
         --prompt "..." --prompt "..." [--base-model PATH] [--max-tokens N] \
-        [--granularity LEVEL] [--config PATH]
+        [--activations CACHE.safetensors] [--granularity LEVEL] [--config PATH]
 """
 
 from __future__ import annotations
@@ -509,6 +519,118 @@ def capture_activations(
     return per_prompt, meta, unmatched
 
 
+# --------------------------------------------------------------------------
+# The capture cache. Activations are a function of the base model and the
+# prompts, and of nothing about the adapters -- so the expensive half is
+# reusable across every adapter set anyone ever scores.
+# --------------------------------------------------------------------------
+
+#: Separates the prompt label from the layer prefix in a cache file's keys.
+#: A layer prefix is dot-separated and a label is generated, so neither can
+#: contain this.
+CACHE_SEP = "|"
+
+#: Which capture parameters make two activation sets the same object. A
+#: parameter absent here is one a caller could change without invalidating the
+#: cache, which is how a stale answer gets served with confidence -- so this
+#: list is the whole contract, not a summary of it.
+CACHE_KEY_FIELDS = (
+    "base_model",
+    "height",
+    "width",
+    "diffusion_steps",
+    "capture_steps",
+    "cfg_scale",
+    "negative_prompt",
+    "seed",
+    "max_tokens",
+)
+
+
+def cache_key(meta: Mapping[str, object], prompts: Sequence[str],
+              layer_prefixes: Sequence[str]) -> str:
+    """A content identity for one capture, derived rather than assigned.
+
+    The layer set is in the key because a capture taken for an attention-only
+    adapter cannot score one that also reaches the MLPs: the layers it needs
+    were never hooked. Reusing it would silently score a subset and report a
+    smaller ``scored_layer_count``, which reads as an adapter fact.
+    """
+    import hashlib
+
+    payload = json.dumps(
+        {
+            **{field: meta.get(field) for field in CACHE_KEY_FIELDS},
+            "prompts": list(prompts),
+            "layers": sorted(layer_prefixes),
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def save_activations(
+    path: Path,
+    activations: Mapping[str, Mapping[str, torch.Tensor]],
+    meta: Mapping[str, object],
+    prompts: Sequence[str],
+) -> None:
+    """One self-describing safetensors file: the tensors and their provenance.
+
+    The metadata travels *inside* the file rather than in a sidecar, so a cache
+    can never be separated from the parameters that make it valid.
+    """
+    from safetensors.torch import save_file
+
+    flat = {
+        f"{label}{CACHE_SEP}{prefix}": tensor.contiguous()
+        for label, per_layer in activations.items()
+        for prefix, tensor in per_layer.items()
+    }
+    layer_prefixes = sorted({
+        prefix for per_layer in activations.values() for prefix in per_layer
+    })
+    header = {
+        "block_contribution": "1",
+        "meta": json.dumps(dict(meta), sort_keys=True),
+        "prompts": json.dumps(list(prompts)),
+        "labels": json.dumps(list(activations)),
+        "key": cache_key(meta, prompts, layer_prefixes),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_file(flat, str(path), metadata=header)
+
+
+def load_activations(
+    path: Path,
+) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, object], list[str], str]:
+    """``(activations, meta, prompts, key)`` from a cache file."""
+    from safetensors import safe_open
+
+    activations: dict[str, dict[str, torch.Tensor]] = {}
+    with safe_open(str(path), framework="pt") as f:
+        header = f.metadata() or {}
+        if "block_contribution" not in header:
+            raise ContributionError(
+                f"{path} is a safetensors file but not a block_contribution capture"
+            )
+        meta = json.loads(header["meta"])
+        prompts = json.loads(header["prompts"])
+        labels = json.loads(header["labels"])
+        for label in labels:
+            activations[label] = {}
+        for name in f.keys():  # noqa: SIM118 - safe_open is not a Mapping
+            label, _, prefix = name.partition(CACHE_SEP)
+            if label not in activations:
+                raise ContributionError(
+                    f"{path}: tensor {name!r} names a prompt label that is not in the "
+                    "file's own label list"
+                )
+            activations[label][prefix] = f.get_tensor(name)
+    return activations, meta, prompts, header.get("key", "")
+
+
 def spread_steps(total: int, count: int) -> list[int]:
     """``count`` step indices spread over ``0..total-1``, endpoints included.
 
@@ -546,7 +668,24 @@ def main() -> int:
                         help="block_groups.json to use (default: beside this script)")
     parser.add_argument("--granularity", default=None, metavar="LEVEL",
                         help="naming granularity for the per-layer group label")
+    parser.add_argument("--activations", default=None, metavar="PATH",
+                        help="reuse this capture if it matches, otherwise write it "
+                             "— the capture depends on the base model and prompts, "
+                             "never on the adapters")
+    parser.add_argument("--activations-only", action="store_true",
+                        help="capture and write, then stop; scores nothing. Lets the "
+                             "GPU half run when the card is free and the cheap half "
+                             "run whenever")
+    parser.add_argument("--require-cached", action="store_true",
+                        help="refuse rather than load the model — for scoring on a box "
+                             "whose GPU is busy, or on one that has no model at all")
     args = parser.parse_args()
+
+    if args.activations_only and args.require_cached:
+        sys.exit("block_contribution: --activations-only and --require-cached ask for "
+                 "opposite things")
+    if (args.activations_only or args.require_cached) and not args.activations:
+        sys.exit("block_contribution: --activations-only/--require-cached need --activations PATH")
 
     for raw in args.adapters:
         if not Path(raw).is_file():
@@ -567,33 +706,81 @@ def main() -> int:
             sys.exit(f"block_contribution: malformed --capture-steps: {args.capture_steps!r}")
 
     paths = [Path(a) for a in args.adapters]
+    cache = Path(args.activations) if args.activations else None
     try:
         # The layer set comes from the adapters, so only what an adapter
         # actually targets is ever hooked.
         probe = lora_soup.load_lora(paths[0], 1.0)
-        activations, meta, unmatched = capture_activations(
-            prompts=prompts,
-            layer_prefixes=sorted(probe.layers),
-            base_model=args.base_model,
-            device=args.device,
-            height=args.height,
-            width=args.width,
-            diffusion_steps=args.diffusion_steps,
-            capture_steps=capture_steps,
-            cfg_scale=args.cfg_scale,
-            negative_prompt=args.negative_prompt,
-            seed=args.seed,
-            max_tokens=args.max_tokens,
-        )
+        layer_prefixes = sorted(probe.layers)
         del probe
-        meta["unmatched_layers"] = unmatched
+
+        wanted = {
+            "base_model": args.base_model,
+            "height": args.height,
+            "width": args.width,
+            "diffusion_steps": args.diffusion_steps,
+            "capture_steps": (
+                capture_steps
+                if capture_steps is not None
+                else spread_steps(args.diffusion_steps, DEFAULT_CAPTURE_STEPS)
+            ),
+            "cfg_scale": args.cfg_scale,
+            "negative_prompt": args.negative_prompt,
+            "seed": args.seed,
+            "max_tokens": args.max_tokens,
+        }
+        wanted_key = cache_key(wanted, prompts, layer_prefixes)
+
+        activations = meta = None
+        if cache is not None and cache.is_file():
+            activations, meta, cached_prompts, key = load_activations(cache)
+            if key != wanted_key:
+                # Named, not silently re-captured: overwriting the file another
+                # scoring run is about to reuse is a worse surprise than
+                # stopping, and the mismatch is usually a typo in one prompt.
+                raise ContributionError(
+                    f"{cache} was captured under different parameters "
+                    f"(key {key[:12]} vs {wanted_key[:12]}); pass a different "
+                    "--activations path, or delete that one to re-capture"
+                )
+            prompts = cached_prompts
+            print(f"reusing capture {cache} ({key[:12]})", file=sys.stderr)
+
+        if activations is None:
+            if args.require_cached:
+                raise ContributionError(
+                    f"--require-cached, but {cache} does not exist — capture it on a "
+                    "box with the model first (--activations-only)"
+                )
+            activations, meta, unmatched = capture_activations(
+                prompts=prompts,
+                layer_prefixes=layer_prefixes,
+                base_model=args.base_model,
+                device=args.device,
+                height=args.height,
+                width=args.width,
+                diffusion_steps=args.diffusion_steps,
+                capture_steps=capture_steps,
+                cfg_scale=args.cfg_scale,
+                negative_prompt=args.negative_prompt,
+                seed=args.seed,
+                max_tokens=args.max_tokens,
+            )
+            meta["unmatched_layers"] = unmatched
+            if cache is not None:
+                save_activations(cache, activations, meta, prompts)
+                print(f"wrote capture {cache} ({wanted_key[:12]})", file=sys.stderr)
+
+        if args.activations_only:
+            return 0
+
         out = score(
             paths=paths,
             activations=activations,
             prompts=prompts,
             config_path=args.config,
             granularity=args.granularity,
-            capture=meta,
+            capture={**meta, "cache_key": wanted_key},
         )
     except (ContributionError, lora_soup.SoupError, block_groups.BlockGroupError) as e:
         sys.exit(f"block_contribution: {e}")

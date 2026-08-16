@@ -458,3 +458,99 @@ def test_capture_steps_spread_over_the_trajectory(total, count, expected):
     step is texture, and an adapter can be strong in one regime and absent in
     the other."""
     assert block_contribution.spread_steps(total, count) == expected
+
+
+# --- the capture cache ------------------------------------------------------
+
+def _meta(**over):
+    base = {
+        "base_model": "/models/anima", "height": 1024, "width": 1024,
+        "diffusion_steps": 25, "capture_steps": [0, 8, 16, 24], "cfg_scale": 1.0,
+        "negative_prompt": "", "seed": 0, "max_tokens": 256,
+        "device": "cuda", "calls_per_step": 1,
+    }
+    base.update(over)
+    return base
+
+
+def test_a_capture_round_trips_through_a_file(tmp_path):
+    acts = activations(["line0", "line1"], rows=5)
+    prompts = ["a photo", "a drawing"]
+    path = tmp_path / "cap.safetensors"
+    block_contribution.save_activations(path, acts, _meta(), prompts)
+
+    back, meta, back_prompts, key = block_contribution.load_activations(path)
+    assert back_prompts == prompts
+    assert meta["base_model"] == "/models/anima"
+    assert sorted(back) == ["line0", "line1"]
+    for label in acts:
+        for prefix, x in acts[label].items():
+            assert torch.equal(back[label][prefix], x)
+    assert key == block_contribution.cache_key(_meta(), prompts, prefixes())
+
+
+def test_a_cached_capture_scores_identically_to_a_fresh_one(tmp_path):
+    """The cache exists so the GPU half runs once. It is only worth anything if
+    the numbers are the same either way."""
+    paths = make(tmp_path, [30, 31])
+    acts = activations(["line0"], rows=12)
+    direct = run(paths, acts)
+    path = tmp_path / "cap.safetensors"
+    block_contribution.save_activations(path, acts, _meta(), ["a photo"])
+    back, _, prompts, _ = block_contribution.load_activations(path)
+    cached = block_contribution.score(paths=paths, activations=back, prompts=prompts)
+    for a, b in zip(direct["layers"], cached["layers"], strict=True):
+        assert a["contribution_sq"] == b["contribution_sq"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("base_model", "/models/other"),
+    ("height", 512),
+    ("width", 512),
+    ("diffusion_steps", 30),
+    ("capture_steps", [0, 12, 24]),
+    ("cfg_scale", 1.5),
+    ("negative_prompt", "blurry"),
+    ("seed", 1),
+    ("max_tokens", 128),
+])
+def test_every_capture_parameter_changes_the_key(field, value):
+    """**The whole contract of the cache.**
+
+    A parameter missing from the key is one a caller can change while being
+    served the old activations — a stale answer delivered with no warning and
+    no way to notice. Each one is pinned individually rather than by a single
+    happy-path test, because the failure mode of forgetting one is silence."""
+    prompts = ["a photo"]
+    before = block_contribution.cache_key(_meta(), prompts, prefixes())
+    after = block_contribution.cache_key(_meta(**{field: value}), prompts, prefixes())
+    assert before != after
+
+
+def test_the_prompts_and_the_layer_set_are_in_the_key():
+    """The layer set especially: a capture taken for an attention-only adapter
+    never hooked the MLPs, so reusing it for a wider adapter would score a
+    subset and report it as a smaller layer count — which reads as a fact about
+    the adapter."""
+    base = block_contribution.cache_key(_meta(), ["a photo"], prefixes())
+    assert base != block_contribution.cache_key(_meta(), ["a drawing"], prefixes())
+    assert base != block_contribution.cache_key(_meta(), ["a photo", "b"], prefixes())
+    assert base != block_contribution.cache_key(
+        _meta(), ["a photo"], [*prefixes(), "transformer.mlp.0.proj"]
+    )
+
+
+def test_the_key_does_not_depend_on_layer_order():
+    """The layer set is a set; a loader that returns it in a different order is
+    not a different capture."""
+    prompts = ["a photo"]
+    forward = block_contribution.cache_key(_meta(), prompts, prefixes())
+    backward = block_contribution.cache_key(_meta(), prompts, list(reversed(prefixes())))
+    assert forward == backward
+
+
+def test_a_foreign_safetensors_file_is_not_read_as_a_capture(tmp_path):
+    path = tmp_path / "notacapture.safetensors"
+    save_file({"a": torch.zeros(2, 2)}, str(path))
+    with pytest.raises(ContributionError, match="not a block_contribution capture"):
+        block_contribution.load_activations(path)
