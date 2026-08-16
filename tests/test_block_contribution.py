@@ -292,11 +292,128 @@ def test_too_many_adapters_is_refused(tmp_path, monkeypatch):
 
 
 def test_the_adapter_cap_is_above_the_gram_cap():
-    """Contribution is linear in the adapter count where the Gram is quadratic,
-    so the ceiling that makes the Gram sensible would refuse a mixture this can
-    afford. Pinned because the two numbers look like they should agree."""
+    """This one's *memory* is linear in the adapter count -- one delta at a time,
+    and the deltas dominate -- so the ceiling that makes the Gram sensible would
+    refuse a mixture this can afford. Pinned because the two numbers look like
+    they should agree, and because the pair table added later makes the
+    arithmetic quadratic without moving the constraint."""
     block_gram = _load("block_gram", "../scripts/util/block_gram.py")
     assert block_contribution.MAX_ADAPTERS > block_gram.MAX_ADAPTERS
+
+
+# --- the pair tables: what a merge coefficient is actually solved against -----
+
+def test_the_gram_diagonal_is_the_contribution(tmp_path):
+    """Not two computations that agree -- one, reported twice. A diagonal that
+    could drift from ``contribution_sq`` would let a planner and a report
+    disagree about the same adapter."""
+    paths = make(tmp_path, [1, 2, 3])
+    out = run(paths, activations(["a", "b"]), emit_layer_gram=True)
+    for layer in out["layers"]:
+        for p in range(len(out["prompt_labels"])):
+            for i in range(3):
+                assert layer["contribution_gram"][p][i][i] == layer["contribution_sq"][p][i]
+        for i in range(3):
+            assert layer["frobenius_gram"][i][i] == layer["frobenius_sq"][i]
+
+
+def test_the_pair_tables_are_symmetric(tmp_path):
+    """Exactly, not approximately: a solver reading this expects a real
+    symmetric matrix, and float noise in the lower triangle is how a real
+    problem grows a complex eigenvalue."""
+    paths = make(tmp_path, [7, 8, 9])
+    out = run(paths, activations(["a"]), emit_layer_gram=True)
+    for layer in out["layers"]:
+        for table in [layer["frobenius_gram"], *layer["contribution_gram"]]:
+            for i, row in enumerate(table):
+                for j, value in enumerate(row):
+                    assert value == table[j][i]
+
+
+def test_the_gram_predicts_a_merge_the_diagonal_does_not(tmp_path):
+    """**The reason the off-diagonals are computed.**
+
+    ``|| sum_i c_i dW_i X ||^2 = c^T G c``. Checked against a directly merged
+    delta, and checked to *differ* from the diagonal-only prediction
+    ``sum_i c_i^2 contribution_i`` -- because if those agreed on real adapters
+    the whole pair table would be dead weight."""
+    paths = make(tmp_path, [11, 12, 13])
+    acts = activations(["a"])
+    out = run(paths, acts, emit_layer_gram=True)
+    real = realized(paths)
+    coefficients = [0.5, 0.3, -0.2]
+
+    quadratic_form_matched = False
+    for layer in out["layers"]:
+        prefix = layer["layer"]
+        x = acts["a"][prefix].to(torch.float64)
+        merged = sum(c * d[prefix] for c, d in zip(coefficients, real, strict=True))
+        want = float(((merged @ x.T) ** 2).sum()) / x.shape[0]
+
+        gram = layer["contribution_gram"][0]
+        got = sum(
+            coefficients[i] * coefficients[j] * gram[i][j]
+            for i in range(3)
+            for j in range(3)
+        )
+        assert got == pytest.approx(want, rel=1e-10)
+        quadratic_form_matched = True
+
+        diagonal_only = sum(
+            coefficients[i] ** 2 * layer["contribution_sq"][0][i] for i in range(3)
+        )
+        assert diagonal_only != pytest.approx(want, rel=1e-3)
+
+    assert quadratic_form_matched, "no layer was checked"
+
+
+def test_the_frobenius_gram_is_the_weight_space_inner_product(tmp_path):
+    """The same quantity ``block_gram`` reports, so the activation-weighted
+    table has a null to be read against without a units argument."""
+    paths = make(tmp_path, [14, 15])
+    out = run(paths, activations(["a"]), emit_layer_gram=True)
+    real = realized(paths)
+    for layer in out["layers"]:
+        prefix = layer["layer"]
+        for i in range(2):
+            for j in range(2):
+                want = float((real[i][prefix] * real[j][prefix]).sum())
+                assert layer["frobenius_gram"][i][j] == pytest.approx(want, rel=1e-12)
+
+
+def test_a_group_gram_is_the_sum_of_its_layers(tmp_path):
+    """A coefficient is solved per group, so the group table has to be the thing
+    the per-layer tables add up to -- not a mean, not a representative layer."""
+    paths = make(tmp_path, [16, 17, 18])
+    out = run(paths, activations(["a", "b"]), emit_layer_gram=True)
+    by_group = {}
+    for layer in out["layers"]:
+        by_group.setdefault(layer["group"], []).append(layer)
+
+    assert {g["group"] for g in out["groups"]} == set(by_group)
+    for entry in out["groups"]:
+        members = by_group[entry["group"]]
+        assert entry["layer_count"] == len(members)
+        for i in range(3):
+            for j in range(3):
+                want = sum(m["frobenius_gram"][i][j] for m in members)
+                assert entry["frobenius_gram"][i][j] == pytest.approx(want, rel=1e-12)
+                for p in range(2):
+                    want_c = sum(m["contribution_gram"][p][i][j] for m in members)
+                    assert entry["contribution_gram"][p][i][j] == pytest.approx(
+                        want_c, rel=1e-12
+                    )
+
+
+def test_layer_grams_are_off_by_default(tmp_path):
+    """``layers * prompts * N^2`` floats is diagnostic detail; the group tables
+    are what a planner reads, so the default response does not carry it."""
+    paths = make(tmp_path, [19, 20])
+    out = run(paths, activations(["a"]))
+    assert out["groups"], "group tables are not optional"
+    for layer in out["layers"]:
+        assert "contribution_gram" not in layer
+        assert "frobenius_gram" not in layer
 
 
 # --- capture: the parts that do not need a model -----------------------------

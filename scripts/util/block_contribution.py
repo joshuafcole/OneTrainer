@@ -89,10 +89,12 @@ class ContributionError(Exception):
     """The adapters and the activations do not describe the same model."""
 
 
-# Higher than block_gram's ceiling on purpose: that one is quadratic in the
-# adapter count (every pair's inner product), this one is linear (each adapter
-# against one activation matrix). The whole c016 mixture is 65 saves, which the
-# Gram refuses and this does not.
+# Higher than block_gram's ceiling on purpose. The *memory* here is linear in
+# the adapter count -- one delta at a time per layer, as in block_gram -- and it
+# is the deltas that dominate, not the pair table: at 2048x2048 float64 a single
+# layer's delta is 33 MB, so N of them is what sets the ceiling either way. The
+# pairwise reduction added below is quadratic in arithmetic but negligible in
+# both (each pair is one dot product over an already-materialised matrix).
 MAX_ADAPTERS = 128
 
 #: Anima's own sampler resolution. Kept as the default so a capture run and a
@@ -110,6 +112,41 @@ DEFAULT_BASE_MODEL = "D:/models/diffusers/anima/anima-base-v1.0"
 # --------------------------------------------------------------------------
 
 
+def _pair_table(vectors: Sequence[torch.Tensor], scale: float = 1.0) -> list[list[float]]:
+    """``[i][j] = <v_i, v_j> * scale``, computed once per unordered pair.
+
+    Symmetric by construction rather than by arithmetic: the lower triangle is
+    copied from the upper, so a Gram this returns cannot be asymmetric to
+    floating-point noise and a solver reading it cannot get a complex
+    eigenvalue out of a real symmetric problem.
+    """
+    n = len(vectors)
+    table = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i, n):
+            value = float(torch.dot(vectors[i], vectors[j])) * scale
+            table[i][j] = value
+            table[j][i] = value
+    return table
+
+
+def _empty_group(n: int, prompt_count: int) -> dict[str, object]:
+    return {
+        "layer_count": 0,
+        "frobenius_gram": [[0.0] * n for _ in range(n)],
+        "contribution_gram": [
+            [[0.0] * n for _ in range(n)] for _ in range(prompt_count)
+        ],
+    }
+
+
+def _accumulate(into: list[list[float]], addend: Sequence[Sequence[float]]) -> None:
+    for i, row in enumerate(addend):
+        target = into[i]
+        for j, value in enumerate(row):
+            target[j] += value
+
+
 def score(
     paths: Sequence[Path],
     activations: Mapping[str, Mapping[str, torch.Tensor]],
@@ -117,13 +154,34 @@ def score(
     config_path: str | None = None,
     granularity: str | None = None,
     capture: Mapping[str, object] | None = None,
+    emit_layer_gram: bool = False,
 ) -> dict[str, object]:
-    """``{layers, per-layer contribution per (prompt, adapter), Frobenius}``.
+    """``{layers, groups, per-(prompt, adapter) contribution, Frobenius}``.
 
     ``activations`` is keyed by prompt label then by layer prefix; each value is
     a 2-D ``(rows, in_features)`` matrix of that layer's captured inputs. One
     layer's deltas are materialised at a time and reduced to scalars
     immediately, as in ``block_gram`` and for the same reason.
+
+    **The off-diagonals are the point.** A merge's effect is not the sum of its
+    inputs' effects: ``|| sum_i c_i dW_i X ||^2 = sum_ij c_i c_j <dW_i X, dW_j X>``,
+    so a coefficient vector can only be solved against the full pair table. The
+    diagonal alone -- what a per-adapter contribution is -- predicts the merge
+    only when the inputs are orthogonal *in activation space*, which is the
+    assumption this initiative has already found to be false in weight space.
+
+    Grams are emitted **per group** always, because that is the resolution a
+    coefficient is solved at and the whole table is a few hundred numbers.
+    Per *layer* they are gated on ``emit_layer_gram``: at 224 layers, 5 prompts
+    and N adapters it is 1120*N^2 floats, which is diagnostic detail rather than
+    something a planner reads.
+
+    Summing a Gram across the layers of a group treats those layers' effects as
+    commensurable. At ``fine`` granularity a group is one part at one depth
+    band (``mid.attn2.to_q``), so they are. At ``coarse`` a group mixes parts
+    whose outputs enter the network very differently -- a ``to_q`` perturbation
+    moves attention logits through a softmax, a ``to_out`` one lands straight in
+    the residual stream -- and the sum is correspondingly harder to read.
     """
     if not paths:
         raise ContributionError("need at least 1 adapter, got 0")
@@ -168,6 +226,7 @@ def score(
 
     labels = list(activations)
     layers: list[dict[str, object]] = []
+    group_totals: dict[str, dict[str, object]] = {}
     for prefix in scorable:
         # float64 throughout: a contribution is a sum of hundreds of thousands
         # of squared terms spanning several orders of magnitude, and the ratio
@@ -183,11 +242,16 @@ def score(
                 "— they were trained against different base geometry"
             )
         in_features = deltas[0].shape[1]
-        frobenius_sq = [float((d * d).sum()) for d in deltas]
+        # Flat views, not copies: reshape on a contiguous tensor aliases it, so
+        # the pair tables below cost arithmetic and no memory.
+        flat_deltas = [d.reshape(-1) for d in deltas]
+        frobenius_gram = _pair_table(flat_deltas)
+        frobenius_sq = [frobenius_gram[i][i] for i in range(n)]
 
         energy: list[float] = []
         rows: list[int] = []
         contribution_sq: list[list[float]] = []
+        contribution_gram: list[list[list[float]]] = []
         for label in labels:
             x = activations[label].get(prefix)
             if x is None:
@@ -217,11 +281,15 @@ def score(
             count = int(xd.shape[0])
             rows.append(count)
             energy.append(float((xd * xd).sum()) / count)
-            contribution_sq.append(
-                [float(((d @ xd.T) ** 2).sum()) / count for d in deltas]
-            )
+            # Every adapter's projected delta at once, so the off-diagonals are
+            # available. dW_i X^T is (out, rows) -- for the shapes this runs at,
+            # two orders of magnitude smaller than the delta it came from.
+            projected = [(d @ xd.T).reshape(-1) for d in deltas]
+            gram = _pair_table(projected, scale=1.0 / count)
+            contribution_gram.append(gram)
+            contribution_sq.append([gram[i][i] for i in range(n)])
 
-        layers.append({
+        entry: dict[str, object] = {
             "layer": prefix,
             "group": group_of[prefix],
             "in_features": int(in_features),
@@ -229,7 +297,18 @@ def score(
             "rows": rows,
             "activation_energy": energy,
             "contribution_sq": contribution_sq,
-        })
+        }
+        if emit_layer_gram:
+            entry["frobenius_gram"] = frobenius_gram
+            entry["contribution_gram"] = contribution_gram
+        layers.append(entry)
+
+        group = group_of[prefix]
+        bucket = group_totals.setdefault(group, _empty_group(n, len(labels)))
+        bucket["layer_count"] += 1
+        _accumulate(bucket["frobenius_gram"], frobenius_gram)
+        for p in range(len(labels)):
+            _accumulate(bucket["contribution_gram"][p], contribution_gram[p])
 
     return {
         "paths": [str(p) for p in paths],
@@ -247,6 +326,15 @@ def score(
         "unscored_layers": unscored,
         "unrecognized_parts": list(fitted.unrecognized_parts),
         "capture": dict(capture or {}),
+        "groups": [
+            {
+                "group": name,
+                "layer_count": group_totals[name]["layer_count"],
+                "frobenius_gram": group_totals[name]["frobenius_gram"],
+                "contribution_gram": group_totals[name]["contribution_gram"],
+            }
+            for name in sorted(group_totals)
+        ],
         "layers": layers,
     }
 
@@ -668,6 +756,9 @@ def main() -> int:
                         help="block_groups.json to use (default: beside this script)")
     parser.add_argument("--granularity", default=None, metavar="LEVEL",
                         help="naming granularity for the per-layer group label")
+    parser.add_argument("--layer-gram", action="store_true",
+                        help="also emit the pair tables per layer, not only per "
+                             "group — diagnostic, and O(layers * prompts * N^2)")
     parser.add_argument("--activations", default=None, metavar="PATH",
                         help="reuse this capture if it matches, otherwise write it "
                              "— the capture depends on the base model and prompts, "
@@ -796,6 +887,7 @@ def main() -> int:
             prompts=prompts,
             config_path=args.config,
             granularity=args.granularity,
+            emit_layer_gram=args.layer_gram,
             capture={**meta, "cache_key": wanted_key},
         )
     except (ContributionError, lora_soup.SoupError, block_groups.BlockGroupError) as e:
