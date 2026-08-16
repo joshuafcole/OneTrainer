@@ -772,6 +772,22 @@ def main() -> int:
                 print(f"wrote capture {cache} ({wanted_key[:12]})", file=sys.stderr)
 
         if args.activations_only:
+            # JSON on stdout here too, so a caller that pre-warms a capture and
+            # a caller that scores one read the same channel. Deliberately not
+            # a truncated score result: it has no adapters in it.
+            json.dump(
+                {
+                    "cache_key": wanted_key,
+                    "path": str(cache),
+                    "prompts": list(prompts),
+                    "prompt_labels": list(activations),
+                    "layer_count": len(next(iter(activations.values()))),
+                    "capture": meta,
+                },
+                sys.stdout,
+                indent=None,
+            )
+            sys.stdout.write("\n")
             return 0
 
         out = score(
