@@ -5,22 +5,23 @@
         "count": 3,
         "names": ["early", "mid", "late"]
     },
-    "parts": {
-        "attn-self": {
-            "regex": "^(?=.*attn1)(?!.*norm).*",
-            "glob": "attn1.to_*"
-        },
-        "attn-cross": {
-            "regex": "^(?=.*attn2)(?!.*norm).*",
-            "glob": "attn2.to_*"
-        },
-        "mlp": {
-            "regex": "^(?=.*ff\\.net).*",
-            "glob": "ff.net.*"
-        },
-        "modulation": {
-            "regex": "^(?=.*norm[123]\\.linear).*",
-            "glob": "norm[123].linear_*"
+    "default_granularity": "coarse",
+    "_comment": [
+        "A NAMING layer, not a taxonomy. Groups are fitted to the layers a",
+        "checkpoint actually contains; these rules only supply human labels.",
+        "A leaf no rule matches still gets a group named by its raw leaf path,",
+        "so an unfamiliar architecture works without touching this file.",
+        "Rules are ordered -- the first match wins. 'fine' is deliberately",
+        "empty: with no rules every distinct leaf path is its own part, which",
+        "is the identity fit and needs no per-model configuration at all."
+    ],
+    "granularities": {
+        "fine": {},
+        "coarse": {
+            "attn-self": "(?=.*attn1)(?!.*norm)",
+            "attn-cross": "(?=.*attn2)(?!.*norm)",
+            "mlp": "(?=.*ff\\.net)",
+            "modulation": "(?=.*norm[123]\\.linear)"
         }
     }
 }

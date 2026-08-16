@@ -1,10 +1,14 @@
-"""Tests for scripts/util/block_groups.py -- the 455 block-group taxonomy.
+"""Tests for scripts/util/block_groups.py — groups fitted to the layers present.
 
-Pure safetensors + pytest, no torch model code and no real checkpoint: every
-key set is synthetic, built here in the real anima key form
+Pure safetensors + pytest, no torch model code and no real checkpoint: every key
+set is synthetic, built here in the real anima key form
 (``transformer.transformer_blocks.<i>.<part>...``, see ``AnimaLoRASaver``).
-These pin the *decisions* the taxonomy makes -- exact-once coverage, the
-band-rounding rule, the attn/norm split -- rather than incidental structure.
+
+What these pin is the inversion the module is built on — groups are derived from
+the prefixes, so **totality is structural** — plus the two things that remain
+genuinely fallible: the naming layer's gaps, and whether a group's patterns
+select exactly its members when run through the real matcher.
+
 Run with::
 
     python -m pytest tests/test_block_groups.py -q
@@ -14,9 +18,8 @@ import importlib.util
 import os
 import sys
 
-import torch
-
 import pytest
+import torch
 from safetensors.torch import save_file
 
 _here = os.path.dirname(__file__)
@@ -36,315 +39,209 @@ block_groups = _load("block_groups", "../scripts/util/block_groups.py")
 lora_soup = _load("lora_soup", "../scripts/util/lora_soup.py")
 
 BlockGroupError = block_groups.BlockGroupError
-
 BLOCK_PREFIX = "transformer.transformer_blocks"
 
-# Every real LoRA-decomposable leaf a CosmosTransformerBlock offers, and the
-# part each one belongs to -- reproduced from BaseAnimaSetup.LAYER_PRESETS'
-# comment plus diffusers' CosmosTransformerBlock/Attention/FeedForward naming.
-LEAVES_PER_BLOCK = {
-    "attn-self": ["attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0"],
-    "attn-cross": ["attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out.0"],
-    "mlp": ["ff.net.0.proj", "ff.net.2"],
-    "modulation": [
-        "norm1.linear_1", "norm1.linear_2",
-        "norm2.linear_1", "norm2.linear_2",
-        "norm3.linear_1", "norm3.linear_2",
-    ],
-}
-LEAVES_PER_BLOCK_COUNT = sum(len(v) for v in LEAVES_PER_BLOCK.values())  # 16
+# Every real LoRA-decomposable leaf a CosmosTransformerBlock offers — from
+# BaseAnimaSetup.LAYER_PRESETS plus diffusers' CosmosTransformerBlock naming.
+ATTN_LEAVES = [
+    "attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0",
+    "attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out.0",
+]
+MLP_LEAVES = ["ff.net.0.proj", "ff.net.2"]
+MOD_LEAVES = [f"norm{n}.linear_{k}" for n in (1, 2, 3) for k in (1, 2)]
 
 
-def block_leaves(index: int, block_prefix: str = BLOCK_PREFIX) -> dict[str, list[str]]:
-    """{part_name: [full layer prefixes]} for one block index."""
-    base = f"{block_prefix}.{index}"
-    return {part: [f"{base}.{leaf}" for leaf in leaves] for part, leaves in LEAVES_PER_BLOCK.items()}
-
-
-def synthetic_prefixes(block_count: int, block_prefix: str = BLOCK_PREFIX) -> list[str]:
-    """Every block index x every part's leaves, in the real anima key form."""
-    prefixes: list[str] = []
-    for i in range(block_count):
-        for leaves in block_leaves(i, block_prefix).values():
-            prefixes.extend(leaves)
-    return prefixes
-
-
-@pytest.fixture(scope="module")
+@pytest.fixture
 def config():
     return block_groups.load_groups()
 
 
-# --------------------------------------------------------------------------
-# exact-once coverage
-# --------------------------------------------------------------------------
-
-def test_exact_once_coverage_over_a_realistic_key_set(config):
-    """The phase doc's first Done-when: every adapted layer covered exactly
-    once, on a plausible block count."""
-    prefixes = synthetic_prefixes(28)
-    report = block_groups.coverage(prefixes, config)
-
-    assert report.total == 28 * LEAVES_PER_BLOCK_COUNT
-    assert report.covered == report.total
-    assert report.unassigned == ()
-    assert report.multiply_assigned == {}
-    assert report.exact_once
+def prefixes_for(leaves, block_count=28):
+    return [f"{BLOCK_PREFIX}.{i}.{leaf}" for i in range(block_count) for leaf in leaves]
 
 
-def test_group_layers_reports_every_group_including_empty_ones(config):
-    """The cross product is the full roster regardless of what's observed --
-    a group with no members is a reportable zero, not an absent key."""
-    prefixes = synthetic_prefixes(28)
-    groups = block_groups.group_layers(prefixes, config)
+# --- totality is structural --------------------------------------------------
 
-    assert set(groups) == set(block_groups.all_group_names(config))
-    assert len(groups) == 3 * 4  # 3 bands x 4 parts
-    # every group here (28 blocks, all parts populated) has members
-    assert all(members for members in groups.values())
-    assert sum(len(members) for members in groups.values()) == 28 * LEAVES_PER_BLOCK_COUNT
+@pytest.mark.parametrize(
+    "label,leaves",
+    [
+        # The key set that motivated the rewrite: production trains attn-only,
+        # and an exhaustive taxonomy left six of twelve groups empty.
+        ("attn-only", ATTN_LEAVES),
+        ("full", ATTN_LEAVES + MLP_LEAVES + MOD_LEAVES),
+        ("mlp-only", MLP_LEAVES),
+        # An architecture the naming layer has never seen.
+        ("unknown-arch", ["mixer.w_in", "mixer.w_out", "gate.proj"]),
+    ],
+)
+@pytest.mark.parametrize("granularity", ["coarse", "fine"])
+def test_fit_covers_every_layer_exactly_once(config, label, leaves, granularity):
+    """Coverage cannot fail, because the groups are built from the prefixes.
 
+    Asserted over four very different key sets and both granularities rather
+    than argued: the claim is about the algorithm, so an architecture the config
+    knows nothing about has to hold it too."""
+    prefixes = prefixes_for(leaves)
+    fitted = block_groups.fit(prefixes, config, granularity)
 
-# --------------------------------------------------------------------------
-# band boundaries
-# --------------------------------------------------------------------------
-
-def _expected_bands(band_sizes: list[int]) -> dict[int, int]:
-    """{index: band} from consecutive band sizes, e.g. [9, 9, 11] -> indices
-    0-8 -> band 0, 9-17 -> band 1, 18-28 -> band 2."""
-    expected: dict[int, int] = {}
-    index = 0
-    for band, size in enumerate(band_sizes):
-        for _ in range(size):
-            expected[index] = band
-            index += 1
-    return expected
-
-
-def test_band_boundaries_when_block_count_divides_evenly():
-    """27 blocks / 3 bands: no remainder, three equal bands of 9."""
-    for index, band in _expected_bands([9, 9, 9]).items():
-        assert block_groups.band_for_index(index, block_count=27, band_count=3) == band, f"index {index}"
+    seen = [p for members in fitted.groups.values() for p in members]
+    assert sorted(seen) == sorted(prefixes), label
+    assert len(seen) == len(set(seen)), f"{label}: a layer landed in two groups"
+    assert fitted.total_layers == len(prefixes)
 
 
-def test_band_boundaries_when_block_count_does_not_divide_29():
-    """29 / 3: sizes [9, 9, 11] -- the last band absorbs the remainder."""
-    for index, band in _expected_bands([9, 9, 11]).items():
-        assert block_groups.band_for_index(index, block_count=29, band_count=3) == band, f"index {index}"
-    # no index falls off the end
-    assert all(block_groups.band_for_index(i, 29, 3) in (0, 1, 2) for i in range(29))
+@pytest.mark.parametrize("granularity", ["coarse", "fine"])
+def test_an_attention_only_adapter_yields_no_empty_groups(config, granularity):
+    """The measurement this module exists to answer.
+
+    Under the old fixed taxonomy this key set produced 6 populated groups and 6
+    empty ones — and an ablation grid would have rendered all twelve."""
+    fitted = block_groups.fit(prefixes_for(ATTN_LEAVES), config, granularity)
+    assert fitted.groups, "fit produced no groups at all"
+    assert all(members for members in fitted.groups.values())
 
 
-def test_band_boundaries_when_block_count_does_not_divide_28():
-    """28 / 3: sizes [9, 9, 10]."""
-    for index, band in _expected_bands([9, 9, 10]).items():
-        assert block_groups.band_for_index(index, block_count=28, band_count=3) == band, f"index {index}"
+def test_fine_resolves_within_attention_where_coarse_cannot(config):
+    """The point of the knob: for an attn-only adapter coarse can only say
+    self-vs-cross, while fine separates q/k/v/out — 24 coordinates, not 6."""
+    prefixes = prefixes_for(ATTN_LEAVES)
+    coarse = block_groups.fit(prefixes, config, "coarse")
+    fine = block_groups.fit(prefixes, config, "fine")
+
+    assert len(coarse.groups) == 6  # 3 bands x {attn-self, attn-cross}
+    assert len(fine.groups) == 24  # 3 bands x 8 leaves
+    assert set(coarse.groups) == {
+        f"{b}.{p}" for b in ("early", "mid", "late") for p in ("attn-self", "attn-cross")
+    }
+    assert "early.attn1.to_q" in fine.groups
+    # Both partition the same layers — finer is a refinement, not a different set.
+    assert coarse.total_layers == fine.total_layers
 
 
-def test_band_boundaries_reflected_in_group_layers(config):
-    """The same boundaries, seen through group membership counts rather than
-    band_for_index directly -- catches a resolver that disagrees with its own
-    band function."""
-    prefixes = synthetic_prefixes(29)
-    groups = block_groups.group_layers(prefixes, config)
+# --- the naming layer, which CAN have gaps -----------------------------------
 
-    # attn-self has 4 leaves/block, so band sizes scale by 4.
-    assert len(groups["early.attn-self"]) == 9 * 4
-    assert len(groups["mid.attn-self"]) == 9 * 4
-    assert len(groups["late.attn-self"]) == 11 * 4
+def test_an_unknown_architecture_is_grouped_and_named_by_its_raw_leaves(config):
+    """No rule matches, so the labels are raw — and the fit still works. That is
+    what makes a new model usable before anyone edits the config."""
+    prefixes = prefixes_for(["mixer.w_in", "gate.proj"])
+    fitted = block_groups.fit(prefixes, config, "coarse")
 
-
-# --------------------------------------------------------------------------
-# fewer blocks than bands
-# --------------------------------------------------------------------------
-
-def test_single_block_checkpoint_still_assigns_totally(config):
-    """1 block, 3 bands: base=0, so every index lands in the last band --
-    still exact-once, nothing lost."""
-    prefixes = synthetic_prefixes(1)
-    report = block_groups.coverage(prefixes, config)
-    groups = block_groups.group_layers(prefixes, config)
-
-    assert report.exact_once
-    assert report.covered == report.total == LEAVES_PER_BLOCK_COUNT
-    assert groups["early.attn-self"] == []
-    assert groups["mid.attn-self"] == []
-    assert len(groups["late.attn-self"]) == 4
+    assert "early.mixer.w_in" in fitted.groups
+    assert set(fitted.unrecognized_parts) == {"mixer.w_in", "gate.proj"}
+    assert fitted.total_layers == len(prefixes)
 
 
-def test_two_block_checkpoint_still_assigns_totally(config):
-    """2 blocks, 3 bands: same degenerate case, two blocks deep."""
-    prefixes = synthetic_prefixes(2)
-    report = block_groups.coverage(prefixes, config)
-    groups = block_groups.group_layers(prefixes, config)
-
-    assert report.exact_once
-    assert report.covered == report.total == 2 * LEAVES_PER_BLOCK_COUNT
-    assert groups["early.mlp"] == []
-    assert groups["mid.mlp"] == []
-    assert len(groups["late.mlp"]) == 2 * 2
+def test_a_ruleless_granularity_reports_no_unrecognized_parts(config):
+    """``fine`` has no rules, so a raw leaf name is the intended output, not a
+    miss. A signal that fires on every identity fit would carry nothing."""
+    fitted = block_groups.fit(prefixes_for(ATTN_LEAVES), config, "fine")
+    assert fitted.unrecognized_parts == ()
 
 
-# --------------------------------------------------------------------------
-# patterns_for, cross-checked against lora_soup's real matcher
-# --------------------------------------------------------------------------
+def test_unknown_granularity_names_the_ones_that_exist(config):
+    with pytest.raises(BlockGroupError) as e:
+        block_groups.fit(prefixes_for(ATTN_LEAVES), config, "medium")
+    assert "coarse" in str(e.value) and "fine" in str(e.value)
 
-def test_patterns_for_select_exactly_that_groups_members_and_no_others(config):
-    """Every group's patterns, run through lora_soup's real fnmatch matcher,
-    must select that group's members and nothing else -- including the
-    attn1.norm_q/norm_k distractors, which sit right next to attn-self/
-    attn-cross's real members and share their block index, so a glob that
-    over-matches (e.g. 'attn1.*' instead of 'attn1.to_*') would only be
-    caught by having a non-member with the same block+attn-number present.
-    """
-    block_count = 29
-    prefixes = synthetic_prefixes(block_count)
-    norm_distractors = [
-        f"{BLOCK_PREFIX}.{i}.attn{n}.norm_{qk}" for i in range(block_count) for n in (1, 2) for qk in ("q", "k")
+
+# --- patterns must select exactly their members ------------------------------
+
+@pytest.mark.parametrize("granularity", ["coarse", "fine"])
+def test_patterns_select_exactly_that_groups_members(config, granularity):
+    """Run through lora_soup's real fnmatch matcher, with distractors.
+
+    The old taxonomy carried a regex *and* a glob per part and the two could
+    drift; this emits the member prefixes themselves, so the property should
+    hold by construction — which is exactly why it is worth asserting against
+    the real matcher rather than trusting it. The ``attn1.norm_q`` distractors
+    share a block index with real attention members, so an over-broad pattern is
+    only catchable with them present."""
+    prefixes = prefixes_for(ATTN_LEAVES)
+    distractors = [
+        f"{BLOCK_PREFIX}.{i}.attn{n}.norm_{qk}"
+        for i in range(28) for n in (1, 2) for qk in ("q", "k")
     ]
-    all_prefixes = prefixes + norm_distractors
-    groups = block_groups.group_layers(prefixes, config)
+    fitted = block_groups.fit(prefixes, config, granularity)
 
-    for group_name, members in groups.items():
-        patterns = block_groups.patterns_for(group_name, prefixes, config)
-        block_scales = [(pattern, 0.0) for pattern in patterns]
+    for group, members in fitted.groups.items():
+        scales = [(pattern, 0.0) for pattern in fitted.patterns_for(group)]
         member_set = set(members)
-        for prefix in all_prefixes:
-            scale = lora_soup.block_scale_for(prefix, block_scales)
-            if prefix in member_set:
-                assert scale == 0.0, f"{group_name}: {prefix} should be selected by {patterns}"
-            else:
-                assert scale == 1.0, f"{group_name}: {prefix} should NOT be selected by {patterns}"
+        for prefix in prefixes + distractors:
+            scale = lora_soup.block_scale_for(prefix, scales)
+            expected = 0.0 if prefix in member_set else 1.0
+            assert scale == expected, f"{group}: wrong selection for {prefix}"
 
 
-def test_patterns_for_enumerates_per_block_index_not_a_single_band_wildcard(config):
-    """One pattern per block in the band, not one pattern standing in for the
-    whole band -- a band name never appears literally in a real key, so a
-    single '*early*'-shaped glob would select nothing."""
-    prefixes = synthetic_prefixes(29)
-    patterns = block_groups.patterns_for("early.mlp", prefixes, config)
-
-    assert len(patterns) == 9  # early band is blocks 0-8 at 29/3
-    assert patterns == sorted(patterns, key=lambda p: int(p.split(".")[2]))
-    for pattern in patterns:
-        assert "early" not in pattern
+def test_patterns_for_rejects_a_group_not_in_this_fit(config):
+    """A real group name from another checkpoint is still not a coordinate of
+    *this* one — the whole premise of fitting."""
+    fitted = block_groups.fit(prefixes_for(ATTN_LEAVES), config, "coarse")
+    with pytest.raises(BlockGroupError):
+        fitted.patterns_for("early.mlp")
 
 
-# --------------------------------------------------------------------------
-# strays and the attn/norm exclusion
-# --------------------------------------------------------------------------
+# --- layers outside the block prefix -----------------------------------------
 
-def test_stray_prefix_outside_transformer_blocks_is_unassigned(config):
-    prefixes = synthetic_prefixes(4) + ["text_encoder.embed_tokens"]
-    assert block_groups.assign("text_encoder.embed_tokens", config, block_count=4) is None
-
-    report = block_groups.coverage(prefixes, config)
-    assert "text_encoder.embed_tokens" in report.unassigned
-    assert not report.exact_once
-    assert report.covered == 4 * LEAVES_PER_BLOCK_COUNT
-
-
-def test_attn_norm_keys_are_excluded_from_the_attention_groups(config):
-    """The subtle one: LAYER_PRESETS' attention regex is
-    '^(?=.*attn)(?!.*norm).*' -- attn proper excludes anything with 'norm' in
-    it. attn1.norm_q / attn1.norm_k never appear in a real adapted key set
-    (QK-norm isn't LoRA-decomposable), but the taxonomy must still refuse
-    them rather than silently filing them under attn-self.
-    """
-    block_count = 4
-    prefixes = synthetic_prefixes(block_count) + [
-        f"{BLOCK_PREFIX}.2.attn1.norm_q",
-        f"{BLOCK_PREFIX}.2.attn1.norm_k",
-        f"{BLOCK_PREFIX}.2.attn2.norm_q",
+def test_layers_outside_the_block_prefix_are_kept_not_dropped(config):
+    """A text-encoder LoRA is a real thing to train. Dropping such layers to
+    preserve a tidy invariant would silently shrink the coordinate system and
+    make every other group's share wrong."""
+    prefixes = prefixes_for(ATTN_LEAVES) + [
+        "text_encoder.layers.0.self_attn.q_proj",
+        "text_encoder.layers.1.mlp.fc1",
     ]
+    fitted = block_groups.fit(prefixes, config, "coarse")
 
-    # the real attn1 sibling at the same block/index IS attn-self:
-    assert block_groups.assign(f"{BLOCK_PREFIX}.2.attn1.to_q", config, block_count) is not None
-
-    # the norm sublayers are not:
-    assert block_groups.assign(f"{BLOCK_PREFIX}.2.attn1.norm_q", config, block_count) is None
-    assert block_groups.assign(f"{BLOCK_PREFIX}.2.attn1.norm_k", config, block_count) is None
-    assert block_groups.assign(f"{BLOCK_PREFIX}.2.attn2.norm_q", config, block_count) is None
-
-    report = block_groups.coverage(prefixes, config)
-    assert f"{BLOCK_PREFIX}.2.attn1.norm_q" in report.unassigned
-    assert f"{BLOCK_PREFIX}.2.attn1.norm_k" in report.unassigned
-    assert f"{BLOCK_PREFIX}.2.attn2.norm_q" in report.unassigned
-
-    # and they must not have silently inflated attn-self/attn-cross either
-    groups = block_groups.group_layers(prefixes, config)
-    assert f"{BLOCK_PREFIX}.2.attn1.norm_q" not in groups["mid.attn-self"]
-    assert f"{BLOCK_PREFIX}.2.attn2.norm_q" not in groups["mid.attn-cross"]
+    unblocked = {
+        g: m for g, m in fitted.groups.items()
+        if g.startswith(block_groups.UNBLOCKED_BAND + ".")
+    }
+    assert sum(len(m) for m in unblocked.values()) == 2
+    assert fitted.total_layers == len(prefixes)
 
 
-# --------------------------------------------------------------------------
-# config plumbing
-# --------------------------------------------------------------------------
+# --- band rounding (unchanged behaviour, still load-bearing) -----------------
 
-def test_assign_returns_none_for_an_index_beyond_block_count(config):
-    """block_count is normally self-consistent (group_layers/coverage derive
-    it from the very prefixes they resolve), so this path only bites a direct
-    caller passing a stale/mismatched block_count. It must still return None
-    per the documented contract, not raise -- assign() is supposed to be the
-    total function that never throws on a merely-out-of-scope prefix."""
-    assert block_groups.assign(f"{BLOCK_PREFIX}.10.attn1.to_q", config, block_count=5) is None
-
-
-def test_load_groups_defaults_to_the_file_beside_the_module():
-    config = block_groups.load_groups()
-    assert config.model
-    assert config.band_count == 3
-    assert config.band_names == ("early", "mid", "late")
-    assert {part.name for part in config.parts} == {"attn-self", "attn-cross", "mlp", "modulation"}
+@pytest.mark.parametrize(
+    "block_count,expected",
+    [(30, [10, 10, 10]), (29, [9, 9, 11]), (28, [9, 9, 10]), (2, [0, 0, 2])],
+)
+def test_band_rounding_puts_the_remainder_in_the_last_band(block_count, expected):
+    sizes = [0, 0, 0]
+    for i in range(block_count):
+        sizes[block_groups.band_for_index(i, block_count, 3)] += 1
+    assert sizes == expected
 
 
-def test_patterns_for_rejects_an_unknown_group_name(config):
-    with pytest.raises(BlockGroupError):
-        block_groups.patterns_for("nonexistent.part", synthetic_prefixes(3), config)
-    with pytest.raises(BlockGroupError):
-        block_groups.patterns_for("early.nonexistent", synthetic_prefixes(3), config)
+def test_bands_are_derived_from_the_observed_count_not_the_model(config):
+    """A 12-block checkpoint bands as 4/4/4 even though anima has 28."""
+    fitted = block_groups.fit(prefixes_for(["attn1.to_q"], block_count=12), config, "coarse")
+    assert fitted.block_count == 12
+    assert len(fitted.groups["early.attn-self"]) == 4
 
 
-# --------------------------------------------------------------------------
-# LoKr checkpoints resolve to the same coordinate system
-# --------------------------------------------------------------------------
+# --- key-set reading (unchanged) ---------------------------------------------
 
 def test_lokr_keys_collapse_to_the_same_layer_prefixes(tmp_path):
-    """A LoKr checkpoint names its layers under ``.lokr_*`` instead of
-    ``.lora_{down,up}.weight``. The taxonomy is over *layers*, not over
-    factorizations, so it must resolve identically -- and the failure mode if it
-    doesn't is an empty table that looks like an answer rather than an error."""
-    prefixes = synthetic_prefixes(3)
-    state_dict = {}
-    for i, prefix in enumerate(prefixes):
-        # A mix of the w1/w2 forms, so every family gets exercised at least once.
-        if i % 3 == 0:
-            state_dict[prefix + ".lokr_w1"] = torch.zeros(4, 4)
-            state_dict[prefix + ".lokr_w2_a"] = torch.zeros(4, 2)
-            state_dict[prefix + ".lokr_w2_b"] = torch.zeros(2, 4)
-        elif i % 3 == 1:
-            state_dict[prefix + ".lokr_w1_a"] = torch.zeros(4, 2)
-            state_dict[prefix + ".lokr_w1_b"] = torch.zeros(2, 4)
-            state_dict[prefix + ".lokr_w2"] = torch.zeros(4, 4)
-        else:
-            state_dict[prefix + ".lokr_w1"] = torch.zeros(4, 4)
-            state_dict[prefix + ".lokr_t2"] = torch.zeros(2, 2, 3, 3)
-            state_dict[prefix + ".lokr_w2_a"] = torch.zeros(2, 4)
-            state_dict[prefix + ".lokr_w2_b"] = torch.zeros(2, 4)
-        state_dict[prefix + ".alpha"] = torch.tensor(2.0)
-
+    """LoKr's seven suffixes and LoRA's three name the same layer — the taxonomy
+    is over layers, and the factorization is not one of a layer's coordinates."""
+    prefix = f"{BLOCK_PREFIX}.0.attn1.to_q"
     path = tmp_path / "lokr.safetensors"
-    save_file(state_dict, str(path))
-
-    read = block_groups.read_layer_prefixes(path)
-    assert read == sorted(prefixes)
+    save_file(
+        {
+            f"{prefix}.lokr_w1_a": torch.zeros(4, 2),
+            f"{prefix}.lokr_w1_b": torch.zeros(2, 4),
+            f"{prefix}.lokr_w2": torch.zeros(4, 4),
+            f"{prefix}.alpha": torch.tensor(2.0),
+        },
+        str(path),
+    )
+    assert block_groups.read_layer_prefixes(path) == [prefix]
 
 
 def test_lokr_w1_suffix_does_not_swallow_lokr_w1_a():
-    """``.lokr_w1`` is a prefix of ``.lokr_w1_a`` as a *string*, but not as a
-    suffix -- so the endswith match is safe and the layer prefix comes out
-    whole. Pinned because a startswith-flavored split here would silently
-    invent a layer called ``...to_q.lokr_w1``."""
+    """``.lokr_w1`` is a prefix of ``.lokr_w1_a``; endswith order must not let
+    the short one claim the long one's key and invent a phantom layer."""
     keys = [
         f"{BLOCK_PREFIX}.0.attn1.to_q.lokr_w1_a",
         f"{BLOCK_PREFIX}.0.attn1.to_q.lokr_w1_b",
