@@ -1112,3 +1112,137 @@ def test_a_lokr_file_reports_its_storage_dtype(tmp_path):
     parts, _shape = make_lokr(**LIN_256, dim=dim, seed=2000)
     path = write_lokr(tmp_path / "bf16.safetensors", {P1: (parts, float(dim))}, dtype=torch.bfloat16)
     assert lora_soup.load_lora(path, 1.0).dtype == torch.bfloat16
+
+
+# ---------------------------------------------------------------------------
+# Per-input block scales — the weight-wise merge primitive
+# ---------------------------------------------------------------------------
+#
+# The merge-wide --block-scale scales a layer AFTER the sum:
+#     dW[l] = s[l] * sum_i c_i dW_i[l]
+# which is a per-layer strength knob and says nothing about which input the
+# layer should prefer. A merge weighted by per-layer contribution needs the
+# coefficient itself to depend on the layer:
+#     dW[l] = sum_i c_i[l] dW_i[l]
+# Those two are only distinguishable when the inputs differ per layer, so every
+# test here uses at least two inputs and at least two layers.
+
+_P, _Q = "unet.a", "unet.b"
+
+
+def _two_input_files(tmp_path):
+    """Two adapters over two layers, distinct everywhere."""
+    a = {_P: make_layer(4, 6, 2, seed=1), _Q: make_layer(4, 6, 2, seed=2)}
+    b = {_P: make_layer(4, 6, 2, seed=3), _Q: make_layer(4, 6, 2, seed=4)}
+    return (write_lora(tmp_path / "a.safetensors", a, dtype=torch.float32),
+            write_lora(tmp_path / "b.safetensors", b, dtype=torch.float32))
+
+
+def _merged(tmp_path, specs, **kw):
+    state_dict, header = lora_soup.soup_files(specs, dtype=torch.float32, log=lambda *_: None, **kw)
+    return state_dict, header
+
+
+def test_a_per_input_block_scale_changes_only_the_layer_it_names(tmp_path):
+    """The defining property. Scaling input 0 on layer P must leave layer Q
+    byte-identical to the unscaled merge — otherwise it is a global knob."""
+    pa, pb = _two_input_files(tmp_path)
+    specs = [(pa, 1.0), (pb, 1.0)]
+    base, _ = _merged(tmp_path, specs)
+    scaled, _ = _merged(tmp_path, specs, input_block_scales=[[(_P, 0.25)], []])
+    assert rel_err(delta_of(scaled, _Q), delta_of(base, _Q)) < FP32_REL_TOL
+    assert rel_err(delta_of(scaled, _P), delta_of(base, _P)) > 0.01
+
+
+def test_the_merge_is_the_per_layer_weighted_sum_it_claims(tmp_path):
+    """dW[l] == sum_i c_i[l] dW_i[l], checked against deltas assembled here."""
+    pa, pb = _two_input_files(tmp_path)
+    from safetensors.torch import load_file
+    da, db = load_file(str(pa)), load_file(str(pb))
+    # rank=4: the sum of two rank-2 deltas is rank-4, and refactor_svd defaults
+    # to the largest INPUT rank, which would truncate and mask the identity.
+    merged, _ = _merged(tmp_path, [(pa, 1.0), (pb, 1.0)], rank=4,
+                        input_block_scales=[[(_P, 0.25)], [(_Q, 0.5)]])
+    want_p = 0.25 * delta_of(da, _P) + 1.0 * delta_of(db, _P)
+    want_q = 1.00 * delta_of(da, _Q) + 0.5 * delta_of(db, _Q)
+    assert rel_err(delta_of(merged, _P), want_p) < FP32_REL_TOL
+    assert rel_err(delta_of(merged, _Q), want_q) < FP32_REL_TOL
+
+
+def test_a_per_input_scale_cannot_be_imitated_by_the_merge_wide_one(tmp_path):
+    """Why the feature has to exist at all: no assignment of merge-wide layer
+    scales reproduces a merge that prefers different inputs at different
+    layers, because the merge-wide one multiplies the finished sum."""
+    pa, pb = _two_input_files(tmp_path)
+    specs = [(pa, 1.0), (pb, 1.0)]
+    weightwise, _ = _merged(tmp_path, specs, input_block_scales=[[(_P, 2.0)], [(_Q, 2.0)]])
+    for s_p in (0.5, 1.0, 1.5, 2.0):
+        for s_q in (0.5, 1.0, 1.5, 2.0):
+            other, _ = _merged(tmp_path, specs, block_scales=[(_P, s_p), (_Q, s_q)])
+            same_p = rel_err(delta_of(other, _P), delta_of(weightwise, _P)) < FP32_REL_TOL
+            same_q = rel_err(delta_of(other, _Q), delta_of(weightwise, _Q)) < FP32_REL_TOL
+            assert not (same_p and same_q)
+
+
+def test_per_input_and_merge_wide_scales_compose(tmp_path):
+    pa, pb = _two_input_files(tmp_path)
+    from safetensors.torch import load_file
+    da, db = load_file(str(pa)), load_file(str(pb))
+    merged, _ = _merged(tmp_path, [(pa, 1.0), (pb, 1.0)], rank=4,
+                        block_scales=[(_P, 3.0)], input_block_scales=[[(_P, 0.5)], []])
+    want = 3.0 * (0.5 * delta_of(da, _P) + delta_of(db, _P))
+    assert rel_err(delta_of(merged, _P), want) < FP32_REL_TOL
+
+
+def test_concat_honours_per_input_scales_exactly(tmp_path):
+    """The concat path re-derives the factor itself, so it needs its own check —
+    and being exact, it gets the tighter tolerance."""
+    pa, pb = _two_input_files(tmp_path)
+    from safetensors.torch import load_file
+    da, db = load_file(str(pa)), load_file(str(pb))
+    merged, _ = _merged(tmp_path, [(pa, 1.0), (pb, 1.0)], method="concat",
+                        input_block_scales=[[(_P, 0.25)], []])
+    want = 0.25 * delta_of(da, _P) + delta_of(db, _P)
+    assert rel_err(delta_of(merged, _P), want) < FP32_REL_TOL
+
+
+def test_omitting_input_block_scales_is_byte_identical_to_before(tmp_path):
+    """The whole existing surface has to be untouched: an absent argument must
+    not merely be equivalent, it must take the same path."""
+    pa, pb = _two_input_files(tmp_path)
+    specs = [(pa, 0.7), (pb, 0.3)]
+    a, _ = _merged(tmp_path, specs)
+    b, _ = _merged(tmp_path, specs, input_block_scales=[[], []])
+    for key in a:
+        assert torch.equal(a[key], b[key]), key
+
+
+def test_a_mismatched_scale_list_is_refused_not_zipped(tmp_path):
+    """Positional arguments that silently truncate would scale the wrong
+    adapter — the failure this could not be allowed to have."""
+    pa, pb = _two_input_files(tmp_path)
+    with pytest.raises(SoupError, match="positional"):
+        _merged(tmp_path, [(pa, 1.0), (pb, 1.0)], input_block_scales=[[(_P, 0.5)]])
+
+
+def test_the_header_records_each_inputs_own_scales(tmp_path):
+    pa, pb = _two_input_files(tmp_path)
+    _, header = _merged(tmp_path, [(pa, 1.0), (pb, 1.0)],
+                        input_block_scales=[[(_P, 0.25)], []])
+    soup_meta = json.loads(header["soup"])
+    assert soup_meta["inputs"][0]["block_scales"] == [{"pattern": _P, "coefficient": 0.25}]
+    assert soup_meta["inputs"][1]["block_scales"] == []
+
+
+@pytest.mark.parametrize("spec,expected", [
+    ("0:unet.a=0.5", (0, "unet.a", 0.5)),
+    ("12:*attn1*=-1.25", (12, "*attn1*", -1.25)),
+])
+def test_input_block_scale_specs_parse(spec, expected):
+    assert lora_soup.parse_input_block_scale(spec) == expected
+
+
+@pytest.mark.parametrize("spec", ["unet.a=0.5", "0:unet.a", "x:unet.a=0.5", "0:"])
+def test_malformed_input_block_scale_specs_are_refused(spec):
+    with pytest.raises(SoupError):
+        lora_soup.parse_input_block_scale(spec)

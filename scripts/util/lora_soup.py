@@ -490,6 +490,17 @@ class LoadedLora:
     dtype: torch.dtype
     file_sha256: str
 
+    block_scales: tuple[tuple[str, float], ...] = ()
+    """This input's own per-layer coefficients, on top of :attr:`coefficient`.
+
+    The difference from the merge-wide ``block_scales`` is the whole point of
+    having both. That one scales a layer *after* the sum -- ``dW[l] = s[l] *
+    sum_i c_i dW_i[l]`` -- which is a per-layer strength knob and cannot express
+    a preference between inputs. These make the coefficient itself a function of
+    the layer -- ``dW[l] = sum_i c_i[l] dW_i[l]`` -- which is what a merge
+    weighted by per-layer *contribution* needs. The two compose: a global shape
+    times a per-input one."""
+
 
 @dataclasses.dataclass
 class MergedLayer:
@@ -537,6 +548,25 @@ def parse_block_scale(spec: str) -> tuple[str, float]:
     except ValueError as e:
         raise SoupError(f"--block-scale coefficient is not a number: {spec!r}") from e
     return pattern, coefficient
+
+
+def parse_input_block_scale(spec: str) -> tuple[int, str, float]:
+    """Split ``INDEX:PATTERN=COEFF``.
+
+    Split on the *first* colon, unlike ``--input``: the index is a bare integer
+    and what follows is a layer-prefix glob, which never contains one. (The
+    rsplit there exists for ``d:/ai/...`` drive letters, which cannot appear
+    here.)
+    """
+    index_text, sep, rest = spec.partition(":")
+    if not sep or not rest:
+        raise SoupError(f"--input-block-scale expects INDEX:PATTERN=COEFF, got {spec!r}")
+    try:
+        index = int(index_text)
+    except ValueError as e:
+        raise SoupError(f"--input-block-scale index is not an integer: {spec!r}") from e
+    pattern, coefficient = parse_block_scale(rest)
+    return index, pattern, coefficient
 
 
 def block_scale_for(prefix: str, block_scales: Sequence[tuple[str, float]]) -> float:
@@ -737,7 +767,11 @@ def build_lokr_layer(
     return LokrLayer(w1=w1, w1_a=w1_a, w1_b=w1_b, w2=w2, w2_a=w2_a, w2_b=w2_b, t2=t2, alpha=alpha, dim=dim)
 
 
-def load_lora(path: Path | str, coefficient: float) -> LoadedLora:
+def load_lora(
+    path: Path | str,
+    coefficient: float,
+    block_scales: Sequence[tuple[str, float]] = (),
+) -> LoadedLora:
     """Read one adapter safetensors file, refusing anything without a closed-form
     additive delta.
 
@@ -838,6 +872,7 @@ def load_lora(path: Path | str, coefficient: float) -> LoadedLora:
         header=header,
         dtype=dtype,
         file_sha256=_file_sha256(path),
+        block_scales=tuple(block_scales),
     )
 
 
@@ -883,7 +918,10 @@ def merge_deltas(
         scale = block_scale_for(prefix, block_scales)
         total: Tensor | None = None
         for loaded in contributors:
-            term = loaded.layers[prefix].delta() * loaded.coefficient
+            # Per-input first, so the coefficient is c_i[l]; the merge-wide
+            # scale then multiplies the finished sum, as it always has.
+            weight = loaded.coefficient * block_scale_for(prefix, loaded.block_scales)
+            term = loaded.layers[prefix].delta() * weight
             total = term if total is None else total + term
         assert total is not None
         total = total * scale
@@ -954,7 +992,12 @@ def refactor_concat(
             # Repeated here so a direct caller gets the reason, not an
             # AttributeError about a missing ``.down``.
             raise SoupError(f"{loaded.path}: layer {prefix!r} is not plain LoRA. {CONCAT_NEEDS_LORA}")
-        factor = loaded.coefficient * scale * layer.scale
+        factor = (
+            loaded.coefficient
+            * block_scale_for(prefix, loaded.block_scales)
+            * scale
+            * layer.scale
+        )
         root = math.sqrt(abs(factor))
         downs.append(layer.down.to(torch.float32) * root)
         ups.append(layer.up.to(torch.float32) * math.copysign(root, factor))
@@ -999,6 +1042,9 @@ def build_soup_header(
                     "name": loaded.path.name,
                     "path": str(loaded.path),
                     "coefficient": loaded.coefficient,
+                    "block_scales": [
+                        {"pattern": p, "coefficient": c} for p, c in loaded.block_scales
+                    ],
                     # sha256 of the *file bytes*, computed here. Distinct from the
                     # input's own header "hash_sha256", which OneTrainer computes
                     # over sorted tensor data only; both are recorded, named apart.
@@ -1087,10 +1133,25 @@ def soup_files(
     rank: int | None = None,
     block_scales: Sequence[tuple[str, float]] = (),
     dtype: torch.dtype | None = None,
+    input_block_scales: Sequence[Sequence[tuple[str, float]]] | None = None,
     log: Callable[[str], None] = _stderr,
 ) -> tuple[dict[str, Tensor], dict[str, str]]:
-    """``load_lora`` every spec, then ``soup`` them. The one-call entry point."""
-    inputs = [load_lora(path, coefficient) for path, coefficient in specs]
+    """``load_lora`` every spec, then ``soup`` them. The one-call entry point.
+
+    ``input_block_scales`` is parallel to ``specs`` -- one list of per-layer
+    patterns per input -- and defaults to none for every input.
+    """
+    if input_block_scales is None:
+        input_block_scales = [()] * len(specs)
+    if len(input_block_scales) != len(specs):
+        raise SoupError(
+            f"input_block_scales has {len(input_block_scales)} entries for {len(specs)} inputs "
+            "-- they are positional, so a mismatch would silently scale the wrong adapter"
+        )
+    inputs = [
+        load_lora(path, coefficient, per_input)
+        for (path, coefficient), per_input in zip(specs, input_block_scales)
+    ]
     return soup(inputs, method=method, rank=rank, block_scales=block_scales, dtype=dtype, log=log)
 
 
@@ -1119,6 +1180,12 @@ def main() -> int:
         help="multiply matching layers' delta by COEFF; PATTERN is an fnmatch glob "
              "over the whole layer prefix, e.g. '*attn1*=0.0'. Repeatable; matches compose",
     )
+    parser.add_argument(
+        "--input-block-scale", action="append", default=[], metavar="INDEX:PATTERN=COEFF",
+        help="scale ONE input's delta on matching layers, making its coefficient a function "
+             "of the layer: dW[l] = sum_i c_i[l] dW_i[l]. INDEX is the 0-based position of the "
+             "--input it applies to. Repeatable; composes with --block-scale",
+    )
     args = parser.parse_args()
 
     try:
@@ -1126,10 +1193,21 @@ def main() -> int:
         block_scales = [parse_block_scale(spec) for spec in args.block_scale]
         dtype = DTYPE_ALIASES[args.dtype] if args.dtype else None
 
-        for path, coefficient in specs:
-            print(f"input   {path}  x {coefficient}", flush=True)
+        per_input: list[list[tuple[str, float]]] = [[] for _ in specs]
+        for spec in args.input_block_scale:
+            index, pattern, coefficient = parse_input_block_scale(spec)
+            if not 0 <= index < len(specs):
+                raise SoupError(
+                    f"--input-block-scale index {index} is out of range for {len(specs)} input(s)"
+                )
+            per_input[index].append((pattern, coefficient))
+
+        for i, (path, coefficient) in enumerate(specs):
+            extra = f"  [{len(per_input[i])} block scale(s)]" if per_input[i] else ""
+            print(f"input   {path}  x {coefficient}{extra}", flush=True)
         state_dict, header = soup_files(
-            specs, method=args.method, rank=args.rank, block_scales=block_scales, dtype=dtype
+            specs, method=args.method, rank=args.rank, block_scales=block_scales, dtype=dtype,
+            input_block_scales=per_input,
         )
     except SoupError as e:
         sys.exit(f"lora_soup: {e}")
