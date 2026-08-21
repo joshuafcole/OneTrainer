@@ -211,6 +211,20 @@ def test_only_the_counterexample_row_is_replaced():
     assert stats.rows == 1
 
 
+def test_the_epsilon_prediction_path_routes_it_too():
+    """There are two insertion points -- `_flow_matching_losses` and
+    `_diffusion_losses` -- and a term wired into only one of them would be silently
+    absent for every non-flow-matching model."""
+    TELEMETRY.reset()
+    types_ = [ConceptType.STANDARD, ConceptType.COUNTEREXAMPLE]
+    batch, data = _batch_and_data(types_)
+    losses = _Mixin()._diffusion_losses(batch, data, _config(batch_size=2), torch.device("cpu"))
+
+    assert math.isclose(losses[0].item(), 1.0, rel_tol=1e-6)
+    assert math.isclose(losses[1].item(), (2.0 / BETA) * math.log(2.0), rel_tol=1e-5)
+    assert TELEMETRY.take().rows == 1
+
+
 def test_the_concepts_own_loss_weight_still_ramps_it():
     """`loss_weight` is applied after the substitution, so a counterexample
     concept can still be dialled down without touching beta."""
