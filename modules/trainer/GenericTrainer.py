@@ -34,6 +34,7 @@ from modules.util.enum.ModelType import PeftType
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.grad_estimation import WeightGradientEstimator
+from modules.util.loss.counterexample_loss import TELEMETRY as counterexample_telemetry
 from modules.util.profiling_util import TorchMemoryRecorder, TorchProfiler
 from modules.util.sample_metadata import SampleProvenance, hash_text
 from modules.util.time_util import get_string_timestamp
@@ -845,16 +846,26 @@ class GenericTrainer(BaseTrainer):
                 # so the trained model *is* the prior model. Detaching the
                 # prediction as their target zeroes their loss without running
                 # the prior model.
-                prior_pred_indices = [
+                #
+                # Counterexamples are excluded for the same reason and by the same
+                # trick: at step 0 their true gradient is the half-scale repulsion
+                # (delta == 0 exactly, because the adapter is still zero), which
+                # would pollute the gradient-alignment estimate with a term that
+                # points away from the data. Opting out of the repulsion here is
+                # explicit -- the loss raises rather than silently training the
+                # counterexample as a positive.
+                inert_indices = [
                     i
                     for i in range(config.batch_size)
-                    if ConceptType(batch["concept_type"][i]) == ConceptType.PRIOR_PREDICTION
+                    if ConceptType(batch["concept_type"][i])
+                    in (ConceptType.PRIOR_PREDICTION, ConceptType.COUNTEREXAMPLE)
                 ]
-                if len(prior_pred_indices) > 0:
+                model_output_data["skip_counterexample_repulsion"] = True
+                if len(inert_indices) > 0:
                     predicted_detached = model_output_data["predicted"].detach().to(
                         dtype=model_output_data["target"].dtype
                     )
-                    model_output_data["target"][prior_pred_indices] = predicted_detached[prior_pred_indices]
+                    model_output_data["target"][inert_indices] = predicted_detached[inert_indices]
 
                 loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, config)
                 (loss * loss_scale).backward()
@@ -1048,7 +1059,15 @@ class GenericTrainer(BaseTrainer):
                         for i in range(self.config.batch_size)
                         if ConceptType(batch["concept_type"][i]) == ConceptType.PRIOR_PREDICTION
                     ]
-                    if len(prior_pred_indices) > 0 or (
+                    # A counterexample row needs the same frozen forward, but NOT the
+                    # target substitution below: its target stays the wrong image it
+                    # actually is, and the loss measures how much better than the
+                    # reference the adapter has learned to reproduce it.
+                    has_counterexample = any(
+                        ConceptType(batch["concept_type"][i]) == ConceptType.COUNTEREXAMPLE
+                        for i in range(self.config.batch_size)
+                    )
+                    if len(prior_pred_indices) > 0 or has_counterexample or (
                         self.config.masked_training
                         and self.config.masked_prior_preservation_weight > 0
                         and self.config.training_method == TrainingMethod.LORA
@@ -1084,6 +1103,10 @@ class GenericTrainer(BaseTrainer):
                     accumulated_loss += detached_loss
 
                     if self.__is_update_step(train_progress):
+                        # Drained on every rank, not just the logging one, so a
+                        # non-master's accumulator never carries a previous
+                        # window's rows into the next.
+                        counterexample = counterexample_telemetry.take()
                         perf.tic("optimizer")
                         if self.config.fused_gradient_reduce:
                             multi.finish_async(self.config.gradient_reduce_precision)
@@ -1127,6 +1150,24 @@ class GenericTrainer(BaseTrainer):
                             self.tensorboard.add_scalar(
                                 "loss/train_step", accumulated_loss_cpu, train_progress.global_step
                             )
+
+                            # Counterexample readout (phase 502). Drained once per
+                            # optimizer step, so it aggregates the whole GA window.
+                            # `gate_mean` is the one to read first: it is the mean
+                            # per-row multiplier on the repulsion gradient, so ~0
+                            # means the term is inert -- which a warm start makes
+                            # entirely possible, because `prior_model()` detaches
+                            # *every* adapter and the reference is therefore the
+                            # foundation, not the run this one resumed from.
+                            if counterexample.rows > 0:
+                                for tag, value in (
+                                    ("counterexample/rows", float(counterexample.rows)),
+                                    ("counterexample/delta_mean", counterexample.delta_mean),
+                                    ("counterexample/gate_mean", counterexample.gate_mean),
+                                    ("counterexample/saturated_fraction", counterexample.saturated_fraction),
+                                    ("counterexample/loss_mean", counterexample.loss_mean),
+                                ):
+                                    self.tensorboard.add_scalar(tag, value, train_progress.global_step)
                             ema_loss = ema_loss or accumulated_loss_cpu
                             ema_loss_steps += 1
                             ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))

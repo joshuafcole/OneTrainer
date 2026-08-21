@@ -514,6 +514,12 @@ class TrainConfig(BaseConfig):
     normalize_masked_area_loss: bool
     masked_prior_preservation_weight: float
 
+    # counterexample training (ConceptType.COUNTEREXAMPLE). beta sets where the
+    # bounded repulsion switches off; see modules/util/loss/counterexample_loss.py
+    # for why the useful range is hundreds-to-thousands, and read `gate_mean` off
+    # a short run rather than guessing it twice.
+    counterexample_beta: float
+
     # custom conditioning image
     custom_conditioning_image: bool
 
@@ -1188,6 +1194,10 @@ class TrainConfig(BaseConfig):
         data.append(("unmasked_weight", 0.1, float, False))
         data.append(("normalize_masked_area_loss", False, bool, False))
         data.append(("masked_prior_preservation_weight", 0.0, float, False))
+
+        # counterexample training
+        data.append(("counterexample_beta", 1000.0, float, False))
+
         data.append(("custom_conditioning_image", False, bool, False))
 
         # layer filter

@@ -3,7 +3,13 @@ from collections.abc import Callable
 
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.DiffusionScheduleCoefficients import DiffusionScheduleCoefficients
+from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.LossWeight import LossWeight
+from modules.util.loss.counterexample_loss import (
+    TELEMETRY,
+    counterexample_losses,
+    counterexample_stats,
+)
 from modules.util.loss.masked_loss import masked_losses, masked_losses_with_prior
 from modules.util.loss.vb_loss import vb_losses
 
@@ -196,6 +202,100 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         return losses
 
+    def _prediction_distance(
+            self,
+            batch: dict,
+            data: dict,
+            config: TrainConfig,
+            predicted: Tensor,
+    ) -> Tensor:
+        """The configured per-sample distance between an arbitrary ``predicted``
+        and the batch's target.
+
+        Exists so a counterexample's ``d`` and ``d_ref`` are computed by the
+        *same* code path (mse/mae/huber/log-cosh mixture, masking, area
+        normalization and all), because ``delta = d_ref - d`` is meaningless the
+        moment the two halves are different metrics -- and nothing would report
+        that they were.
+
+        Two terms are deliberately dropped from the probe:
+
+        * ``prior_target`` -- masked prior preservation compares the prediction
+          against the frozen model's output, which for the reference forward *is*
+          the prediction, so the term would be identically zero on one side of
+          the subtraction and not the other.
+        * ``predicted_var_values`` -- the variational bound is a property of the
+          trained head, not a reconstruction distance, and has no reference twin.
+        """
+        probe = {
+            key: value
+            for key, value in data.items()
+            if key not in ("prior_target", "predicted_var_values")
+        }
+        probe["predicted"] = predicted
+        if config.masked_training and not config.model_type.has_conditioning_image_input():
+            return self.__masked_losses(batch, probe, config)
+        return self.__unmasked_losses(batch, probe, config)
+
+    def _apply_counterexample_losses(
+            self,
+            batch: dict,
+            data: dict,
+            config: TrainConfig,
+            losses: Tensor,
+    ) -> Tensor:
+        """Replace every ``COUNTEREXAMPLE`` row's loss with the bounded repulsion.
+
+        Substituted *before* the loss scaler and ``loss_weight``, so a
+        counterexample concept's own ramp still applies on top exactly as it does
+        for a positive concept.
+
+        Raises rather than degrading when the frozen reference is missing: a
+        counterexample row whose repulsion silently did not apply is a row that
+        trained the model **toward** the wrong image, which is the one failure
+        mode of this feature that a green run would never reveal. The kron-GA
+        estimation pass, which legitimately has no reference forward, opts out
+        explicitly via ``data['skip_counterexample_repulsion']``.
+        """
+        concept_types = batch.get("concept_type")
+        if concept_types is None:
+            return losses
+        indices = [
+            i
+            for i in range(len(concept_types))
+            if ConceptType(concept_types[i]) == ConceptType.COUNTEREXAMPLE
+        ]
+        if not indices:
+            return losses
+        if data.get("skip_counterexample_repulsion", False):
+            return losses
+        if "prior_target" not in data:
+            raise RuntimeError(
+                "A COUNTEREXAMPLE concept is in the batch but no frozen reference prediction "
+                "was computed. Counterexample training needs the prior-model forward, which is "
+                "LoRA-only (see BaseModelSetup.prior_model) and is armed in GenericTrainer."
+            )
+
+        beta = config.counterexample_beta
+        index = torch.tensor(indices, device=losses.device, dtype=torch.long)
+        distance = self._prediction_distance(batch, data, config, data["predicted"])
+        reference_distance = self._prediction_distance(
+            batch, data, config, data["prior_target"].detach()
+        )
+        repulsion = counterexample_losses(distance, reference_distance, beta)
+
+        TELEMETRY.record(
+            counterexample_stats(
+                delta=(reference_distance - distance)[index],
+                losses=repulsion[index],
+                beta=beta,
+            )
+        )
+
+        losses = losses.clone()
+        losses[index] = repulsion[index]
+        return losses
+
     def __snr(self, timesteps: Tensor, device: torch.device) -> Tensor:
         if self.__coefficients:
             all_snr = (self.__coefficients.sqrt_alphas_cumprod /
@@ -282,6 +382,8 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             else:
                 losses = self.__unmasked_losses(batch, data, config)
 
+            losses = self._apply_counterexample_losses(batch, data, config, losses)
+
         # Scale Losses by Batch and/or GA (if enabled)
         losses = losses * config.loss_scaler.get_scale(batch_size=config.batch_size, accumulation_steps=config.gradient_accumulation_steps)
 
@@ -325,6 +427,8 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 losses = self.__masked_losses(batch, data, config)
             else:
                 losses = self.__unmasked_losses(batch, data, config)
+
+            losses = self._apply_counterexample_losses(batch, data, config, losses)
 
         # Scale Losses by Batch and/or GA (if enabled)
         losses = losses * config.loss_scaler.get_scale(config.batch_size, config.gradient_accumulation_steps)
