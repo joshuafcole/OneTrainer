@@ -72,9 +72,16 @@ class CounterexampleStats:
     ``gate_mean`` is the load-bearing one (see the module docstring): it is the
     mean of ``sigmoid(beta * delta)``, the per-row multiplier on the repulsion
     gradient, so it says directly how much of the term is live. ``saturated``
-    is its blunt companion -- the fraction of rows already on the correct side
-    of the reference, which is what "the job is done" and "the reference was
-    never the right anchor" both look like from the outside.
+    is its blunt companion -- the fraction of rows strictly past the reference,
+    which is what "the job is done" and "the reference was never the right
+    anchor" both look like from the outside.
+
+    Strictly past, and the strictness is load-bearing: a LoRA starts at zero, so
+    on the first step of every cold run ``delta`` is *exactly* 0 for every row.
+    Counting that as saturated would make ``saturated_fraction`` read 1.0 -- "all
+    done" -- at the one moment nothing has happened yet, on every run, regardless
+    of outcome. A row sitting exactly on the reference is not past it; its gate
+    says so too, at 0.5.
     """
 
     rows: int
@@ -122,7 +129,7 @@ def counterexample_stats(delta: Tensor, losses: Tensor, beta: float) -> Countere
         rows=int(detached.numel()),
         delta_sum=float(detached.sum().item()),
         gate_sum=float(torch.sigmoid(beta * detached).sum().item()),
-        saturated=int((detached <= 0).sum().item()),
+        saturated=int((detached < 0).sum().item()),
         loss_sum=float(losses.detach().to(dtype=torch.float32).sum().item()),
     )
 

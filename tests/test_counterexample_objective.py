@@ -128,10 +128,30 @@ def test_stats_report_the_live_fraction():
     stats = counterexample_stats(delta, losses, BETA)
 
     assert stats.rows == 4
-    assert math.isclose(stats.saturated_fraction, 0.75)  # <= 0: the two zeros + the -100
+    # Strictly < 0, so only the -100. The two zeros are the state a cold LoRA is
+    # in on step 0 -- counting them would report "all saturated" before the run
+    # has done anything. See test_a_cold_start_reports_nothing_saturated.
+    assert math.isclose(stats.saturated_fraction, 0.25)
     # gate = sigmoid(beta*delta) -> [0.5, ~0, ~1, 0.5]
     assert math.isclose(stats.gate_mean, 0.5, abs_tol=1e-4)
     assert math.isclose(stats.delta_mean, 0.0, abs_tol=1e-6)
+
+
+def test_a_cold_start_reports_nothing_saturated():
+    """A LoRA starts at zero, so step 0 has `delta == 0` for every row exactly.
+
+    That is the least-informative moment of the run, and `saturated_fraction`
+    must not describe it as the most-finished one. Caught on the first real
+    training run: `gate_first` correctly read 0.50 while `saturated_first` read
+    1.00, two readouts of the same step disagreeing about whether anything had
+    happened.
+    """
+    delta = torch.zeros(4)
+    losses = counterexample_losses(torch.zeros(4), delta, BETA)
+    stats = counterexample_stats(delta, losses, BETA)
+
+    assert stats.saturated_fraction == 0.0
+    assert math.isclose(stats.gate_mean, 0.5)
 
 
 def test_telemetry_accumulates_across_micro_steps_and_drains():
