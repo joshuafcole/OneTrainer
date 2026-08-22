@@ -91,6 +91,14 @@ BETA_BOUNDS = (1.0, 1.0e9)
 # width. A quarter on each side leaves the middle half of the band at full
 # strength, so a band always has a plateau and never degenerates into a spike.
 BAND_EDGE_FRACTION = 0.25
+# Below this dose the band has narrowed the term nearly out of existence.
+# Mirrors `STARVED` in the studio agent's readout, which reports the *measured*
+# dose; this one guards the forecast.
+STARVED_DOSE = 0.1
+# Timesteps drawn to estimate the dose. Large enough that the estimate's own
+# error (~0.2% on a fraction near 0.5) is far below any decision it informs, and
+# cheap enough to pay once per run.
+DOSE_SAMPLES = 50_000
 
 
 def counterexample_losses(distance: Tensor, reference_distance: Tensor, beta: float) -> Tensor:
@@ -145,6 +153,35 @@ def counterexample_weight(step: int, total_steps: int, ramp: float) -> float:
     if step >= window:
         return 1.0
     return 0.5 * (1.0 - math.cos(math.pi * max(0, step) / window))
+
+
+def noise_level_from_snr(snr: Tensor) -> Tensor:
+    """``u = 1 / (1 + sqrt(SNR))`` -- the fraction of the noised latent's
+    amplitude that is noise, in ``[0, 1]``.
+
+    The one coordinate a noise band means the same thing in on every model
+    family. For a variance-preserving schedule
+    ``x_t = sqrt(a_bar) x_0 + sqrt(1 - a_bar) eps``, so it is exactly
+    ``sqrt(1 - a_bar) / (sqrt(a_bar) + sqrt(1 - a_bar))``. For a rectified flow
+    ``x_t = (1 - sigma) x_0 + sigma eps`` gives ``SNR = ((1-sigma)/sigma)^2``, and
+    the same expression collapses to ``sigma`` itself.
+
+    Lives here rather than on the loss mixin so the objective and the dose
+    forecast cannot drift apart: a forecast computed by a second copy of this
+    formula would keep reporting the old answer after the first one changed.
+    """
+    return 1.0 / (1.0 + snr.clamp(min=0.0).sqrt())
+
+
+def band_dose(noise_level: Tensor, low: float, high: float) -> float:
+    """Expected :func:`noise_band_weight` over a sample of noise levels.
+
+    The band's **dose**: the fraction of the repulsion a run will actually
+    deliver. Estimated by pushing a large sample of timesteps -- drawn through
+    the run's *real* sampler, not a model of it -- through the same band
+    function the loss uses.
+    """
+    return float(noise_band_weight(noise_level, low, high).mean().item())
 
 
 def _smooth_edge(x: Tensor) -> Tensor:

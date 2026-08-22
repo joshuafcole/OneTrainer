@@ -6,12 +6,16 @@ from modules.util.DiffusionScheduleCoefficients import DiffusionScheduleCoeffici
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.LossWeight import LossWeight
 from modules.util.loss.counterexample_loss import (
+    DOSE_SAMPLES,
     SCHEDULE,
+    STARVED_DOSE,
     TELEMETRY,
+    band_dose,
     counterexample_losses,
     counterexample_stats,
     counterexample_weight,
     noise_band_weight,
+    noise_level_from_snr,
 )
 from modules.util.loss.masked_loss import masked_losses, masked_losses_with_prior
 from modules.util.loss.vb_loss import vb_losses
@@ -31,6 +35,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.__coefficients = None
         self.__alphas_cumprod_fun = None
         self.__sigmas = None
+        self.__band_forecast_done = False
 
     def __log_cosh_loss(
             self,
@@ -310,6 +315,14 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 row_noise, config.counterexample_band_low, config.counterexample_band_high
             )
         )
+        # Forecast the dose here rather than before the loop: this is the first
+        # moment the schedule AND the resolved timestep shift both exist. It costs
+        # one 50k draw, once, and only on a run that has both a band and a
+        # counterexample concept -- the only run it could tell anything.
+        if band is not None and not self.__band_forecast_done:
+            self.__band_forecast_done = True
+            if config.counterexample_band_low > 0.0 or config.counterexample_band_high < 1.0:
+                self.__forecast_band_dose(config, losses.device)
         SCHEDULE.observe(delta, band)
 
         # Recorded BEFORE the ramp weight, deliberately: `gate_mean` has to keep
@@ -350,8 +363,94 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         not how the network is asked to parameterize it, so unlike
         ``__min_snr_weight`` there is no v-prediction correction here.
         """
-        snr = self.__snr(timesteps, device)
-        return 1.0 / (1.0 + snr.clamp(min=0.0).sqrt())
+        return noise_level_from_snr(self.__snr(timesteps, device))
+
+    def __noise_level_for(self, timesteps: Tensor, device: torch.device) -> Tensor | None:
+        """``u`` for arbitrary timesteps, from whichever schedule this setup was
+        given.
+
+        Not a new branch: ``__sigmas`` is set only by ``_flow_matching_losses``
+        and ``__coefficients`` only by ``_diffusion_losses``, so "which one is
+        populated" *is* how the run already identifies its own family. Returns
+        ``None`` when neither is -- a continuous-timestep model (Wuerstchen
+        supplies an ``alphas_cumprod_fun`` and samples with
+        ``_get_timestep_continuous``) has no discrete schedule to sample over,
+        and a forecast built on a made-up one would be worse than no forecast.
+        """
+        if self.__sigmas is not None:
+            return self.__sigmas[timesteps].to(device=device)
+        if self.__coefficients is not None:
+            return self.__noise_level_from_snr(timesteps, device)
+        return None
+
+    def __forecast_band_dose(self, config: TrainConfig, device: torch.device) -> None:
+        """Say, once, how much of the repulsion this band will actually deliver.
+
+        The band is model-agnostic; **the dose is not**. ``timestep_shift`` skews
+        where samples land, so an identical band delivers 0.57 of the term on
+        SD 1.5 and 0.22 on a flow model at shift 7.51 -- a 3x spread that also
+        varies *within* a family with resolution, since
+        ``model.calculate_timestep_shift`` reads the training size. So this is
+        derived per run rather than tabulated per family, the same way that
+        method is.
+
+        Estimated by drawing through ``_get_timestep_discrete`` itself -- the run's
+        real sampler, with its real distribution and its real shift -- rather than
+        by modelling it. A model of the sampler would be a second implementation
+        of eight distribution branches, and it would go stale silently.
+        """
+        # A *discrete* schedule is what makes the forecast possible: it is what
+        # `_get_timestep_discrete` samples over. A model that has only an
+        # `alphas_cumprod_fun` (Wuerstchen) samples with
+        # `_get_timestep_continuous` instead, so there is nothing to draw from
+        # and no length to draw it over. The band itself still works there --
+        # `__noise_level_from_snr` handles that path fine -- only the forecast is
+        # skipped, and it is skipped rather than approximated.
+        if self.__sigmas is not None:
+            length = self.__sigmas.shape[0]
+        elif self.__coefficients is not None:
+            length = self.__coefficients.sqrt_alphas_cumprod.shape[0]
+        else:
+            return
+        # A FRESH generator, never the training one: drawing 50k samples from the
+        # run's own generator would advance its state and change every subsequent
+        # noise draw, so a diagnostic would silently make runs unreproducible.
+        generator = torch.Generator(device=device)
+        generator.manual_seed(0)
+        timesteps = self._get_timestep_discrete(
+            num_train_timesteps=length,
+            deterministic=False,
+            generator=generator,
+            batch_size=DOSE_SAMPLES,
+            config=config,
+            shift=self._last_timestep_shift,
+        )
+        noise_level = self.__noise_level_for(timesteps.long(), device)
+        if noise_level is None:
+            return
+
+        low, high = config.counterexample_band_low, config.counterexample_band_high
+        dose = band_dose(noise_level, low, high)
+        shift = self._last_timestep_shift
+        print(
+            f"counterexample: band [{low:.2f}, {high:.2f}] in u, timestep_shift {shift:.2f}"
+            f" -> expected dose (band_pass) ~{dose:.2f}"
+        )
+        if dose <= 0.0:
+            print(
+                "counterexample: WARNING this band passes no timesteps at all -- the "
+                "repulsion will not train anything. Widen it."
+            )
+        elif dose < STARVED_DOSE:
+            print(
+                f"counterexample: WARNING a dose of {dose:.2f} is starvation -- the rows "
+                "that do pass will look perfectly healthy and the gate will not report it."
+            )
+        else:
+            print(
+                f"counterexample: to match an unbanded arm's dose, multiply the concept's "
+                f"loss_weight by {1.0 / dose:.2f}"
+            )
 
     def __snr(self, timesteps: Tensor, device: torch.device) -> Tensor:
         if self.__coefficients:

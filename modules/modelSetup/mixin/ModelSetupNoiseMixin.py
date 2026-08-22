@@ -16,6 +16,14 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
 
         self.__weights = None
         self._offset_noise_psi_schedule: Tensor | None = None
+        # The shift `_get_timestep_discrete` last resolved. Recorded rather than
+        # re-derived because under `dynamic_timestep_shifting` it comes from
+        # `model.calculate_timestep_shift(h, w)` -- a per-family method that
+        # reads the scheduler's own base/max shift and depends on the training
+        # resolution, so nothing downstream can reconstruct it from the config
+        # alone. Anything that needs to reason about *where on the schedule*
+        # this run samples has to read it from here.
+        self._last_timestep_shift: float | None = None
 
     def _compute_and_cache_offset_noise_psi_schedule(self, betas: Tensor) -> Tensor:
         """
@@ -130,6 +138,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
     ) -> Tensor:
         if shift is None:
             shift = config.timestep_shift
+        self._last_timestep_shift = shift
 
         if deterministic:
             # -1 is for zero-based indexing

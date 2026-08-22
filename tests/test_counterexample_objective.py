@@ -15,6 +15,8 @@ reference raises instead of silently training the model toward the wrong image.
 ``python tests/test_counterexample_objective.py`` or pytest.
 """
 
+import contextlib
+import io
 import math
 import os
 import sys
@@ -35,6 +37,9 @@ sys.modules["modules.util.quantization_util"] = _stub
 from modules.modelSetup.mixin.ModelSetupDiffusionLossMixin import (  # noqa: E402
     ModelSetupDiffusionLossMixin,
 )
+from modules.modelSetup.mixin.ModelSetupNoiseMixin import (  # noqa: E402
+    ModelSetupNoiseMixin,
+)
 from modules.module.LoRAModule import LoRAModule  # noqa: E402
 from modules.util.config.TrainConfig import TrainConfig  # noqa: E402
 from modules.util.enum.ConceptType import ConceptType  # noqa: E402
@@ -47,10 +52,12 @@ from modules.util.loss.counterexample_loss import (  # noqa: E402
     TELEMETRY,
     CounterexampleSchedule,
     CounterexampleTelemetry,
+    band_dose,
     counterexample_losses,
     counterexample_stats,
     counterexample_weight,
     noise_band_weight,
+    noise_level_from_snr,
     ramp_steps,
 )
 
@@ -333,6 +340,95 @@ def test_the_ramp_scales_the_counterexample_row_and_only_that_row():
     assert math.isclose(losses[1].item(), (2.0 / BETA) * math.log(2.0), rel_tol=1e-5)
 
 
+def _run_banded(*, low, high, timestep=499, mixin=None):
+    """One flow-matching step with a counterexample row, returning the mixin (so a
+    caller can reuse it for a second step) and whatever the run printed."""
+    batch, data = _batch_and_data([ConceptType.COUNTEREXAMPLE])
+    data["timestep"] = torch.tensor([timestep])
+    mixin = mixin or _Mixin()
+    config = _config(
+        batch_size=1, counterexample_band_low=low, counterexample_band_high=high
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        mixin._flow_matching_losses(
+            batch, data, config, torch.device("cpu"), sigmas=torch.zeros(1000)
+        )
+    return mixin, out.getvalue()
+
+
+def test_the_dose_forecast_fires_once_and_only_for_a_banded_run():
+    """The band is model-agnostic; the DOSE is not, so a run has to be told what
+    its band will actually deliver *before* the numbers come back. But only when
+    there is a band -- an unbanded run passes everything and has nothing to say."""
+    TELEMETRY.reset()
+    _, quiet = _run_banded(low=0.0, high=1.0)
+    assert quiet == ""
+
+    TELEMETRY.reset()
+    mixin, first = _run_banded(low=0.0, high=0.5)
+    assert "expected dose" in first
+    assert "loss_weight by" in first        # the remedy, not just the diagnosis
+
+    # ...and exactly once, not every step for the rest of the run.
+    TELEMETRY.reset()
+    _, second = _run_banded(low=0.0, high=0.5, mixin=mixin)
+    assert second == ""
+
+
+def test_a_starving_band_is_called_starvation_not_reported_as_a_dose():
+    """The failure the forecast exists for: a band this narrow leaves the rows
+    that *do* pass behaving perfectly normally, so nothing downstream reports
+    it."""
+    TELEMETRY.reset()
+    _, out = _run_banded(low=0.0, high=0.02, timestep=5)
+    assert "WARNING" in out and "starvation" in out
+
+
+def test_the_dose_forecast_does_not_disturb_the_training_generator():
+    """A diagnostic that draws 50,000 samples from the run's own generator would
+    advance its state and change every later noise draw -- making runs silently
+    unreproducible in exchange for a log line. It uses a fresh, fixed-seed one."""
+    config = _config(batch_size=1, counterexample_band_low=0.0, counterexample_band_high=0.5)
+
+    def draw(mixin, generator):
+        return mixin._get_timestep_discrete(1000, False, generator, 4, config).tolist()
+
+    baseline_gen = torch.Generator(device="cpu")
+    baseline_gen.manual_seed(1234)
+    baseline = draw(_Mixin(), baseline_gen)
+
+    mixin = _Mixin()
+    live_gen = torch.Generator(device="cpu")
+    live_gen.manual_seed(1234)
+    TELEMETRY.reset()
+    _run_banded(low=0.0, high=0.5, mixin=mixin)
+    assert draw(mixin, live_gen) == baseline
+
+
+def test_the_dose_is_the_mean_band_weight_over_the_sampled_schedule():
+    """`band_dose` is the number the forecast reports and the number
+    `counterexample/band_pass` measures. Checked against a schedule whose answer
+    is known in closed form: for a rectified flow u IS sigma, so a uniform draw
+    over the schedule puts a [0, 0.5] band's dose at the band function's own mean
+    over [0, 1]."""
+    u = torch.linspace(0.0, 1.0, 100_001)
+    dose = band_dose(u, 0.0, 0.5)
+    assert math.isclose(dose, noise_band_weight(u, 0.0, 0.5).mean().item(), rel_tol=1e-9)
+    # 0.375 at full strength + a raised-cosine edge over [0.375, 0.5], which
+    # integrates to half its width.
+    assert math.isclose(dose, 0.375 + 0.5 * 0.125, abs_tol=1e-3)
+
+
+def test_the_coordinate_has_exactly_one_implementation():
+    """The forecast and the objective must not be able to disagree about what u
+    is. They call the same function; this pins that it is the published one."""
+    snr = torch.tensor([((1 - s) / s) ** 2 for s in (0.1, 0.35, 0.5, 0.8)])
+    assert torch.allclose(
+        noise_level_from_snr(snr), torch.tensor([0.1, 0.35, 0.5, 0.8]), atol=1e-6
+    )
+
+
 def test_telemetry_accumulates_across_micro_steps_and_drains():
     """Gradient accumulation calls the loss several times per optimizer step, so
     the readout must sum the window and then reset -- otherwise the first logged
@@ -492,8 +588,11 @@ def test_an_unbanded_run_reports_a_full_dose():
 # ---------------------------------------------------------------------------
 
 
-class _Mixin(ModelSetupDiffusionLossMixin):
-    pass
+class _Mixin(ModelSetupDiffusionLossMixin, ModelSetupNoiseMixin):
+    """Both mixins, because every real ``Base*Setup`` has both and the dose
+    forecast genuinely reaches across: it draws through the noise mixin's
+    ``_get_timestep_discrete`` rather than modelling the sampler. A harness with
+    only the loss half would be testing a class that does not exist."""
 
 
 def _config(**overrides) -> TrainConfig:

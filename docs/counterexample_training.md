@@ -144,6 +144,38 @@ literature reaches the same place from the other side:
 all steps, with the high-noise 30% producing "severe structural collapse" (FID
 69.7) when intervened on. In `u`, that 70% is roughly `u <= 0.77` on SD 1.5.
 
+**The band is model-agnostic; the DOSE is not.** `timestep_shift` skews where
+samples land, so the *same* band delivers very different amounts of the term:
+
+| sampling | mean `u` | `band_pass` for `[0, 0.77]` |
+|---|---|---|
+| SD 1.5 (VP, uniform `t`) | 0.594 | 0.573 |
+| rectified flow, shift 1.0 | 0.501 | 0.673 |
+| flow, shift 1.88 — Anima @ 512 | 0.605 | 0.524 |
+| flow, shift 3.16 — @ 1024 | 0.685 | 0.396 |
+| flow, shift 7.51 — @ 1536 | 0.798 | 0.217 |
+
+A 3× spread on one setting — and it varies *within* a family with resolution,
+because `model.calculate_timestep_shift(h, w)` reads the training size. So there
+is no per-family constant to tabulate; the dose has to be derived per run.
+
+**It is.** The first counterexample batch of a banded run prints:
+
+```
+counterexample: band [0.00, 0.50] in u, timestep_shift 1.00 -> expected dose (band_pass) ~0.28
+counterexample: to match an unbanded arm's dose, multiply the concept's loss_weight by 3.53
+```
+
+The estimate draws 50,000 timesteps through `_get_timestep_discrete` — the run's
+*real* sampler, with its real distribution and its real resolved shift — rather
+than modelling it, so it cannot go stale against the eight distribution branches.
+It uses a fresh fixed-seed generator, never the training one. A band that
+starves the term (dose below 0.1) is called out as starvation rather than
+reported as a number, because nothing downstream can see it: the rows that do
+pass behave perfectly normally. Skipped, not approximated, on a model with no
+discrete schedule (Wuerstchen samples continuously); the band itself still works
+there.
+
 **⚠️ Narrowing the band reduces the DOSE.** A band that passes 40% of rows
 delivers 40% of the repulsion. `counterexample/band_pass` reports the fraction,
 and two arms of an A/B with different bands are not the same treatment at the
