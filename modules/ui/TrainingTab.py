@@ -1237,11 +1237,11 @@ class TrainingTab:
             0,
             "Counterexample Beta",
             tooltip=(
-                "Sharpness of the bounded repulsion applied to COUNTEREXAMPLE concepts. "
-                "Larger values switch the term off sooner once the adapter is worse than the "
-                "frozen reference on the bad image. Read counterexample/gate_mean off a short "
-                "run: ~1.0 means beta is too small to ever switch off, ~0.0 means the term is "
-                "inert. No effect unless a concept has type COUNTEREXAMPLE."
+                "0 = solve it from this run's own delta (recommended). Otherwise, the delta "
+                "SCALE at which the bounded repulsion switches off -- not a strength knob: at "
+                "delta == 0, where every cold LoRA starts, the slope is 1.0 for every beta. Use "
+                "Counterexample Ramp to start gentle. No effect unless a concept has type "
+                "COUNTEREXAMPLE."
             ),
         )
         components.entry(
@@ -1250,7 +1250,33 @@ class TrainingTab:
             1,
             self.ui_state,
             "counterexample_beta",
-            extra_validate=check_range(lower=1e-6, message="Counterexample beta must be positive"),
+            extra_validate=check_range(
+                lower=0.0, message="Counterexample beta must be 0 (auto) or positive"
+            ),
+        )
+        row += 1
+
+        # Counterexample Ramp
+        components.label(
+            frame,
+            row,
+            0,
+            "Counterexample Ramp",
+            tooltip=(
+                "How long the counterexample term takes to reach full strength, independent of "
+                "the positives. A fraction of the run (0-1) or a literal step count (>1); 0 "
+                "disables it. 1.0 arrives at full strength on the last step, so the term is "
+                "weakest while the adapter still knows nothing and strongest during the LR "
+                "anneal. Also the window beta is calibrated over."
+            ),
+        )
+        components.entry(
+            frame,
+            row,
+            1,
+            self.ui_state,
+            "counterexample_ramp",
+            extra_validate=check_range(lower=0.0, message="Counterexample ramp must be >= 0"),
         )
         row += 1
 

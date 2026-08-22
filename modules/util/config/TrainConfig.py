@@ -514,11 +514,26 @@ class TrainConfig(BaseConfig):
     normalize_masked_area_loss: bool
     masked_prior_preservation_weight: float
 
-    # counterexample training (ConceptType.COUNTEREXAMPLE). beta sets where the
-    # bounded repulsion switches off; see modules/util/loss/counterexample_loss.py
-    # for why the useful range is hundreds-to-thousands, and read `gate_mean` off
-    # a short run rather than guessing it twice.
+    # counterexample training (ConceptType.COUNTEREXAMPLE). beta sets the delta
+    # SCALE at which the bounded repulsion switches off -- it is not a strength
+    # knob (at delta == 0, where every cold LoRA starts, the slope is 1.0 for
+    # every beta). 0 means "solve it from this run's own delta", which is the
+    # recommendation: a measured SD 1.5 LoRA wanted ~31,500, not the 1000 that
+    # Diffusion-DPO's convention suggests, and |delta| grows as training runs.
     counterexample_beta: float
+    # Timing, independent of the positives': the fraction of the run (or, above 1,
+    # the literal step count) over which the counterexample term eases from 0 to
+    # full strength. 0 disables the ramp. Doubles as the beta calibration window.
+    #
+    # Default 0.25 rather than 1.0, and the difference is a real trade, not a
+    # detail: a cosine ramp across the WHOLE run delivers half the total repulsion
+    # (mean strength 0.50 vs 0.87 at 0.25). That is the right shape for "strongest
+    # during the LR anneal", but as a *default* it would halve the treatment in an
+    # A/B and could report a real effect as a null. 0.25 removes the cold-start
+    # push -- repelling before the adapter has learned anything -- and still runs
+    # three quarters of training at full strength. Set 1.0 deliberately when the
+    # goal is to concentrate the correction into the anneal.
+    counterexample_ramp: float
 
     # custom conditioning image
     custom_conditioning_image: bool
@@ -1196,7 +1211,8 @@ class TrainConfig(BaseConfig):
         data.append(("masked_prior_preservation_weight", 0.0, float, False))
 
         # counterexample training
-        data.append(("counterexample_beta", 1000.0, float, False))
+        data.append(("counterexample_beta", 0.0, float, False))
+        data.append(("counterexample_ramp", 0.25, float, False))
 
         data.append(("custom_conditioning_image", False, bool, False))
 

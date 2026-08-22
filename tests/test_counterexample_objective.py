@@ -39,10 +39,18 @@ from modules.module.LoRAModule import LoRAModule  # noqa: E402
 from modules.util.config.TrainConfig import TrainConfig  # noqa: E402
 from modules.util.enum.ConceptType import ConceptType  # noqa: E402
 from modules.util.loss.counterexample_loss import (  # noqa: E402
+    BETA_BOUNDS,
+    BOOTSTRAP_BETA,
+    CALIBRATION_TARGET_GATE,
+    DEFAULT_CALIBRATION_STEPS,
+    MIN_CALIBRATION_STEPS,
     TELEMETRY,
+    CounterexampleSchedule,
     CounterexampleTelemetry,
     counterexample_losses,
     counterexample_stats,
+    counterexample_weight,
+    ramp_steps,
 )
 
 BETA = 4.0
@@ -154,6 +162,176 @@ def test_a_cold_start_reports_nothing_saturated():
     assert math.isclose(stats.gate_mean, 0.5)
 
 
+def test_beta_cannot_ramp_strength_but_the_ramp_can():
+    """The correction that motivated `counterexample_ramp` existing at all.
+
+    "Ramp beta up so the term starts gentle" is the intuitive move and it does not
+    work: `dL/dDelta = 2*sigmoid(beta*delta)`, so at `delta == 0` -- exactly where
+    every cold LoRA starts -- the slope is 1.0 for EVERY beta. Ramping beta is in
+    fact an anti-ramp, moving the term from never-switches-off to sharply-bounded.
+    """
+    for beta in (1.0, 100.0, 1_000.0, 31_500.0, 1_000_000.0):
+        d = torch.tensor([1.0], requires_grad=True)
+        counterexample_losses(d, torch.tensor([1.0]), beta).sum().backward()
+        assert math.isclose(-float(d.grad), 1.0, rel_tol=1e-6)
+
+    # The weight, by contrast, is a strength knob and starts at exactly zero.
+    assert counterexample_weight(0, 100, ramp=1.0) == 0.0
+    assert counterexample_weight(100, 100, ramp=1.0) == 1.0
+
+
+def test_the_ramp_arrives_at_full_strength_at_the_end():
+    """`ramp = 1.0` means "strongest during the LR anneal" -- the whole request."""
+    total = 200
+    weights = [counterexample_weight(s, total, ramp=1.0) for s in range(total + 1)]
+
+    assert weights[0] == 0.0
+    assert math.isclose(weights[-1], 1.0, abs_tol=1e-9)
+    assert weights == sorted(weights)  # monotonic, never overshoots
+    assert math.isclose(weights[total // 2], 0.5, abs_tol=1e-6)  # raised cosine
+    # Leaves 0 and arrives at 1 with (near) zero slope -- "calm", not linear.
+    assert weights[1] < 0.5 / total
+    assert (1.0 - weights[-2]) < 0.5 / total
+
+
+def test_the_ramp_follows_onetrainers_warmup_convention():
+    """Fractions in (0, 1], literal steps above 1, 0 disables -- the same rule
+    `learning_rate_warmup_steps` already uses, so there is one to learn."""
+    assert ramp_steps(0.0, 500) == 0
+    assert ramp_steps(0.25, 500) == 125
+    assert ramp_steps(1.0, 500) == 500
+    assert ramp_steps(50, 500) == 50
+    assert counterexample_weight(3, 500, ramp=0.0) == 1.0  # disabled: full at once
+
+
+def test_an_explicit_beta_is_never_overridden():
+    schedule = CounterexampleSchedule()
+    schedule.observe(torch.tensor([1e-5, 2e-5]))
+    assert schedule.beta(configured=777.0, step=0, total_steps=100) == 777.0
+
+
+def test_auto_beta_solves_for_this_runs_delta_and_then_freezes():
+    """`counterexample_beta = 0` reads the scale off the run instead of a constant.
+
+    Measured motivation: beta=1000 on a real SD 1.5 LoRA gave `beta*|delta| ~
+    0.015` and wanted ~31,500, and |delta| grows 21x within a single short run --
+    so no published constant can be right for every model and stage.
+
+    Frozen after the window, not tracked: a beta that kept chasing |delta| would
+    pin the gate forever and destroy the switch-off the bound exists for.
+    """
+    schedule = CounterexampleSchedule()
+    # Nothing observed yet (step 0 is delta == 0 exactly) -> bootstrap, not a crash.
+    assert schedule.beta(configured=0.0, step=99, total_steps=100) == BOOTSTRAP_BETA
+
+    for _ in range(MIN_CALIBRATION_STEPS):
+        schedule.observe(torch.tensor([1e-5, -1e-5]))  # |delta| = 1e-5
+    beta = schedule.beta(configured=0.0, step=99, total_steps=100)
+
+    # sigmoid(beta * 1e-5) should sit on the calibration target.
+    assert math.isclose(1 / (1 + math.exp(-beta * 1e-5)), CALIBRATION_TARGET_GATE, rel_tol=1e-6)
+
+    # Window is over, so later (larger) deltas must not move it.
+    schedule.observe(torch.tensor([1.0]))
+    assert schedule.beta(configured=0.0, step=99, total_steps=100) == beta
+
+
+def test_beta_is_stable_through_the_calibration_window():
+    """Regression, from a real run: the provisional solve swung 30x mid-window.
+
+    The solve is `logit / mean|delta|`, and a cold LoRA's first deltas are ~0, so
+    using it before the window closed produced beta = 15,000,000 at step 6 decaying
+    to 400,000 by step 20 -- the objective's own scale thrashing while training.
+    It went unnoticed because the ramp had the weight near 0 throughout; with
+    `counterexample_ramp = 0` it would have run at full strength.
+
+    So beta must hold ONE value for the whole window and change exactly once.
+    """
+    schedule = CounterexampleSchedule()
+    seen = []
+    for i in range(MIN_CALIBRATION_STEPS):
+        # Deltas growing from ~0, which is what made the provisional solve explode.
+        schedule.observe(torch.tensor([1e-12 * (i + 1)]))
+        seen.append(schedule.beta(configured=0.0, step=i, total_steps=1000))
+
+    assert seen == [BOOTSTRAP_BETA] * MIN_CALIBRATION_STEPS
+    assert len(set(seen)) == 1
+
+
+def test_the_calibration_window_does_not_follow_a_long_ramp():
+    """Tying beta's window to the ramp degenerates at `counterexample_ramp = 1.0`:
+    it would close on the last step, calibrating beta exactly as the run ends. So
+    the window is its own fraction of the run -- which at the 0.25 ramp default
+    happens to coincide anyway -- and floored for short runs."""
+    schedule = CounterexampleSchedule()
+
+    assert schedule.calibration_steps(total_steps=1000) == 250   # 25% of the run
+    assert schedule.calibration_steps(total_steps=4) == MIN_CALIBRATION_STEPS
+    assert schedule.calibration_steps(total_steps=0) == DEFAULT_CALIBRATION_STEPS
+
+
+def test_the_window_closes_on_training_steps_not_observed_ones():
+    """Regression, from a real run where auto-beta silently never engaged.
+
+    The window was sized in training steps but counted in *observed* ones. Batches
+    that hold no counterexample row observe nothing, so with batch 2 and two
+    concepts ~25% of steps never counted: `observed` trailed `step` forever, the
+    window never closed, and the run trained its whole life on the bootstrap beta
+    -- indistinguishable, from outside, from an explicitly configured 1000.
+    """
+    schedule = CounterexampleSchedule()
+    total = 48
+    window = schedule.calibration_steps(total)
+
+    # Three quarters of steps carry a row, as in the run that exposed this.
+    for step in range(total):
+        if step % 4:
+            schedule.observe(torch.tensor([1e-5]))
+        beta = schedule.beta(configured=0.0, step=step, total_steps=total)
+
+    assert schedule._observed_steps < total     # observations trail the steps...
+    assert beta != BOOTSTRAP_BETA               # ...and beta calibrated regardless
+    assert math.isclose(1 / (1 + math.exp(-beta * 1e-5)), CALIBRATION_TARGET_GATE, rel_tol=1e-6)
+
+    # It still refuses to solve from nothing: a run with almost no rows holds.
+    starved = CounterexampleSchedule()
+    starved.observe(torch.tensor([1e-5]))
+    assert starved.beta(configured=0.0, step=window + 5, total_steps=total) == BOOTSTRAP_BETA
+
+
+def test_auto_beta_is_clamped_off_a_denormal_delta():
+    """The first steps after zero can produce a |delta| whose reciprocal is not a
+    hyperparameter."""
+    schedule = CounterexampleSchedule()
+    schedule.observe(torch.tensor([1e-30]))
+    assert schedule.beta(configured=0.0, step=99, total_steps=10) <= BETA_BOUNDS[1]
+
+
+def test_the_ramp_scales_the_counterexample_row_and_only_that_row():
+    """The point of a separate schedule: counterexample *timing* independent of
+    the positives'. At the start of the ramp the wrong image contributes nothing,
+    while the positive beside it trains at full strength as usual."""
+    TELEMETRY.reset()
+    types_ = [ConceptType.STANDARD, ConceptType.COUNTEREXAMPLE]
+    batch, data = _batch_and_data(types_)
+    data["counterexample_step"] = 0  # start of the ramp -> weight == 0
+    data["counterexample_total_steps"] = 100
+    config = _config(counterexample_ramp=1.0)
+
+    losses = _Mixin()._flow_matching_losses(batch, data, config, torch.device("cpu"))
+
+    assert losses[1].item() == 0.0                        # ramped fully out
+    assert math.isclose(losses[0].item(), 1.0, rel_tol=1e-6)  # positive untouched
+
+    # ...and at the end of the ramp the same row carries the full step-0 value.
+    TELEMETRY.reset()
+    batch, data = _batch_and_data(types_)
+    data["counterexample_step"] = 100
+    data["counterexample_total_steps"] = 100
+    losses = _Mixin()._flow_matching_losses(batch, data, config, torch.device("cpu"))
+    assert math.isclose(losses[1].item(), (2.0 / BETA) * math.log(2.0), rel_tol=1e-5)
+
+
 def test_telemetry_accumulates_across_micro_steps_and_drains():
     """Gradient accumulation calls the loss several times per optimizer step, so
     the readout must sum the window and then reset -- otherwise the first logged
@@ -165,11 +343,11 @@ def test_telemetry_accumulates_across_micro_steps_and_drains():
     telemetry.record(counterexample_stats(delta, losses, BETA))
     telemetry.record(counterexample_stats(delta, losses, BETA))
 
-    taken = telemetry.take()
+    taken = telemetry.take().stats
     assert taken.rows == 4
     assert math.isclose(taken.saturated_fraction, 0.5)
 
-    assert telemetry.take().rows == 0
+    assert telemetry.take().stats.rows == 0
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +405,7 @@ def test_only_the_counterexample_row_is_replaced():
     assert math.isclose(losses[0].item(), 1.0, rel_tol=1e-6)
     assert math.isclose(losses[2].item(), 1.0, rel_tol=1e-6)
 
-    stats = TELEMETRY.take()
+    stats = TELEMETRY.take().stats
     assert stats.rows == 1
 
 
@@ -242,7 +420,7 @@ def test_the_epsilon_prediction_path_routes_it_too():
 
     assert math.isclose(losses[0].item(), 1.0, rel_tol=1e-6)
     assert math.isclose(losses[1].item(), (2.0 / BETA) * math.log(2.0), rel_tol=1e-5)
-    assert TELEMETRY.take().rows == 1
+    assert TELEMETRY.take().stats.rows == 1
 
 
 def test_the_concepts_own_loss_weight_still_ramps_it():
@@ -280,7 +458,7 @@ def test_the_ga_estimation_pass_can_opt_out_explicitly():
     losses = _Mixin()._flow_matching_losses(batch, data, _config(batch_size=1), torch.device("cpu"))
 
     assert math.isclose(losses[0].item(), 1.0, rel_tol=1e-6)
-    assert TELEMETRY.take().rows == 0
+    assert TELEMETRY.take().stats.rows == 0
 
 
 def test_an_identical_reference_gives_delta_exactly_zero():
@@ -293,7 +471,7 @@ def test_an_identical_reference_gives_delta_exactly_zero():
     data["prior_target"] = data["predicted"].detach().clone()
     _Mixin()._flow_matching_losses(batch, data, _config(batch_size=1), torch.device("cpu"))
 
-    stats = TELEMETRY.take()
+    stats = TELEMETRY.take().stats
     assert stats.delta_mean == 0.0
     assert math.isclose(stats.gate_mean, 0.5)
 
@@ -312,14 +490,14 @@ def test_masked_training_uses_the_same_metric_on_both_sides():
 
     unmasked = _config(batch_size=1)
     _Mixin()._flow_matching_losses(batch, data, unmasked, torch.device("cpu"))
-    assert math.isclose(TELEMETRY.take().delta_mean, 3.0, rel_tol=1e-6)
+    assert math.isclose(TELEMETRY.take().stats.delta_mean, 3.0, rel_tol=1e-6)
 
     # Everything outside the mask, weighted 0.5: both distances halve, so delta
     # halves. A mask applied to only one side would have given 3.5 or 2.5.
     batch["latent_mask"] = torch.zeros((1, 2, 2, 2))
     masked = _config(batch_size=1, masked_training=True, unmasked_weight=0.5)
     _Mixin()._flow_matching_losses(batch, data, masked, torch.device("cpu"))
-    assert math.isclose(TELEMETRY.take().delta_mean, 1.5, rel_tol=1e-6)
+    assert math.isclose(TELEMETRY.take().stats.delta_mean, 1.5, rel_tol=1e-6)
 
 
 # ---------------------------------------------------------------------------

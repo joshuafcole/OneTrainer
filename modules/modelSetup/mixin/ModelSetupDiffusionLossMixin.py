@@ -6,9 +6,11 @@ from modules.util.DiffusionScheduleCoefficients import DiffusionScheduleCoeffici
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.LossWeight import LossWeight
 from modules.util.loss.counterexample_loss import (
+    SCHEDULE,
     TELEMETRY,
     counterexample_losses,
     counterexample_stats,
+    counterexample_weight,
 )
 from modules.util.loss.masked_loss import masked_losses, masked_losses_with_prior
 from modules.util.loss.vb_loss import vb_losses
@@ -276,24 +278,36 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 "LoRA-only (see BaseModelSetup.prior_model) and is armed in GenericTrainer."
             )
 
-        beta = config.counterexample_beta
+        # `beta` may be auto-calibrated from this run's own delta, so it is asked
+        # for per step rather than read straight off the config -- see
+        # CounterexampleSchedule. An explicit positive beta is returned unchanged.
+        step = int(data.get("counterexample_step", 0))
+        total_steps = int(data.get("counterexample_total_steps", 0))
+        ramp = config.counterexample_ramp
+        beta = SCHEDULE.beta(config.counterexample_beta, step, total_steps)
+
         index = torch.tensor(indices, device=losses.device, dtype=torch.long)
         distance = self._prediction_distance(batch, data, config, data["predicted"])
         reference_distance = self._prediction_distance(
             batch, data, config, data["prior_target"].detach()
         )
         repulsion = counterexample_losses(distance, reference_distance, beta)
+        delta = (reference_distance - distance)[index]
+        SCHEDULE.observe(delta)
 
+        # Recorded BEFORE the ramp weight, deliberately: `gate_mean` has to keep
+        # describing the objective's own state (is beta scaled for this run's
+        # delta?) and not get mixed up with how much of it is currently switched
+        # on. The weight is its own scalar instead.
+        weight = counterexample_weight(step, total_steps, ramp)
         TELEMETRY.record(
-            counterexample_stats(
-                delta=(reference_distance - distance)[index],
-                losses=repulsion[index],
-                beta=beta,
-            )
+            counterexample_stats(delta=delta, losses=repulsion[index], beta=beta),
+            weight=weight,
+            beta=beta,
         )
 
         losses = losses.clone()
-        losses[index] = repulsion[index]
+        losses[index] = weight * repulsion[index]
         return losses
 
     def __snr(self, timesteps: Tensor, device: torch.device) -> Tensor:
