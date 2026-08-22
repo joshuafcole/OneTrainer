@@ -343,7 +343,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         )
 
         losses = losses.clone()
-        losses[index] = weight * band * repulsion[index] if band is not None else weight * repulsion[index]
+        # The band multiplies the repulsion rather than selecting rows: a muted
+        # row still takes part in the step, it just contributes ~nothing, which
+        # keeps the batch shape and the positives' loss untouched.
+        scaled = repulsion[index] if band is None else band * repulsion[index]
+        losses[index] = weight * scaled
         return losses
 
     def __noise_level_from_snr(self, timesteps: Tensor, device: torch.device) -> Tensor:

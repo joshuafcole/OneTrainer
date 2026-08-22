@@ -196,14 +196,14 @@ def noise_band_weight(noise_level: Tensor, low: float, high: float) -> Tensor:
     ``noise_level`` is the model-agnostic coordinate ``u = 1 / (1 + sqrt(SNR))``
     -- the fraction of the noised latent's amplitude that is noise. ``u = 0`` is
     a clean latent and ``u = 1`` is pure noise, on *every* model family:
-    ``ModelSetupDiffusionLossMixin._noise_level`` derives it once from the SNR
-    each branch already computes, and for a rectified-flow model it comes out
+    ``ModelSetupDiffusionLossMixin.__noise_level_for`` derives it once from the
+    SNR each branch already computes, and for a rectified-flow model it comes out
     exactly equal to sigma.
 
     That is the whole reason the band is not expressed in timestep indices, the
     coordinate OneTrainer's own ``min_noising_strength`` uses. Index fraction is
     not comparable across model families: on SD 1.5's scaled-linear schedule
-    ``t/N = 0.1`` is ``u = 0.28``, while on a rectified-flow model ``t/N = 0.1``
+    ``t/N = 0.1`` is ``u = 0.26``, while on a rectified-flow model ``t/N = 0.1``
     is ``u = 0.10`` exactly. A band authored on one model and reused on another
     would silently mean a different physical noise range -- and nothing would
     report it.
