@@ -534,6 +534,20 @@ class TrainConfig(BaseConfig):
     # three quarters of training at full strength. Set 1.0 deliberately when the
     # goal is to concentrate the correction into the anneal.
     counterexample_ramp: float
+    # Where on the noise schedule the repulsion is allowed to act, as a band in
+    # the model-agnostic coordinate u = 1 / (1 + sqrt(SNR)): the fraction of the
+    # noised latent's amplitude that is noise. u = 0 is a clean latent, u = 1 is
+    # pure noise, and for a rectified-flow model u is exactly sigma. Deliberately
+    # NOT the timestep-index fraction that min_noising_strength uses -- on SD 1.5
+    # index 0.1 is u = 0.28, on a flow model it is u = 0.10, so a band authored
+    # once and reused would silently mean a different noise range per family.
+    #
+    # (0, 1) is "no band" and is exactly a no-op. Narrowing it concentrates the
+    # correction but also REDUCES THE DOSE in proportion to the fraction of rows
+    # it passes -- counterexample/band_pass reports that fraction, and an A/B
+    # that does not match it across arms is comparing two different treatments.
+    counterexample_band_low: float
+    counterexample_band_high: float
 
     # custom conditioning image
     custom_conditioning_image: bool
@@ -1213,6 +1227,8 @@ class TrainConfig(BaseConfig):
         # counterexample training
         data.append(("counterexample_beta", 0.0, float, False))
         data.append(("counterexample_ramp", 0.25, float, False))
+        data.append(("counterexample_band_low", 0.0, float, False))
+        data.append(("counterexample_band_high", 1.0, float, False))
 
         data.append(("custom_conditioning_image", False, bool, False))
 

@@ -103,6 +103,57 @@ it delivers *half* the total repulsion — as a default that would halve the
 treatment in an A/B and could report a real effect as a null. Set `1.0`
 deliberately when concentrating the correction into the anneal is the goal.
 
+### `counterexample_band_low` / `counterexample_band_high` — *where* on the schedule
+
+The third knob, and the one that decides **which noise levels** the repulsion is
+allowed to touch. `0`/`1` is no band and is exactly a no-op.
+
+The band is expressed in
+
+```
+u = 1 / (1 + sqrt(SNR))
+```
+
+— the fraction of the noised latent's **amplitude** that is noise. `u = 0` is a
+clean latent, `u = 1` is pure noise. For a variance-preserving schedule
+(`x_t = sqrt(a_bar)·x_0 + sqrt(1-a_bar)·eps`) that is
+`sqrt(1-a_bar) / (sqrt(a_bar) + sqrt(1-a_bar))`; for a rectified flow
+(`x_t = (1-sigma)·x_0 + sigma·eps`) the same expression collapses to **`sigma`
+exactly**.
+
+**⚠️ It is deliberately not the coordinate `min_noising_strength` uses.**
+Timestep-index fraction is not comparable across model families: on SD 1.5's
+scaled-linear schedule `t/N = 0.1` is already `u = 0.26`, while on a
+rectified-flow model `t/N = 0.1` is `u = 0.10`. A band authored on one model and
+reused on another would silently cover a different physical noise range, and
+nothing would report it. That is the whole reason this knob exists in its own
+coordinate.
+
+It is a **reweighting, not a resampling**. The timestep is drawn per sample
+before concept type is ever consulted, so narrowing `min/max_noising_strength`
+instead would move the positives' schedule too.
+
+**Why a band at all.** Diffusion training decomposes into
+[three stages by noise level](https://arxiv.org/pdf/2204.00227) — coarse
+structure at low SNR, perceptually-rich *content* in the middle, imperceptible
+clean-up at high SNR. A counterexample is a *close-but-wrong* image, so what
+separates it from a right one is content, not global structure. The unlearning
+literature reaches the same place from the other side:
+[KSCU](https://arxiv.org/html/2507.06526) confines concept unlearning to the last
+70% of denoising steps and reports FID **14.1** against **18.8** for training on
+all steps, with the high-noise 30% producing "severe structural collapse" (FID
+69.7) when intervened on. In `u`, that 70% is roughly `u <= 0.77` on SD 1.5.
+
+**⚠️ Narrowing the band reduces the DOSE.** A band that passes 40% of rows
+delivers 40% of the repulsion. `counterexample/band_pass` reports the fraction,
+and two arms of an A/B with different bands are not the same treatment at the
+same `loss_weight` — match the band, or divide `loss_weight` by the pass
+fraction. The same trap as the ramp, in a different dimension.
+
+The edges are raised cosines a quarter of the band's width each, combined with a
+`min`, so every band keeps a full-strength plateau across its middle half rather
+than degenerating into a spike.
+
 ## Telemetry
 
 Logged once per optimizer step (aggregated over the gradient-accumulation
@@ -117,6 +168,8 @@ window), only on steps that actually contained counterexample rows:
 | `counterexample/delta_mean` | mean `Δ`. Multiply by β to sanity-check the knob. |
 | `counterexample/loss_mean` | mean `L`. Starts at `(2/β)·log 2`. |
 | `counterexample/rows` | counterexample rows seen in the window. Zero means the concept never landed in a batch. |
+| `counterexample/noise_level` | mean `u` of the counterexample rows the sampler drew, **before** the band filters them — i.e. where the rows are, which is what tells you where to put a band. Unbanded it is the same number either way. |
+| `counterexample/band_pass` | the term's **dose**: mean band weight over its rows. `1.0` is unbanded. Far below it and the band has narrowed the term nearly out of existence — a failure `gate_mean` cannot see, because the rows that *do* pass behave perfectly normally. |
 
 ## Requirements and costs
 

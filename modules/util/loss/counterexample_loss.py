@@ -87,6 +87,10 @@ MIN_CALIBRATION_STEPS = 8
 # A solved beta is clamped into this range: |delta| can be denormal-small on the
 # first steps after zero, and 1/tiny is not a hyperparameter.
 BETA_BOUNDS = (1.0, 1.0e9)
+# Each edge of the noise band is a raised cosine this fraction of the band's
+# width. A quarter on each side leaves the middle half of the band at full
+# strength, so a band always has a plateau and never degenerates into a spike.
+BAND_EDGE_FRACTION = 0.25
 
 
 def counterexample_losses(distance: Tensor, reference_distance: Tensor, beta: float) -> Tensor:
@@ -143,6 +147,53 @@ def counterexample_weight(step: int, total_steps: int, ramp: float) -> float:
     return 0.5 * (1.0 - math.cos(math.pi * max(0, step) / window))
 
 
+def _smooth_edge(x: Tensor) -> Tensor:
+    """Raised-cosine 0 -> 1 over ``x`` in ``[0, 1]``, flat outside it."""
+    clamped = x.clamp(0.0, 1.0)
+    return 0.5 * (1.0 - torch.cos(math.pi * clamped))
+
+
+def noise_band_weight(noise_level: Tensor, low: float, high: float) -> Tensor:
+    """Per-row weight in ``[0, 1]`` restricting repulsion to a noise band.
+
+    ``noise_level`` is the model-agnostic coordinate ``u = 1 / (1 + sqrt(SNR))``
+    -- the fraction of the noised latent's amplitude that is noise. ``u = 0`` is
+    a clean latent and ``u = 1`` is pure noise, on *every* model family:
+    ``ModelSetupDiffusionLossMixin._noise_level`` derives it once from the SNR
+    each branch already computes, and for a rectified-flow model it comes out
+    exactly equal to sigma.
+
+    That is the whole reason the band is not expressed in timestep indices, the
+    coordinate OneTrainer's own ``min_noising_strength`` uses. Index fraction is
+    not comparable across model families: on SD 1.5's scaled-linear schedule
+    ``t/N = 0.1`` is ``u = 0.28``, while on a rectified-flow model ``t/N = 0.1``
+    is ``u = 0.10`` exactly. A band authored on one model and reused on another
+    would silently mean a different physical noise range -- and nothing would
+    report it.
+
+    ``low <= 0 and high >= 1`` is "no band" and returns all ones, so the default
+    is provably a no-op rather than a taper nobody asked for.
+    """
+    if low <= 0.0 and high >= 1.0:
+        return torch.ones_like(noise_level)
+    if not (0.0 <= low < high <= 1.0):
+        raise ValueError(
+            f"counterexample noise band must satisfy 0 <= low < high <= 1, got ({low}, {high})"
+        )
+
+    edge = BAND_EDGE_FRACTION * (high - low)
+    weight = torch.ones_like(noise_level)
+    if low > 0.0:
+        weight = torch.minimum(weight, _smooth_edge((noise_level - low) / edge))
+    if high < 1.0:
+        weight = torch.minimum(weight, _smooth_edge((high - noise_level) / edge))
+    # minimum, not a product: with edges a quarter of the width each, the two
+    # never both bite, so the band keeps a full-strength plateau across its
+    # middle half. A product would dip in the centre of a narrow band -- the one
+    # place the term is supposed to be strongest.
+    return weight
+
+
 class CounterexampleSchedule:
     """Process-global auto-calibration for ``beta``, alongside :data:`TELEMETRY`.
 
@@ -164,11 +215,28 @@ class CounterexampleSchedule:
         self._observed_steps = 0
         self._frozen_beta: float | None = None
 
-    def observe(self, delta: Tensor) -> None:
-        """Record one step's counterexample rows for the calibration mean."""
+    def observe(self, delta: Tensor, band_weight: Tensor | None = None) -> None:
+        """Record one step's counterexample rows for the calibration mean.
+
+        ``band_weight`` matters more than it looks: beta is solved so that *the
+        rows that actually train* land at the target gate. A band that mutes the
+        high-noise rows also removes them from the objective, so calibrating on
+        them would solve for a delta scale the run never optimizes -- and since
+        |delta| varies strongly with noise level, that is not a rounding error.
+        A step whose rows are entirely out of band contributes nothing at all,
+        rather than contributing a zero that would drag the mean down.
+        """
         if delta.numel() == 0:
             return
-        self._abs_delta_sum += float(delta.detach().abs().to(dtype=torch.float32).mean().item())
+        magnitude = delta.detach().abs().to(dtype=torch.float32)
+        if band_weight is None:
+            self._abs_delta_sum += float(magnitude.mean().item())
+        else:
+            weights = band_weight.detach().to(dtype=torch.float32)
+            total = float(weights.sum().item())
+            if total <= 0.0:
+                return
+            self._abs_delta_sum += float((magnitude * weights).sum().item()) / total
         self._observed_steps += 1
 
     def calibration_steps(self, total_steps: int) -> int:
@@ -251,6 +319,13 @@ class CounterexampleStats:
     gate_sum: float
     saturated: int
     loss_sum: float
+    noise_level_sum: float = 0.0
+    """Sum of the rows' noise coordinates ``u``, so the mean says *where on the
+    schedule* the term was operating -- the number a band is set against."""
+    band_sum: float = 0.0
+    """Sum of the rows' band weights. Its mean is the term's **dose**: a band
+    that passes 30% of rows delivers 30% of the repulsion, and an A/B that does
+    not match it across arms is comparing two different treatments."""
 
     @property
     def delta_mean(self) -> float:
@@ -268,6 +343,14 @@ class CounterexampleStats:
     def loss_mean(self) -> float:
         return self.loss_sum / self.rows if self.rows else 0.0
 
+    @property
+    def noise_level_mean(self) -> float:
+        return self.noise_level_sum / self.rows if self.rows else 0.0
+
+    @property
+    def band_mean(self) -> float:
+        return self.band_sum / self.rows if self.rows else 0.0
+
     def __add__(self, other: "CounterexampleStats") -> "CounterexampleStats":
         return CounterexampleStats(
             rows=self.rows + other.rows,
@@ -275,24 +358,46 @@ class CounterexampleStats:
             gate_sum=self.gate_sum + other.gate_sum,
             saturated=self.saturated + other.saturated,
             loss_sum=self.loss_sum + other.loss_sum,
+            noise_level_sum=self.noise_level_sum + other.noise_level_sum,
+            band_sum=self.band_sum + other.band_sum,
         )
 
 
 EMPTY_STATS = CounterexampleStats(rows=0, delta_sum=0.0, gate_sum=0.0, saturated=0, loss_sum=0.0)
 
 
-def counterexample_stats(delta: Tensor, losses: Tensor, beta: float) -> CounterexampleStats:
-    """Summarize one batch's counterexample rows. ``delta``/``losses`` are already
+def counterexample_stats(
+    delta: Tensor,
+    losses: Tensor,
+    beta: float,
+    noise_level: Tensor | None = None,
+    band_weight: Tensor | None = None,
+) -> CounterexampleStats:
+    """Summarize one batch's counterexample rows. Every tensor is already
     restricted to those rows by the caller."""
     if delta.numel() == 0:
         return EMPTY_STATS
     detached = delta.detach().to(dtype=torch.float32)
+    rows = int(detached.numel())
     return CounterexampleStats(
-        rows=int(detached.numel()),
+        rows=rows,
         delta_sum=float(detached.sum().item()),
         gate_sum=float(torch.sigmoid(beta * detached).sum().item()),
         saturated=int((detached < 0).sum().item()),
         loss_sum=float(losses.detach().to(dtype=torch.float32).sum().item()),
+        noise_level_sum=(
+            float(noise_level.detach().to(dtype=torch.float32).sum().item())
+            if noise_level is not None
+            else 0.0
+        ),
+        # No band means every row passes, which is a dose of 1.0 per row -- not
+        # a dose of zero. Defaulting this to 0 would report an unbanded run as
+        # having delivered nothing.
+        band_sum=(
+            float(band_weight.detach().to(dtype=torch.float32).sum().item())
+            if band_weight is not None
+            else float(rows)
+        ),
     )
 
 

@@ -1280,6 +1280,59 @@ class TrainingTab:
         )
         row += 1
 
+        # Counterexample Noise Band
+        components.label(
+            frame,
+            row,
+            0,
+            "Counterexample Band Low",
+            tooltip=(
+                "Where on the noise schedule the repulsion acts, as a band in u = 1 / (1 + "
+                "sqrt(SNR)) -- the fraction of the noised latent's amplitude that is noise. "
+                "0 = clean, 1 = pure noise, and u is exactly sigma on a flow model, so a band "
+                "means the same thing on every model family (unlike the timestep-index fraction "
+                "Min/Max Noising Strength use). Low 0 with High 1 is no band at all. Narrowing "
+                "it concentrates the correction but reduces the dose in proportion -- "
+                "counterexample/band_pass reports that fraction, and an A/B must match it "
+                "across arms."
+            ),
+        )
+        components.entry(
+            frame,
+            row,
+            1,
+            self.ui_state,
+            "counterexample_band_low",
+            extra_validate=check_range(
+                lower=0.0, upper=1.0, message="Counterexample band low must be in [0, 1]"
+            ),
+        )
+        row += 1
+
+        components.label(
+            frame,
+            row,
+            0,
+            "Counterexample Band High",
+            tooltip=(
+                "Upper edge of the counterexample noise band, in the same u = 1 / (1 + sqrt(SNR)) "
+                "coordinate as Counterexample Band Low. Must be greater than Low. The high-noise "
+                "end is where a close-but-wrong image and a right one are least distinguishable, "
+                "so it is the end usually worth excluding."
+            ),
+        )
+        components.entry(
+            frame,
+            row,
+            1,
+            self.ui_state,
+            "counterexample_band_high",
+            extra_validate=check_range(
+                lower=0.0, upper=1.0, message="Counterexample band high must be in [0, 1]"
+            ),
+        )
+        row += 1
+
     def __create_layer_frame(self, master, row):
         cls = create.get_model_setup_class(self.train_config.model_type, self.train_config.training_method)
         presets = cls.LAYER_PRESETS if cls is not None else {"full": []}

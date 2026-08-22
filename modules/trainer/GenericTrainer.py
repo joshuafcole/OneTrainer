@@ -1185,6 +1185,13 @@ class GenericTrainer(BaseTrainer):
                                     # means "solve it from this run's delta".
                                     ("counterexample/weight", window.weight),
                                     ("counterexample/beta", window.beta),
+                                    # Where on the schedule the term operated,
+                                    # and how much of it the noise band let
+                                    # through. band_pass is the DOSE: a band
+                                    # passing 0.4 delivers 40% of the repulsion,
+                                    # which an A/B has to match across arms.
+                                    ("counterexample/noise_level", counterexample.noise_level_mean),
+                                    ("counterexample/band_pass", counterexample.band_mean),
                                 ):
                                     self.tensorboard.add_scalar(tag, value, train_progress.global_step)
                             ema_loss = ema_loss or accumulated_loss_cpu
