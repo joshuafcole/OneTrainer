@@ -244,6 +244,31 @@ def test_auto_beta_solves_for_this_runs_delta_and_then_freezes():
     assert schedule.beta(configured=0.0, step=99, total_steps=100) == beta
 
 
+def test_a_second_run_in_one_process_does_not_inherit_the_first_beta():
+    """`SCHEDULE` is a process-global singleton and a process can train twice --
+    the GUI runs the trainer on a thread and stays alive across Start presses,
+    which is exactly the shape a back-to-back A/B bake-off has.
+
+    A carried-over frozen beta is the worst kind of wrong: it was calibrated
+    against a different model, resolution or band, and it is *indistinguishable
+    from a configured one* in the telemetry, so the second run reads healthy.
+    `GenericTrainer.start()` calls `reset()`; this pins what that has to restore.
+    """
+    schedule = CounterexampleSchedule()
+    for _ in range(MIN_CALIBRATION_STEPS):
+        schedule.observe(torch.tensor([1e-5, -1e-5]))
+    first = schedule.beta(configured=0.0, step=99, total_steps=100)
+
+    # Run 2, an order of magnitude coarser -- without the reset it would be
+    # handed run 1's beta and never solve at all.
+    schedule.reset()
+    for _ in range(MIN_CALIBRATION_STEPS):
+        schedule.observe(torch.tensor([1e-4, -1e-4]))
+    second = schedule.beta(configured=0.0, step=99, total_steps=100)
+
+    assert math.isclose(second, first / 10.0, rel_tol=1e-6)
+
+
 def test_beta_is_stable_through_the_calibration_window():
     """Regression, from a real run: the provisional solve swung 30x mid-window.
 
