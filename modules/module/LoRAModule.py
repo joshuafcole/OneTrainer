@@ -1023,7 +1023,10 @@ class LoRAModuleWrapper:
 
         rank_keys = {
             PeftType.LORA: ".lora_down.weight",
-            PeftType.LOHA: ".hada_w1_a",
+            # hada_w1_b is the down projection ([rank, in]); hada_w1_a is the up
+            # projection ([out, rank]). Reading shape[0] of the latter yields the
+            # output width, not the rank.
+            PeftType.LOHA: ".hada_w1_b",
             PeftType.LOKR: ".lokr_w1_a",
         }
         key_suffix = rank_keys.get(self.peft_type)
@@ -1051,8 +1054,7 @@ class LoRAModuleWrapper:
         state_dict = {k: v for (k, v) in state_dict.items() if k.startswith(prefix)}
 
         check_fusion_match(state_dict.keys(), self.fuse, self.fusion_spec)
-        # FIXME: disabled rank check, false positive on Flux2 LoHA loading
-        # self._check_rank_matches(state_dict)
+        self._check_rank_matches(state_dict)
 
         try:
             for module in self.lora_modules.values():
