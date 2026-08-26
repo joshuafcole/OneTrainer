@@ -1,6 +1,7 @@
 
 from modules.util import path_util
 from modules.util.enum.ModelType import PeftType
+from modules.util.enum.PeftInitMode import PeftInitMode
 from modules.util.ui.validation_helpers import check_range
 
 
@@ -45,6 +46,29 @@ class BaseLoraTabView:
             self.components.label(master, 3, 3, "Apply on output axis (DoRA Only)",
                                   tooltip="Apply the weight decomposition on the output axis instead of the input axis.")
             self.components.switch(master, 3, 4, ui_state, "lora_decompose_output_axis")
+
+            # Gradient-aligned (GA) initialization. Shares the init fields
+            # (GenericTrainer's GA pass dispatches on peft_type). Not applicable
+            # to DoRA, which is initialized to the identity; leaving it on
+            # Default there is the safe no-op.
+            self.components.label(master, 4, 3, "Initialization",
+                                  tooltip="Default: random (Kaiming) initialization. Gradient (GA): estimates the base weight gradients over the first few batches and points lora_down at the top-r right singular vectors of the mean gradient (norm-matched), keeping lora_up=0 so the model output is unchanged until the first optimizer step. Speeds up early convergence; for sliders it pre-orients the adapter along the guidance-difference direction. Not used for DoRA.")
+            self.components.options_kv(master, 4, 4, [
+                ("Default", PeftInitMode.DEFAULT),
+                ("Gradient (GA)", PeftInitMode.GRADIENT),
+            ], ui_state, "peft_init_mode")
+
+            self.components.label(master, 5, 3, "Init Estimation Steps",
+                                  tooltip="Number of batches used to estimate the gradients for the GA initialization.")
+            self.components.entry(master, 5, 4, ui_state, "peft_init_steps")
+
+            self.components.label(master, 6, 3, "Init Gain",
+                                  tooltip="Multiplier on the norm of the gradient-aligned initial factors, relative to the default initialization's norm. 1.0 matches the default magnitudes exactly.")
+            self.components.entry(master, 6, 4, ui_state, "peft_init_gain")
+
+            self.components.label(master, 7, 3, "Offload Init Grads",
+                                  tooltip="Accumulates the GA gradient estimates in CPU memory instead of VRAM. Slower (one device-to-host transfer per layer per batch), but frees one fp32 weight-sized buffer per adapted layer from VRAM during the estimation pass.")
+            self.components.switch(master, 7, 4, ui_state, "peft_init_offload")
 
         # LoRA and LoHA shared settings
         if peft_type == PeftType.LORA or peft_type == PeftType.LOHA:
@@ -135,6 +159,27 @@ class BaseLoraTabView:
             self.components.label(master, 6, 0, "Kronecker-Vec Trick",
                                   tooltip="Uses an accelerated path that bypasses the materialization of the full Kronecker product. This delivers a massive speedup to the LoKr without sacrificing precision. Highly recommended.")
             self.components.switch(master, 6, 1, ui_state, "lokr_vec_trick")
+
+            # Gradient-aligned (GA) initialization. Shares the init fields
+            # (GenericTrainer's GA pass dispatches on peft_type).
+            self.components.label(master, 7, 0, "Initialization",
+                                  tooltip="Default: random (Kaiming) initialization. Gradient (GA): estimates the base weight gradients over the first few batches and aligns the initial LoKr factors with their principal Kronecker components, which can speed up early convergence. The model output is unchanged until the first optimizer step.")
+            self.components.options_kv(master, 7, 1, [
+                ("Default", PeftInitMode.DEFAULT),
+                ("Gradient (GA)", PeftInitMode.GRADIENT),
+            ], ui_state, "peft_init_mode")
+
+            self.components.label(master, 8, 0, "Init Estimation Steps",
+                                  tooltip="Number of batches used to estimate the gradients for the GA initialization.")
+            self.components.entry(master, 8, 1, ui_state, "peft_init_steps")
+
+            self.components.label(master, 9, 0, "Init Gain",
+                                  tooltip="Multiplier on the norm of the gradient-aligned initial factors, relative to the default initialization's norm. 1.0 matches the default magnitudes exactly.")
+            self.components.entry(master, 9, 1, ui_state, "peft_init_gain")
+
+            self.components.label(master, 10, 0, "Offload Init Grads",
+                                  tooltip="Accumulates the GA gradient estimates in CPU memory instead of VRAM. Slower (one device-to-host transfer per layer per batch), but frees one fp32 weight-sized buffer per adapted layer from VRAM during the estimation pass.")
+            self.components.switch(master, 10, 1, ui_state, "peft_init_offload")
 
             # LoKr Decomposition Settings
             self.components.label(master, 1, 3, "Decompose Both Matrices",
