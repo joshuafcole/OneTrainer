@@ -30,6 +30,7 @@ from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.profiling_util import PeakMemoryRecorder, TorchMemoryRecorder, TorchProfiler
+from modules.util.sample_metadata import SampleProvenance, hash_text
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
@@ -84,6 +85,9 @@ class GenericTrainer(BaseTrainer):
         self.model = None
         self.one_step_trained = False
         self.grad_hook_handles = []
+        # basename of the most recent *successful* save this run, for sample
+        # provenance; None until the first save lands.
+        self.last_save_filename: str | None = None
 
     def start(self):
         if multi.is_master():
@@ -263,15 +267,40 @@ class GenericTrainer(BaseTrainer):
                 sample_config = copy.copy(sample_config)
                 sample_config.from_train_config(self.config)
 
-                self.model_sampler.sample(
-                    sample_config=sample_config,
-                    destination=sample_path,
-                    image_format=self.config.sample_image_format,
-                    video_format=self.config.sample_video_format,
-                    audio_format=self.config.sample_audio_format,
-                    on_sample=on_sample,
-                    on_update_progress=on_update_progress,
-                )
+                # Provenance describes the *normalized* config actually sampled,
+                # not the raw list entry -- hashed after from_train_config above.
+                # A failure here must not cost the run its sample, so it only
+                # ever leaves provenance unset, never skips model_sampler.sample.
+                try:
+                    self.model_sampler.set_provenance(SampleProvenance(
+                        global_step=train_progress.global_step,
+                        epoch=train_progress.epoch,
+                        epoch_step=train_progress.epoch_step,
+                        seed=None if sample_config.random_seed else sample_config.seed,
+                        prompt_hash=hash_text(sample_config.prompt),
+                        sample_config_hash=hash_text(json.dumps(
+                            sample_config.to_dict(), sort_keys=True, ensure_ascii=True,
+                            separators=(",", ":"), default=str,
+                        )),
+                        last_save_filename=self.last_save_filename,
+                    ))
+                except Exception:
+                    traceback.print_exc()
+                    tqdm.write("Could not build sample provenance, sampling without it")
+                    self.model_sampler.set_provenance(None)
+
+                try:
+                    self.model_sampler.sample(
+                        sample_config=sample_config,
+                        destination=sample_path,
+                        image_format=self.config.sample_image_format,
+                        video_format=self.config.sample_video_format,
+                        audio_format=self.config.sample_audio_format,
+                        on_sample=on_sample,
+                        on_update_progress=on_update_progress,
+                    )
+                finally:
+                    self.model_sampler.set_provenance(None)
             except Exception:
                 traceback.print_exc()
                 tqdm.write("Error during sampling, proceeding without sampling")
@@ -507,6 +536,7 @@ class GenericTrainer(BaseTrainer):
                 output_model_destination=save_path,
                 dtype=self.config.output_dtype.torch_dtype()
             )
+            self.last_save_filename = os.path.basename(save_path)
             if self.config.optimizer.optimizer.is_schedule_free:
                 torch.clear_autocast_cache()
                 self.model.optimizer.train()
