@@ -85,6 +85,9 @@ class GenericTrainer(BaseTrainer):
         self.model = None
         self.one_step_trained = False
         self.grad_hook_handles = []
+        self.sampled_train_progresses: set[str] = set()
+        self.saved_train_progresses: set[str] = set()
+        self.train_exited_cleanly = False
         # basename of the most recent *successful* save this run, for sample
         # provenance; None until the first save lands.
         self.last_save_filename: str | None = None
@@ -214,18 +217,41 @@ class GenericTrainer(BaseTrainer):
                 fun()
         self.sample_queue = []
 
+    @staticmethod
+    def __progress_key(train_progress: TrainProgress) -> str:
+        return train_progress.filename_string()
+
+    def __mark_clean_train_exit(self):
+        self.train_exited_cleanly = True
+
+    def __has_enabled_samples(self, sample_config_list: list[SampleConfig]) -> bool:
+        return any(sample_config.enabled for sample_config in sample_config_list)
+
+    def __should_emit_final_workspace_artifacts(self) -> bool:
+        return self.one_step_trained and self.train_exited_cleanly
+
+    def __emit_final_workspace_artifacts(self, train_progress: TrainProgress):
+        progress_key = self.__progress_key(train_progress)
+
+        if self.config.save_on_train_end and multi.is_master() and progress_key not in self.saved_train_progresses:
+            self.__save(train_progress)
+
+        if self.config.sample_on_train_end and multi.is_master() and progress_key not in self.sampled_train_progresses:
+            self.__sample_during_training(train_progress, self.train_device, distribute=False)
+
     def __sample_loop(
             self,
             train_progress: TrainProgress,
             train_device: torch.device,
             sample_config_list: list[SampleConfig],
             ema_applied: bool,
+            distribute: bool = True,
             folder_postfix: str = "",
             is_custom_sample: bool = False,
     ):
         for i, sample_config in multi.distributed(
             [(i, sample_config) for i, sample_config in enumerate(sample_config_list) if sample_config.enabled],
-            distribute=not self.config.samples_to_tensorboard and not ema_applied
+            distribute=distribute and not self.config.samples_to_tensorboard and not ema_applied
         ):
             try:
                 safe_prompt = path_util.safe_filename(sample_config.prompt)
@@ -312,6 +338,7 @@ class GenericTrainer(BaseTrainer):
             train_progress: TrainProgress,
             train_device: torch.device,
             sample_params_list: list[SampleConfig] = None,
+            distribute: bool = True,
     ):
         # Special case for schedule-free optimizers.
         if self.config.optimizer.optimizer.is_schedule_free:
@@ -339,6 +366,8 @@ class GenericTrainer(BaseTrainer):
                 tqdm.write("Error during loading the sample definition file, proceeding without sampling")
                 sample_params_list = []
 
+        has_enabled_samples = self.__has_enabled_samples(sample_params_list)
+
         if self.model.ema:
             #the EMA model only exists in the master process, so EMA sampling is done on one GPU only
             #non-EMA sampling is done on all GPUs
@@ -349,6 +378,7 @@ class GenericTrainer(BaseTrainer):
             train_progress=train_progress,
             train_device=train_device,
             sample_config_list=sample_params_list,
+            distribute=distribute,
             is_custom_sample=is_custom_sample,
             ema_applied = self.config.ema != EMAMode.OFF
         )
@@ -362,9 +392,13 @@ class GenericTrainer(BaseTrainer):
                 train_progress=train_progress,
                 train_device=train_device,
                 sample_config_list=sample_params_list,
+                distribute=distribute,
                 folder_postfix=" - no-ema",
                 ema_applied = False,
             )
+
+        if has_enabled_samples and not is_custom_sample and multi.is_master():
+            self.sampled_train_progresses.add(self.__progress_key(train_progress))
 
         self.model_setup.setup_train_device(self.model, self.config)
         # Special case for schedule-free optimizers.
@@ -537,6 +571,8 @@ class GenericTrainer(BaseTrainer):
                 dtype=self.config.output_dtype.torch_dtype()
             )
             self.last_save_filename = os.path.basename(save_path)
+            if multi.is_master():
+                self.saved_train_progresses.add(self.__progress_key(train_progress))
             if self.config.optimizer.optimizer.is_schedule_free:
                 torch.clear_autocast_cache()
                 self.model.optimizer.train()
@@ -647,12 +683,14 @@ class GenericTrainer(BaseTrainer):
         train_device = torch.device(self.config.train_device)
 
         train_progress = self.model.train_progress
+        self.train_exited_cleanly = False
 
         if self.config.only_cache:
             if multi.is_master():
                 self.callbacks.on_update_status("Caching")
                 for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
                     self.data_loader.get_data_set().start_next_epoch()
+            self.__mark_clean_train_exit()
             return
 
         scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
@@ -672,6 +710,7 @@ class GenericTrainer(BaseTrainer):
         for _epoch in tqdm(epochs, desc="epoch") if multi.is_master() else epochs:
             multi.sync_commands(self.commands)
             if self.commands.get_stop_command():
+                self.__mark_clean_train_exit()
                 return
             self.callbacks.on_update_status("Starting epoch/caching")
 
@@ -866,16 +905,23 @@ class GenericTrainer(BaseTrainer):
                 self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
                 if self.commands.get_stop_command():
+                    self.__mark_clean_train_exit()
                     return
 
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
             if self.commands.get_stop_command():
+                self.__mark_clean_train_exit()
                 return
+
+        self.__mark_clean_train_exit()
 
     def end(self):
         if self.one_step_trained:
+            if self.__should_emit_final_workspace_artifacts():
+                self.__emit_final_workspace_artifacts(self.model.train_progress)
+
             self.model.evict()
 
             if self.config.backup_before_save and multi.is_master():

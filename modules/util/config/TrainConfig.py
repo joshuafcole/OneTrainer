@@ -572,6 +572,7 @@ class TrainConfig(BaseConfig):
     sample_audio_format: AudioFormat
     samples_to_tensorboard: bool
     non_ema_sampling: bool
+    sample_on_train_end: bool
 
     # cloud settings
     cloud: CloudConfig
@@ -585,6 +586,7 @@ class TrainConfig(BaseConfig):
     save_every: int
     save_every_unit: TimeUnit
     save_skip_first: int
+    save_on_train_end: bool
     save_filename_prefix: str
 
     # secrets - not saved into config file
@@ -1266,6 +1268,7 @@ class TrainConfig(BaseConfig):
         data.append(("sample_audio_format", AudioFormat.MP3, AudioFormat, False))
         data.append(("samples_to_tensorboard", True, bool, False))
         data.append(("non_ema_sampling", True, bool, False))
+        data.append(("sample_on_train_end", True, bool, False))
 
         # backup settings
         data.append(("backup_after", 30, int, False))
@@ -1276,6 +1279,7 @@ class TrainConfig(BaseConfig):
         data.append(("save_every", 0, int, False))
         data.append(("save_every_unit", TimeUnit.NEVER, TimeUnit, False))
         data.append(("save_skip_first", 0, int, False))
+        data.append(("save_on_train_end", True, bool, False))
         data.append(("save_filename_prefix", "", str, False))
 
         # secrets
