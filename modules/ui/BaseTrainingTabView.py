@@ -868,6 +868,18 @@ class BaseTrainingTabView(ABC):
         self.components.options(frame, row, 1, [str(x) for x in list(LossScaler)], ui_state, "loss_scaler")
         row += 1
 
+        # Counterexample Beta
+        self.components.label(frame, row, 0, "Counterexample Beta",
+                              tooltip="The delta SCALE at which the bounded repulsion applied to COUNTEREXAMPLE "
+                                      "concepts switches off -- not a strength knob: at delta == 0, where every cold "
+                                      "LoRA starts, the slope is 1.0 for every beta. Read counterexample/gate_mean "
+                                      "off a short run: ~1.0 means beta is too small to ever switch off. No effect "
+                                      "unless a concept has type COUNTEREXAMPLE.",
+                              wide_tooltip=True)
+        self.components.entry(frame, row, 1, ui_state, "counterexample_beta",
+                              extra_validate=check_range(lower=1e-6, message="Counterexample beta must be positive"))
+        row += 1
+
     def __create_layer_frame(self, master, row, controller, ui_state):
         presets = controller.get_layer_presets()
         self.components.layer_filter_entry(master, row, 0, ui_state,

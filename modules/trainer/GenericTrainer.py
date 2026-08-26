@@ -29,6 +29,7 @@ from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.loss.counterexample_loss import TELEMETRY as counterexample_telemetry
 from modules.util.profiling_util import PeakMemoryRecorder, TorchMemoryRecorder, TorchProfiler
 from modules.util.sample_metadata import SampleProvenance, hash_text
 from modules.util.time_util import get_string_timestamp
@@ -808,7 +809,14 @@ class GenericTrainer(BaseTrainer):
 
                     prior_pred_indices = [i for i in range(self.config.batch_size)
                                           if ConceptType(batch['concept_type'][i]) == ConceptType.PRIOR_PREDICTION]
+                    # A counterexample row needs the same frozen forward, but NOT the
+                    # target substitution below: its target stays the wrong image it
+                    # actually is, and the loss measures how much better than the
+                    # reference the adapter has learned to reproduce it.
+                    has_counterexample = any(ConceptType(batch['concept_type'][i]) == ConceptType.COUNTEREXAMPLE
+                                             for i in range(self.config.batch_size))
                     if len(prior_pred_indices) > 0 \
+                            or has_counterexample \
                             or (self.config.masked_training
                                 and self.config.masked_prior_preservation_weight > 0
                                 and self.config.training_method == TrainingMethod.LORA):
@@ -837,6 +845,10 @@ class GenericTrainer(BaseTrainer):
                     accumulated_loss += detached_loss
 
                     if self.__is_update_step(train_progress):
+                        # Drained on every rank, not just the logging one, so a
+                        # non-master's accumulator never carries a previous
+                        # window's rows into the next.
+                        counterexample = counterexample_telemetry.take()
                         if self.config.fused_gradient_reduce:
                             multi.finish_async(self.config.gradient_reduce_precision)
                         else:
@@ -870,6 +882,25 @@ class GenericTrainer(BaseTrainer):
                                 raise RuntimeError("Training loss became NaN. This may be due to invalid parameters, precision issues, or a bug in the loss computation.")
 
                             self.tensorboard.add_scalar("loss/train_step",accumulated_loss_cpu , train_progress.global_step)
+
+                            # Counterexample readout. Drained once per optimizer
+                            # step, so it aggregates the whole GA window.
+                            # `gate_mean` is the one to read first: it is the mean
+                            # per-row multiplier on the repulsion gradient. Near 0
+                            # is ambiguous between "already past the reference on
+                            # every row" and "never engaged" -- only its trajectory
+                            # over the run separates them. See
+                            # docs/CounterexampleTraining.md.
+                            if counterexample.rows > 0:
+                                for tag, value in (
+                                    ("counterexample/rows", float(counterexample.rows)),
+                                    ("counterexample/delta_mean", counterexample.delta_mean),
+                                    ("counterexample/gate_mean", counterexample.gate_mean),
+                                    ("counterexample/saturated_fraction", counterexample.saturated_fraction),
+                                    ("counterexample/loss_mean", counterexample.loss_mean),
+                                ):
+                                    self.tensorboard.add_scalar(tag, value, train_progress.global_step)
+
                             ema_loss = ema_loss or accumulated_loss_cpu
                             ema_loss_steps += 1
                             ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))

@@ -30,6 +30,9 @@ class BaseConceptWindowView:
                                  "VALIDATION: Use concept for validation instead of training\n"
                                  "PRIOR_PREDICTION: Use the sample to make a prediction using the model as it was before training. This prediction is then used as the training target "
                                  "for the model in training. This can be used as regularisation and to preserve prior model knowledge while finetuning the model on other concepts. "
+                                 "Only implemented for LoRA.\n"
+                                 "COUNTEREXAMPLE: A close-but-wrong image, trained *away* from with a bounded repulsion that switches itself off once the model fits the "
+                                 "image worse than it did before training. Unlike a negative loss weight it cannot diverge. See docs/CounterexampleTraining.md. "
                                  "Only implemented for LoRA.",
                          wide_tooltip=True)
         self.components.options(frame, 2, 1, [str(x) for x in list(ConceptType)], ui_state, "type")

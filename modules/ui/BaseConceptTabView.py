@@ -13,7 +13,8 @@ from PIL import Image
 
 class BaseConceptTabView(BaseConfigListView):
 
-    _FILTER_TYPES = ["ALL", "STANDARD", "VALIDATION", "PRIOR_PREDICTION"]
+    # Derived, so a new ConceptType member cannot become unfilterable by omission.
+    _FILTER_TYPES = ["ALL"] + [concept_type.value for concept_type in ConceptType]
 
     def _element_matches_filters(self, element):
         if not self.filters.get("show_disabled", True):
