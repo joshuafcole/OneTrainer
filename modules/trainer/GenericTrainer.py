@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import math
 import os
@@ -14,6 +15,7 @@ from modules.modelLoader.BaseModelLoader import BaseModelLoader
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
 from modules.modelSaver.BaseModelSaver import BaseModelSaver
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.trainer.BaseTrainer import BaseTrainer
 from modules.util import create, huggingface_util, path_util
 from modules.util.bf16_stochastic_rounding import set_seed as bf16_stochastic_rounding_set_seed
@@ -27,8 +29,11 @@ from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelFormat import ModelFormat
+from modules.util.enum.ModelType import PeftType
+from modules.util.enum.PeftInitMode import PeftInitMode
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.grad_estimation import WeightGradientEstimator
 from modules.util.profiling_util import PeakMemoryRecorder, TorchMemoryRecorder, TorchProfiler
 from modules.util.sample_metadata import SampleProvenance, hash_text
 from modules.util.time_util import get_string_timestamp
@@ -679,6 +684,182 @@ class GenericTrainer(BaseTrainer):
             torch.clear_autocast_cache()
             self.model.optimizer.eval()
 
+    def __peft_init_cache_path(self) -> str | None:
+        """Cache file for the estimated GA (gradient-aligned init) factors.
+
+        The factors depend on the base model, the dataset, the estimation
+        length and the Kronecker factorization -- but NOT on LoKr rank (dim),
+        alpha or gain, so one estimation pass serves a whole LoKr sweep. The
+        key also carries peft_type so a LoRA-GA cache (1-tuple right-singular
+        matrices) never collides with a Kron-GA cache (2-tuple Van Loan
+        pairs); the LoRA-GA factors are truncated to rank on replay, so
+        lora_rank is included only for LoRA to keep the cached matrices wide
+        enough. Lives under cache_dir next to the latent cache (same reuse
+        semantics).
+        """
+        config = self.config
+        if not config.cache_dir:
+            return None
+        key_data = {
+            "base_model_name": config.base_model_name,
+            "concept_file_name": config.concept_file_name,
+            "peft_init_steps": config.peft_init_steps,
+            "lokr_decompose_factor": config.lokr_decompose_factor,
+            "peft_type": str(config.peft_type),
+        }
+        if config.peft_type == PeftType.LORA:
+            key_data["lora_rank"] = config.lora_rank
+        key = json.dumps(key_data, sort_keys=True)
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        return os.path.join(config.cache_dir, "ga_init", f"{digest}.pt")
+
+    def __run_peft_gradient_init(self):
+        """Gradient-aligned (GA) initialization: Kron-GA for LoKr, LoRA-GA for
+        LoRA (the LoRA-GA property backported to LoKr's Van Loan factors, and
+        vice versa). DoRA is skipped -- it initializes to the identity, so
+        leaving it on Default is the safe no-op.
+
+        Estimates per-layer dL/dW of the frozen base weights over the first
+        peft_init_steps batches, then re-initializes the adapter's nonzero
+        factors with a rank-truncation of the estimated gradient. The zero
+        factor (lora_up, or LoKr's zero factor) is untouched, so the model
+        output is unchanged until the first real optimizer step.
+        """
+        config = self.config
+        if config.peft_init_mode != PeftInitMode.GRADIENT or config.peft_type not in (PeftType.LOKR, PeftType.LORA):
+            return
+        if config.training_method != TrainingMethod.LORA:
+            return
+        if self.model.train_progress.global_step > 0:
+            print("GA init: skipping, training is being resumed.")
+            return
+        if config.model_names().lora:
+            print("GA init: skipping, an existing checkpoint is being loaded.")
+            return
+        if multi.world_size() > 1:
+            print("GA init: skipping, multi-GPU training is not supported yet.")
+            return
+
+        wrappers = [
+            module for module in vars(self.model).values()
+            if isinstance(module, LoRAModuleWrapper)
+        ]
+        if not wrappers:
+            return
+
+        cache_path = self.__peft_init_cache_path()
+        if cache_path is not None and os.path.isfile(cache_path):
+            try:
+                cached = torch.load(cache_path, map_location="cpu", weights_only=True)
+            except Exception as e:
+                print(f"GA init: ignoring unreadable cache {cache_path}: {e}")
+                cached = None
+            if cached is not None:
+                self.callbacks.on_update_status("GA factor initialization")
+                applied = skipped = 0
+                for wrapper in wrappers:
+                    factors = {
+                        name: pair for name in wrapper.lora_modules
+                        if (pair := cached.get(f"{wrapper.prefix}.{name}")) is not None
+                    }
+                    wrapper_applied, wrapper_skipped = wrapper.init_from_factors(factors, config.peft_init_gain)
+                    applied += wrapper_applied
+                    skipped += wrapper_skipped
+                print(f"GA init: applied to {applied} layers ({skipped} skipped) from cache {cache_path}")
+                return
+
+        self.callbacks.on_update_status("GA gradient estimation")
+        self.callbacks.on_update_aux_progress("ga-init", 0, config.peft_init_steps)
+
+        # The fp32 accumulators are weight-shaped, one per adapted Linear:
+        # accumulating on the train device avoids a per-layer device-to-host
+        # sync every batch, at the cost of that VRAM; offload trades it back.
+        store_device = torch.device("cpu") if config.peft_init_offload else torch.device(config.train_device)
+
+        estimators = []
+        for wrapper in wrappers:
+            estimator = WeightGradientEstimator(store_device=store_device)
+            estimator.attach({name: module.orig_module for name, module in wrapper.lora_modules.items()})
+            estimators.append(estimator)
+
+        # Keeps fp16 gradients from underflowing without a GradScaler. The init
+        # only uses gradient directions, so the constant has no other effect.
+        loss_scale = 1024.0 if enable_grad_scaling(config.train_dtype, self.parameters) else 1.0
+
+        if config.latent_caching:
+            self.data_loader.get_data_set().start_next_epoch()
+            self.model_setup.setup_train_device(self.model, config)
+        else:
+            self.model_setup.setup_train_device(self.model, config)
+            self.data_loader.get_data_set().start_next_epoch()
+
+        # An advancing copy so timestep/noise sampling varies across batches,
+        # without moving the real training progress.
+        progress = copy.deepcopy(self.model.train_progress)
+        step_count = 0
+        # force_eager: dynamo hard-errors on tensor hook registration inside
+        # compiled regions, so compiled blocks must run eagerly during the
+        # estimation pass. Compiled training resumes normally afterwards.
+        with torch.compiler.set_stance("force_eager"):
+            for batch in tqdm(self.data_loader.get_data_loader(), desc="ga-init", total=config.peft_init_steps):
+                model_output_data = self.model_setup.predict(self.model, batch, config, progress)
+
+                # Exclude prior-prediction (regularization) samples: their true
+                # step-0 gradient is ~0, because the adapter still outputs zero,
+                # so the trained model *is* the prior model. Detaching the
+                # prediction as their target zeroes their loss without running
+                # the prior model.
+                prior_pred_indices = [
+                    i
+                    for i in range(config.batch_size)
+                    if ConceptType(batch["concept_type"][i]) == ConceptType.PRIOR_PREDICTION
+                ]
+                if len(prior_pred_indices) > 0:
+                    predicted_detached = model_output_data["predicted"].detach().to(
+                        dtype=model_output_data["target"].dtype
+                    )
+                    model_output_data["target"][prior_pred_indices] = predicted_detached[prior_pred_indices]
+
+                loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, config)
+                (loss * loss_scale).backward()
+                for estimator in estimators:
+                    estimator.count_step()
+                progress.next_step(config.batch_size)
+                step_count += 1
+                self.callbacks.on_update_aux_progress("ga-init", step_count, config.peft_init_steps)
+                if step_count >= config.peft_init_steps:
+                    break
+
+        self.callbacks.on_update_status("GA factor initialization")
+        applied = skipped = 0
+        all_factors: dict[str, tuple[torch.Tensor, ...]] = {}
+        for wrapper, estimator in zip(wrappers, estimators, strict=True):
+            estimator.detach_hooks()
+            grads = {
+                name: grad for name in wrapper.lora_modules
+                if (grad := estimator.mean_gradient(name)) is not None
+            }
+            wrapper_applied, wrapper_skipped, factors = \
+                wrapper.init_from_gradients(grads, config.peft_init_gain)
+            applied += wrapper_applied
+            skipped += wrapper_skipped
+            for name, pair in factors.items():
+                all_factors[f"{wrapper.prefix}.{name}"] = pair
+            estimator.clear()
+
+        if cache_path is not None and all_factors:
+            try:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                torch.save(all_factors, cache_path)
+                print(f"GA init: cached factors to {cache_path}")
+            except OSError as e:
+                print(f"GA init: failed to write cache {cache_path}: {e}")
+
+        self.model.optimizer.zero_grad(set_to_none=True)
+        torch_gc()
+        self.callbacks.on_update_aux_progress("ga-init", 0, 0)
+        print(f"GA init: applied to {applied} layers ({skipped} skipped) from {step_count} batches.")
+
     def train(self):
         train_device = torch.device(self.config.train_device)
 
@@ -692,6 +873,8 @@ class GenericTrainer(BaseTrainer):
                     self.data_loader.get_data_set().start_next_epoch()
             self.__mark_clean_train_exit()
             return
+
+        self.__run_peft_gradient_init()
 
         scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
 

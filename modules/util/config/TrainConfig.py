@@ -23,6 +23,7 @@ from modules.util.enum.LossWeight import LossWeight
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.Optimizer import Optimizer
+from modules.util.enum.PeftInitMode import PeftInitMode
 from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -556,6 +557,15 @@ class TrainConfig(BaseConfig):
     lokr_dora_on_output: bool
     lokr_full_matrix: bool
     lokr_vec_trick: bool
+
+    # gradient-aligned (GA) init -- shared by peft_type LORA and LOKR;
+    # GenericTrainer's GA pass dispatches on peft_type. Not applicable to
+    # DoRA, which is initialized to the identity, so leaving it on Default
+    # there is the safe no-op.
+    peft_init_mode: PeftInitMode
+    peft_init_steps: int
+    peft_init_gain: float
+    peft_init_offload: bool
 
     # optimizer
     optimizer: TrainOptimizerConfig
@@ -1252,6 +1262,12 @@ class TrainConfig(BaseConfig):
         data.append(("lokr_dora_on_output", True, bool, False))
         data.append(("lokr_full_matrix", False, bool, False))
         data.append(("lokr_vec_trick", True, bool, False))
+
+        # gradient-aligned (GA) init
+        data.append(("peft_init_mode", PeftInitMode.DEFAULT, PeftInitMode, False))
+        data.append(("peft_init_steps", 64, int, False))
+        data.append(("peft_init_gain", 1.0, float, False))
+        data.append(("peft_init_offload", False, bool, False))
 
         # optimizer
         data.append(("optimizer", TrainOptimizerConfig.default_values(), TrainOptimizerConfig, False))
