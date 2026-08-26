@@ -870,8 +870,11 @@ class LoRAModuleWrapper:
     rank: int
     alpha: float
     module_filters: list[ModuleFilter]
+    target_modules: dict[str, nn.Module]
 
     lora_modules: dict[str, PeftBase]
+    frozen_lora_modules: dict[str, PeftBase]
+    dummy_lora_modules: dict[str, PeftBase]
     lokr_dim: int
 
     def __init__(
@@ -900,6 +903,10 @@ class LoRAModuleWrapper:
         # selects fused/split only via `fuse`. When `fuse` is left None it defaults to fusing iff a spec
         # was given.
         self.fuse = (fusion_spec is not None) if fuse is None else fuse
+        # every Linear/Conv2d in the base model, keyed by its (unprefixed) name -- lets a narrower
+        # resume tell "outside the current filter" apart from "not in the model at all" (see
+        # __load_remaining_state).
+        self.target_modules = self.__collect_target_modules(orig_module)
 
         self.module_filters = [
             ModuleFilter(pattern, use_regex=config.layer_filter_regex)
@@ -953,6 +960,82 @@ class LoRAModuleWrapper:
             }
         self.fused_groups = []
         self.lora_modules = self.__create_modules(orig_module, config)
+        # populated by load_state_dict, when a resumed checkpoint has keys outside the current filter
+        # (see __load_remaining_state).
+        self.frozen_lora_modules = {}
+        self.dummy_lora_modules = {}
+
+    def __collect_target_modules(self, orig_module: nn.Module | None) -> dict[str, nn.Module]:
+        if orig_module is None:
+            return {}
+
+        target_modules = {}
+        for name, child_module in orig_module.named_modules():
+            name = name.replace(".checkpoint.", ".")
+            if isinstance(child_module, Linear | Conv2d):
+                target_modules[name] = child_module
+
+        return target_modules
+
+    def __full_prefix(self, short_name: str) -> str:
+        return (self.prefix + "." + short_name) if self.prefix != "" else short_name
+
+    def __iter_real_modules(self):
+        """Modules that are actually hooked to the base model: trainable + frozen inherited."""
+        yield from self.lora_modules.values()
+        yield from self.frozen_lora_modules.values()
+
+    def __iter_stateful_modules(self):
+        """Every module that must round-trip through state_dict(): real + save-only dummies."""
+        yield from self.__iter_real_modules()
+        yield from self.dummy_lora_modules.values()
+
+    def __find_target_prefix(self, state_key: str) -> str | None:
+        """Find the longest target-module prefix that `state_key` belongs to, if any.
+
+        Longest match matters because one target module's name can be a strict prefix of
+        another's (e.g. a module that itself is a Linear with a Linear submodule).
+        """
+        matches = [
+            self.__full_prefix(short_name)
+            for short_name in self.target_modules
+            if state_key.startswith(self.__full_prefix(short_name) + ".")
+        ]
+        if not matches:
+            return None
+        return max(matches, key=len)
+
+    def __load_remaining_state(self, state_dict: dict[str, Tensor], remaining_names: set[str]):
+        """Bucket checkpoint keys left over after the trainable population loaded.
+
+        A leftover key that still resolves to a real target module in the current base model
+        becomes a frozen module: loaded, hooked, and applied, but never trained. A leftover key
+        that resolves to nothing (the base model has no such module -- e.g. a stale or foreign
+        checkpoint key) becomes a dummy: preserved only so it round-trips through state_dict().
+        """
+        remaining_prefixes: dict[str, set[str]] = defaultdict(set)
+
+        for name in remaining_names:
+            resolved_prefix = self.__find_target_prefix(name)
+            if resolved_prefix is not None:
+                remaining_prefixes[resolved_prefix].add(name)
+            else:
+                remaining_prefixes[name.rsplit(".", 1)[0]].add(name)
+
+        for full_prefix in sorted(remaining_prefixes):
+            short_name = full_prefix.removeprefix(self.prefix + ".") if self.prefix else full_prefix
+
+            if short_name in self.target_modules and short_name not in self.lora_modules:
+                module = self.klass(
+                    full_prefix, self.target_modules[short_name], *self.additional_args, **self.additional_kwargs
+                )
+                module.load_state_dict(state_dict)
+                module.requires_grad_(False)
+                self.frozen_lora_modules[short_name] = module
+            else:
+                module = self.dummy_klass(full_prefix, None, *self.additional_args, **self.additional_kwargs)
+                module.load_state_dict(state_dict)
+                self.dummy_lora_modules[full_prefix] = module
 
     def __create_modules(self, orig_module: nn.Module | None, config: TrainConfig) -> dict[str, PeftBase]:
         if orig_module is None:
@@ -1036,6 +1119,9 @@ class LoRAModuleWrapper:
     def requires_grad_(self, requires_grad: bool):
         for module in self.lora_modules.values():
             module.requires_grad_(requires_grad)
+        # frozen inherited modules are never trainable, regardless of what's requested here.
+        for module in self.frozen_lora_modules.values():
+            module.requires_grad_(False)
 
     def set_multiplier(self, multiplier: float):
         """Set the signed adapter-delta scale on every module in this wrapper.
@@ -1043,8 +1129,15 @@ class LoRAModuleWrapper:
         This is the "slider" knob: 0.0 disables the adapter (frozen-base pass),
         +/- values steer the concept, and it doubles as inference-time strength.
         Non-additive PEFT types raise (at forward time) for a non-default value.
+
+        Applies to every *real* (hooked) module -- trainable and frozen inherited alike.
+        A frozen module still contributes to the forward pass exactly like a trainable
+        one; excluding it here would mean 0.0 doesn't actually give the frozen-base pass
+        the docstring promises, and a strength slider that only scaled the newest layer
+        filter would visibly desync from the rest of the adapter's effect. Dummy modules
+        are never hooked, so setting a multiplier on them would be a no-op either way.
         """
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             module.set_multiplier(multiplier)
 
     def parameters(self) -> list[Parameter]:
@@ -1054,7 +1147,7 @@ class LoRAModuleWrapper:
         return parameters
 
     def to(self, device: torch.device = None, dtype: torch.dtype = None) -> 'LoRAModuleWrapper':
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             module.to(device, dtype)
         return self
 
@@ -1101,77 +1194,97 @@ class LoRAModuleWrapper:
         check_fusion_match(state_dict.keys(), self.fuse, self.fusion_spec)
         self._check_rank_matches(state_dict)
 
+        freshly_initialized = []
+
         try:
             for module in self.lora_modules.values():
-                module.load_state_dict(state_dict, strict=strict)
+                # A module the *current* filter selects but the checkpoint has no keys for is a
+                # layer newly added by a wider filter -- leave it at its fresh init rather than
+                # strict-loading an empty dict into it (which nn.Module.load_state_dict rejects as
+                # missing keys). A module that does have some keys still loads strictly, so a
+                # genuinely incomplete/corrupt entry for an existing module still raises.
+                #
+                # The test deliberately mirrors PeftBase.load_state_dict's own prefix filter --
+                # startswith(prefix), no trailing dot -- so this guard can never disagree with the
+                # load it guards. Making it stricter would skip modules the loader would have fed.
+                if any(k.startswith(module.prefix) for k in state_dict):
+                    module.load_state_dict(state_dict, strict=strict)
+                else:
+                    freshly_initialized.append(module.prefix)
         except RuntimeError as e:
             raise RuntimeError(f"Error during loading of module key \"{module.prefix}\"") from e
+
+        # Say so. A wider filter legitimately adds layers the checkpoint never had, but a
+        # truncated or mismatched checkpoint reaches this same branch and would otherwise be
+        # indistinguishable from it -- silently, at fresh init, for the rest of the run.
+        if freshly_initialized:
+            print(
+                f"{len(freshly_initialized)} layer(s) selected by the current filter had no weights "
+                f"in the checkpoint and start from a fresh initialization: "
+                f"{sorted(freshly_initialized)}"
+            )
 
         # Temporarily re-create the state dict, so we can see what keys were left.
         remaining_names = set(state_dict) - set(self.state_dict())
 
-        # create dummy modules for the remaining keys
-        for name in remaining_names:
-            if name.endswith(".alpha"):
-                prefix = name.removesuffix(".alpha")
-                module = self.dummy_klass(prefix, None, *self.additional_args, **self.additional_kwargs)
-                module.load_state_dict(state_dict)
-                self.lora_modules[prefix] = module
+        self.__load_remaining_state(state_dict, remaining_names)
 
     def state_dict(self) -> dict:
         """
-        Returns the state dict
+        Returns the state dict. Includes trainable, frozen, and dummy modules, so a save after a
+        narrower-filter resume preserves the inherited (frozen) and unmatched (dummy) weights too.
         """
         state_dict = {}
 
-        for module in self.lora_modules.values():
+        for module in self.__iter_stateful_modules():
             state_dict |= module.state_dict(prefix=module.prefix)
 
         return state_dict
 
     def modules(self) -> list[nn.Module]:
         """
-        Returns a list of all modules
+        Returns a list of all modules that are actually part of the model (trainable + frozen).
         """
         modules = []
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             modules += module.modules()
 
         return modules
 
     def hook_to_module(self):
         """
-        Hooks the LoRA into the module without changing its weights
+        Hooks the LoRA into the module without changing its weights. Dummy modules are never
+        hooked -- they hold no target module to hook into.
         """
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             module.hook_to_module()
 
     def remove_hook_from_module(self):
         """
         Removes the LoRA hook from the module without changing its weights
         """
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             module.remove_hook_from_module()
 
     def apply_to_module(self):
         """
         Applys the LoRA to the module, changing its weights
         """
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             module.apply_to_module()
 
     def extract_from_module(self, base_module: nn.Module):
         """
         Creates a LoRA from the difference between the base_module and the orig_module
         """
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             module.extract_from_module(base_module)
 
     def prune(self):
         """
         Removes all dummy modules
         """
-        self.lora_modules = {k: v for (k, v) in self.lora_modules.items() if not isinstance(v, self.dummy_klass)}
+        self.dummy_lora_modules = {}
 
     def set_dropout(self, dropout_probability: float):
         """
