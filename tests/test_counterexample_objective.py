@@ -412,3 +412,87 @@ def test_the_bounded_term_stops_where_gradient_ascent_does_not():
     # And the bounded one settled somewhere finite and only modestly past the
     # reference -- "worse than base on the bad image", not "destroyed".
     assert d_ref < bounded < 20 * d_ref
+
+
+# ---------------------------------------------------------------------------
+# Composition with gradient-aligned (GA) initialization.
+#
+# These features are separate upstream PRs and neither diff can carry the code
+# under test: upstream has no GA init, so the counterexample PR cannot name its
+# estimation pass; upstream has no counterexamples, so the GA PR has nothing to
+# exclude. The coupling lands only where both are present, and these tests are
+# the only thing holding it.
+#
+# The coupling has two ends and they fail differently. The GA pass zeroes these
+# rows' targets (GenericTrainer) *and* opts out of the repulsion (the flag read
+# below). Dropping the opt-out is loud -- the run crashes on the missing
+# reference, as the control here shows. Dropping the target substitution is
+# silent: the pass completes and estimates the initialization toward the very
+# images the run is meant to be pushed away from.
+# ---------------------------------------------------------------------------
+
+def test_the_ga_estimation_pass_opts_out_of_the_repulsion():
+    """The GA pass runs the model without the frozen reference, and says so."""
+    TELEMETRY.reset()
+    batch, data = _batch_and_data([ConceptType.COUNTEREXAMPLE], with_reference=False)
+    data["skip_counterexample_repulsion"] = True
+
+    losses = _Mixin()._flow_matching_losses(batch, data, _config(batch_size=1), torch.device("cpu"))
+
+    assert torch.isfinite(losses).all()
+    assert TELEMETRY.take().rows == 0, "an opted-out pass must not report repulsion telemetry"
+
+
+def test_the_opt_out_did_not_weaken_the_missing_reference_guard():
+    """The control. Same batch, flag absent -- the guard must still fire.
+
+    Without it the opt-out would be a general 'skip the loss' switch, and a
+    counterexample row reaching the loss with no reference would fall through
+    as an ordinary positive: the one failure of this feature a green run never
+    reveals.
+    """
+    TELEMETRY.reset()
+    batch, data = _batch_and_data([ConceptType.COUNTEREXAMPLE], with_reference=False)
+    try:
+        _Mixin()._flow_matching_losses(batch, data, _config(batch_size=1), torch.device("cpu"))
+    except RuntimeError as exc:
+        assert "COUNTEREXAMPLE" in str(exc)
+        return
+    raise AssertionError("the flag must not suppress the guard when it is unset")
+
+
+def test_the_opt_out_is_scoped_to_counterexample_rows():
+    """A batch with no counterexample row is untouched either way, so the flag
+    can never become a switch that disables ordinary training rows."""
+    TELEMETRY.reset()
+    cfg = _config(batch_size=2)
+    baseline = None
+    for flag in (False, True):
+        batch, data = _batch_and_data([ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION])
+        data["skip_counterexample_repulsion"] = flag
+        losses = _Mixin()._flow_matching_losses(batch, data, cfg, torch.device("cpu"))
+        if baseline is None:
+            baseline = losses.detach().clone()
+        else:
+            assert torch.allclose(losses, baseline)
+
+
+def test_the_ga_pass_treats_counterexample_rows_as_inert():
+    """The silent half of the coupling, made testable.
+
+    The pass itself needs a model and a dataloader, so this pins the predicate
+    instead. A counterexample row left out of this list keeps its ordinary
+    reconstruction loss during gradient estimation, and the initialization is
+    then aligned toward the near-miss image -- with nothing raised and nothing
+    logged.
+    """
+    from modules.trainer.GenericTrainer import GenericTrainer
+
+    types_ = [
+        ConceptType.STANDARD.value,
+        ConceptType.COUNTEREXAMPLE.value,
+        ConceptType.PRIOR_PREDICTION.value,
+        ConceptType.VALIDATION.value,
+    ]
+
+    assert GenericTrainer.inert_gradient_init_indices(types_, 4) == [1, 2]

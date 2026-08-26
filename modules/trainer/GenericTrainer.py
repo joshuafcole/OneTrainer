@@ -714,6 +714,24 @@ class GenericTrainer(BaseTrainer):
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         return os.path.join(config.cache_dir, "ga_init", f"{digest}.pt")
 
+    @staticmethod
+    def inert_gradient_init_indices(concept_types, batch_size: int) -> list[int]:
+        """Rows whose loss must be zeroed during the GA gradient estimation pass.
+
+        Public and free-standing only so it can be tested: the pass around it
+        needs a real model and dataloader, which puts it past the unit boundary,
+        and this predicate is the half of the counterexample/GA coupling that
+        fails *silently* when it is wrong. Getting it wrong does not raise; it
+        points the initialization at the images the run exists to move away
+        from.
+        """
+        return [
+            i
+            for i in range(batch_size)
+            if ConceptType(concept_types[i])
+            in (ConceptType.PRIOR_PREDICTION, ConceptType.COUNTEREXAMPLE)
+        ]
+
     def __run_peft_gradient_init(self):
         """Gradient-aligned (GA) initialization: Kron-GA for LoKr, LoRA-GA for
         LoRA (the LoRA-GA property backported to LoKr's Van Loan factors, and
@@ -810,16 +828,28 @@ class GenericTrainer(BaseTrainer):
                 # so the trained model *is* the prior model. Detaching the
                 # prediction as their target zeroes their loss without running
                 # the prior model.
-                prior_pred_indices = [
-                    i
-                    for i in range(config.batch_size)
-                    if ConceptType(batch["concept_type"][i]) == ConceptType.PRIOR_PREDICTION
-                ]
-                if len(prior_pred_indices) > 0:
+                #
+                # Counterexamples are excluded for the same reason and by the
+                # same trick: at step 0 their true gradient is the half-scale
+                # repulsion (delta == 0 exactly, because the adapter is still
+                # zero), which would point the initialization *away* from the
+                # data. This half is silent if it is dropped -- the pass still
+                # runs, it just estimates toward the wrong images -- so it is
+                # the half to check first when the two features are composed.
+                inert_indices = self.inert_gradient_init_indices(
+                    batch["concept_type"], config.batch_size
+                )
+                if len(inert_indices) > 0:
                     predicted_detached = model_output_data["predicted"].detach().to(
                         dtype=model_output_data["target"].dtype
                     )
-                    model_output_data["target"][prior_pred_indices] = predicted_detached[prior_pred_indices]
+                    model_output_data["target"][inert_indices] = predicted_detached[inert_indices]
+
+                # The other end of the same decision. Set unconditionally: the
+                # repulsion needs the frozen reference forward, which this pass
+                # deliberately does not run, so without this flag
+                # _apply_counterexample_losses raises rather than guessing.
+                model_output_data["skip_counterexample_repulsion"] = True
 
                 loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, config)
                 (loss * loss_scale).backward()

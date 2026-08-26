@@ -265,6 +265,13 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         ]
         if not indices:
             return losses
+        # The GA initialization pass opts out explicitly. It runs the model
+        # without the frozen reference and zeroes these rows' targets itself,
+        # so the repulsion has nothing to measure and must not be applied.
+        # Nothing else in the tree sets this: any *other* caller arriving here
+        # without a reference is the failure the raise below exists for.
+        if data.get("skip_counterexample_repulsion"):
+            return losses
         if "prior_target" not in data:
             raise RuntimeError(
                 "A COUNTEREXAMPLE concept is in the batch but no frozen reference prediction "
