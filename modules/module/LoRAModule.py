@@ -1194,6 +1194,8 @@ class LoRAModuleWrapper:
         check_fusion_match(state_dict.keys(), self.fuse, self.fusion_spec)
         self._check_rank_matches(state_dict)
 
+        freshly_initialized = []
+
         try:
             for module in self.lora_modules.values():
                 # A module the *current* filter selects but the checkpoint has no keys for is a
@@ -1201,10 +1203,26 @@ class LoRAModuleWrapper:
                 # strict-loading an empty dict into it (which nn.Module.load_state_dict rejects as
                 # missing keys). A module that does have some keys still loads strictly, so a
                 # genuinely incomplete/corrupt entry for an existing module still raises.
+                #
+                # The test deliberately mirrors PeftBase.load_state_dict's own prefix filter --
+                # startswith(prefix), no trailing dot -- so this guard can never disagree with the
+                # load it guards. Making it stricter would skip modules the loader would have fed.
                 if any(k.startswith(module.prefix) for k in state_dict):
                     module.load_state_dict(state_dict, strict=strict)
+                else:
+                    freshly_initialized.append(module.prefix)
         except RuntimeError as e:
             raise RuntimeError(f"Error during loading of module key \"{module.prefix}\"") from e
+
+        # Say so. A wider filter legitimately adds layers the checkpoint never had, but a
+        # truncated or mismatched checkpoint reaches this same branch and would otherwise be
+        # indistinguishable from it -- silently, at fresh init, for the rest of the run.
+        if freshly_initialized:
+            print(
+                f"{len(freshly_initialized)} layer(s) selected by the current filter had no weights "
+                f"in the checkpoint and start from a fresh initialization: "
+                f"{sorted(freshly_initialized)}"
+            )
 
         # Temporarily re-create the state dict, so we can see what keys were left.
         remaining_names = set(state_dict) - set(self.state_dict())

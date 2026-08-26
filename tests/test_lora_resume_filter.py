@@ -278,6 +278,42 @@ def test_wider_filter_resume_creates_fresh_trainable_modules():
     assert torch.equal(new_module.lora_up.weight, torch.zeros_like(new_module.lora_up.weight))
 
 
+def test_a_wider_filter_says_which_layers_started_fresh(capsys):
+    """A fresh start is legitimate here and indistinguishable from a truncated checkpoint.
+
+    The wider-filter branch and a corrupt/mismatched checkpoint reach the same code with
+    the same effect -- the layer trains from scratch for the whole run. The only thing
+    separating "I widened the filter" from "my checkpoint is wrong" is that the run says
+    so, so the message is part of the feature, not decoration.
+    """
+    model = _ThreeBlockNet()
+    wrapper_a = _wrapper(model, ["block0"])
+    state_dict = wrapper_a.state_dict()
+
+    wrapper_b = _wrapper(model, ["block0", "block1", "block2"])
+    wrapper_b.load_state_dict(state_dict)
+
+    out = capsys.readouterr().out
+    assert "fresh initialization" in out
+    assert "2 layer(s)" in out
+    # named, not just counted -- a count alone cannot tell you the wrong layer started fresh
+    assert "block1" in out
+    assert "block2" in out
+    assert "block0" not in out.split("fresh initialization")[-1]
+
+
+def test_an_equal_filter_stays_quiet(capsys):
+    """The control: no fresh starts, no message. Otherwise every ordinary resume cries wolf."""
+    model = _ThreeBlockNet()
+    wrapper_a = _wrapper(model, ["block0", "block1"])
+    state_dict = wrapper_a.state_dict()
+
+    wrapper_b = _wrapper(model, ["block0", "block1"])
+    wrapper_b.load_state_dict(state_dict)
+
+    assert "fresh initialization" not in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # The longest-prefix-match case
 # ---------------------------------------------------------------------------
