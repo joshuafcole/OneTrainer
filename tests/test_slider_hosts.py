@@ -1164,3 +1164,15 @@ def test_the_image_regime_keeps_the_ordinary_lora_residency(regime, expected):
 
     setup.setup_train_device(model, config)
     assert model.materialized == expected
+
+
+def test_sdxl_refuses_the_image_regime_before_building_an_adapter():
+    """The regime dropdown is model-agnostic, so IMAGE + SDXL is a pairing a user
+    can reach. The data loader refuses it too, but that is one model load later."""
+    setup = _bare(StableDiffusionXLSliderSetup)
+    config = _config(
+        model_type=ModelType.STABLE_DIFFUSION_XL_10_BASE,
+        slider_regime=SliderRegime.IMAGE,
+    )
+    with pytest.raises(NotImplementedError, match="not implemented for SDXL"):
+        setup.setup_model(model=None, config=config)

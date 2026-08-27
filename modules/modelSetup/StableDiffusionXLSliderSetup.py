@@ -115,6 +115,14 @@ class StableDiffusionXLSliderSetup(
     ):
         self._check_slider_peft_type(config)
         self._check_trainable_parts(config)
+        if config.slider_regime != SliderRegime.PROMPT_PAIR:
+            # The regime dropdown is model-agnostic, so this pairing is reachable
+            # and has to be refused by name. The data loader refuses it too, but
+            # that is one model load later -- same argument as the PEFT check.
+            raise NotImplementedError(
+                f"the {config.slider_regime} slider regime is not implemented for SDXL. Pick "
+                f"the prompt-pair regime on the Slider tab."
+            )
 
         model.text_encoder_1_lora = None
         model.text_encoder_2_lora = None
