@@ -231,6 +231,30 @@ def test_adding_a_first_bucket_tier_moves_the_image_cache():
         "a cache whose aggregate names grew must not be reused"
 
 
+def test_neither_cache_shares_a_directory_with_a_different_name_set():
+    """The general form, for both caches: what is stored decides where it is
+    stored. Each concrete loader picks its own names from config, so this is the
+    guarantee they all rely on."""
+    def dirs(image_split, image_aggregate, text_split):
+        loader = _Loader()
+        loader._cache_bucketing = bucketing_params(
+            _config(), quantization=QUANTIZATION, batch_size=4)
+        loader._cache_concepts = []
+        modules = loader._cache_modules_from_names(
+            model=None, model_setup=None,
+            image_split_names=image_split, image_aggregate_names=image_aggregate,
+            text_split_names=text_split, sort_names=["concept"],
+            config=_config(), text_caching=True, before_cache_image_fun=lambda: None,
+        )
+        caches = [m for m in modules if isinstance(m, DiskCache)]
+        return tuple(c.cache_dir for c in caches)
+
+    baseline = dirs(["latent_image"], ["crop_resolution"], ["tokens"])
+    assert dirs(["latent_image", "latent_depth"], ["crop_resolution"], ["tokens"])[0] != baseline[0]
+    assert dirs(["latent_image"], ["crop_resolution", "image_path"], ["tokens"])[0] != baseline[0]
+    assert dirs(["latent_image"], ["crop_resolution"], ["tokens", "pooled_state"])[1] != baseline[1]
+
+
 def test_turning_masked_training_on_moves_the_image_cache():
     """Split names take the same unguarded path as aggregate names, and a concrete
     loader derives them from config. Driven through StableDiffusionBaseDataLoader

@@ -111,6 +111,22 @@ def test_a_same_length_caption_reword_moves_only_the_caption_fingerprint():
         assert before[0] == after[0], "a caption edit must never move the media fingerprint"
 
 
+def test_a_same_size_image_replacement_moves_the_media_fingerprint():
+    """Media are identified by size and mtime, not by their bytes -- hashing every
+    image on every launch would cost more than the re-encode the cache saves. The
+    mtime half is what covers a replacement that happens to keep the same size, so
+    it is set explicitly here rather than left to filesystem timestamp resolution."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        concept_dir = _dataset(tmp_dir, images=("a.png",))
+        image = os.path.join(concept_dir, "a.png")
+        os.utime(image, ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
+        before = _fingerprint(concept_dir)
+
+        _write(image, b"z" * os.path.getsize(image))  # same size, different bytes
+        os.utime(image, ns=(2_000_000_000_000_000_000, 2_000_000_000_000_000_000))
+        assert _fingerprint(concept_dir)[0] != before[0]
+
+
 def test_a_mask_image_moves_the_media_fingerprint():
     """Mask and conditioning images sit in the concept dir under a postfix and are
     cached as tensors too (latent_mask, latent_conditioning_image), so editing one
