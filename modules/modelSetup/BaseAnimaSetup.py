@@ -33,7 +33,14 @@ class BaseAnimaSetup(
     ModelSetupText2ImageMixin,
     metaclass=ABCMeta
 ):
-    # CosmosTransformerBlock has attn1 (self-attn), attn2 (cross-attn), ff (feedforward)
+    # CosmosTransformerBlock has attn1 (self-attn), attn2 (cross-attn), ff (feedforward) and three
+    # CosmosAdaLayerNormZero modulations (norm1/2/3, each holding linear_1 + linear_2). Those six
+    # adaLN Linears -- the per-block conditioning offsets that decide how each block reads the
+    # prompt -- are the *only* thing "blocks" adapts that "attn-mlp" does not: measured on
+    # Anima-Base-v1.0's published transformer config, 280 -> 448 adapted Linears and 1.51x the LoRA
+    # parameters at equal rank. Style / "look" LoRAs are the ones that want them; a subject LoRA is
+    # usually better off on attn-mlp, leaving the conditioning path alone.
+    # tests/test_anima_layer_presets.py produces both numbers.
     LAYER_PRESETS = {
         "attn-mlp": ["attn1", "attn2", "ff"],
         "attn-only": ["attn1", "attn2"],
