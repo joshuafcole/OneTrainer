@@ -82,7 +82,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     # filtered concept list. Passing them as arguments instead would mean changing
     # a signature every concrete loader calls.
     _cache_bucketing: BucketingParams | None = None
-    _cache_concepts: list[ConceptConfig] = []
+    _cache_concepts: list[ConceptConfig] | None = None
 
     def _enumerate_input_modules(self, config: TrainConfig, allow_videos: bool = False) -> list:
         supported_extensions = set()
@@ -422,7 +422,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         # stale tensors or raising KeyError on a name that was not there when it was
         # built. Computed after the bucket tags are added so the names it sees are the
         # names the DiskCache is given. See modules/util/cache_key.py.
-        if self._cache_bucketing is None:
+        if self._cache_bucketing is None or self._cache_concepts is None:
             raise RuntimeError(
                 "cache salts are unset: _cache_modules_from_names must be reached through "
                 "DataLoaderText2ImageMixin._create_dataset, which derives the bucket geometry."
