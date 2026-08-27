@@ -671,3 +671,54 @@ def test_a_foreign_safetensors_file_is_not_read_as_a_capture(tmp_path):
     save_file({"a": torch.zeros(2, 2)}, str(path))
     with pytest.raises(ContributionError, match="not a block_contribution capture"):
         block_contribution.load_activations(path)
+
+
+# --------------------------------------------------------------------- sys.path bootstrap
+
+def test_a_script_that_imports_modules_puts_the_repo_root_on_sys_path():
+    """Running a file by path puts only *that file's* directory on sys.path.
+
+    Not the repo root and not the cwd -- so ``from modules.… import …`` inside
+    ``scripts/util/`` raises ``ModuleNotFoundError`` unless the script first puts
+    the checkout root there itself. ``block_contribution`` did not, and its
+    activation-capture path (the only one that loads a model) could not run
+    standalone as a result. rehearsal-agent invokes these by path
+    (``[ot_python, "-X", "utf8", str(script), *args]``), which is exactly the
+    shape that breaks; ``cwd`` being the checkout does not help, because a script
+    invocation never puts the cwd on the path.
+
+    Two mechanisms are in use and both are accepted: OT's own ``script_imports()``
+    (which also loads ZLUDA on Windows -- right for anything that will touch CUDA)
+    and a bare ``parents[2]`` insert (right for a module that is *imported* by
+    tests and must not drag ZLUDA in). Checked over the whole directory, because
+    the next script to reach for ``modules`` will hit the same wall.
+    """
+    import ast
+    import pathlib as _pathlib
+
+    util = _pathlib.Path(__file__).resolve().parent.parent / "scripts" / "util"
+    offenders = []
+    for path in sorted(util.glob("*.py")):
+        # import_util.py *is* the bootstrap: its own modules.zluda import runs
+        # after the insert it exists to perform.
+        if path.name == "import_util.py":
+            continue
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        imports_modules = any(
+            (isinstance(n, ast.ImportFrom) and (n.module or "").startswith("modules"))
+            or (isinstance(n, ast.Import) and any(a.name.startswith("modules") for a in n.names))
+            for n in ast.walk(tree)
+        )
+        if not imports_modules:
+            continue
+        bootstraps = any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "script_imports"
+            for n in ast.walk(tree)
+        ) or ("parents[2]" in source or "parent.parent.parent" in source)
+        if not bootstraps:
+            offenders.append(path.name)
+    assert not offenders, (
+        "these scripts import modules.* but never put the checkout root on sys.path, so "
+        f"they raise ModuleNotFoundError when run by path: {offenders}"
+    )
