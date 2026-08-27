@@ -6,4 +6,6 @@
 
 [Embedding Training](EmbeddingTraining.md)
 
+[Concept Sliders](ConceptSliders.md)
+
 [Captioning and Masking](CaptioningAndMasking.md)
