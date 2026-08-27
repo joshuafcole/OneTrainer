@@ -84,6 +84,15 @@ def init_compile():
     # modules during the backward pass.
     torch._dynamo.config.cache_size_limit = 8192
 
+    # a second, independent cap: cache_size_limit bounds recompiles per code
+    # object, accumulated_recompile_limit bounds them across all of them, and it
+    # defaults to 256. aspect bucketing gives every distinct latent shape its own
+    # recompile, so a run with many buckets can exhaust the accumulated budget
+    # while every individual frame stays well under its own limit. raising only
+    # the per-frame cap leaves the run capped at 256 with nothing in the log to
+    # say which limit it hit.
+    torch._dynamo.config.accumulated_recompile_limit = 8192
+
     # same thread-local-config problem: force_parameter_static_shapes defaults to True and would
     # override maybe_mark_dynamic on the compressed weight, so the reentrant-checkpoint backward
     # (running on autograd worker threads that don't see _compress_weight()'s main-thread setting)
