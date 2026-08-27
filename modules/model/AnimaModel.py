@@ -2,7 +2,8 @@ import math
 from contextlib import nullcontext
 from random import Random
 
-from modules.model.BaseModel import BaseModel
+from modules.model.BaseModel import BaseModel, BaseModelEmbedding
+from modules.module.AdditionalEmbeddingWrapper import AdditionalEmbeddingWrapper
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.util.convert_util import add_prefix
 from modules.util.enum.DataType import DataType
@@ -24,6 +25,28 @@ from transformers import Qwen2Tokenizer, Qwen3Model, T5TokenizerFast
 PROMPT_MAX_LENGTH = 512
 
 
+class AnimaModelEmbedding:
+    def __init__(
+            self,
+            uuid: str,
+            text_encoder_vector: Tensor | None,
+            placeholder: str,
+            is_output_embedding: bool,
+    ):
+        # Anima has two token vocabularies but only ONE trainable embedding table: Qwen3's word
+        # embeddings. The T5 ids the conditioner takes as queries are looked up in a table that lives
+        # inside AnimaTextConditioner, and ComfyUI's Anima encoder does not read a TI vector from it --
+        # a token trained there could not reproduce its concept outside OneTrainer. So the T5 side is
+        # deliberately left untouched and this holder carries a single Qwen3 embedding, exactly like
+        # every other single-text-encoder model.
+        self.text_encoder_embedding = BaseModelEmbedding(
+            uuid=uuid,
+            placeholder=placeholder,
+            vector=text_encoder_vector,
+            is_output_embedding=is_output_embedding,
+        )
+
+
 class AnimaModel(BaseModel):
     # base model data
     tokenizer: Qwen2Tokenizer | None
@@ -41,6 +64,11 @@ class AnimaModel(BaseModel):
 
     text_encoder_offload_conductor: LayerOffloadConductor | None
     transformer_offload_conductor: LayerOffloadConductor | None
+
+    # persistent embedding training data
+    embedding: AnimaModelEmbedding | None
+    additional_embeddings: list[AnimaModelEmbedding] | None
+    embedding_wrapper: AdditionalEmbeddingWrapper | None
 
     # persistent lora training data
     transformer_lora: LoRAModuleWrapper | None
@@ -68,6 +96,10 @@ class AnimaModel(BaseModel):
 
         self.text_encoder_offload_conductor = None
         self.transformer_offload_conductor = None
+
+        self.embedding = None
+        self.additional_embeddings = []
+        self.embedding_wrapper = None
 
         self.transformer_lora = None
         self.lora_state_dict = None
@@ -125,6 +157,17 @@ class AnimaModel(BaseModel):
         # kohya-ss loads the DiT with the net. wrapper stripped -> the netless body.
         return self._diffusers_to_dit()
 
+    def all_embeddings(self) -> list[AnimaModelEmbedding]:
+        return self.additional_embeddings \
+               + ([self.embedding] if self.embedding is not None else [])
+
+    def all_text_encoder_embeddings(self) -> list[BaseModelEmbedding]:
+        return [embedding.text_encoder_embedding for embedding in self.additional_embeddings] \
+               + ([self.embedding.text_encoder_embedding] if self.embedding is not None else [])
+
+    def add_text_encoder_embeddings_to_prompt(self, prompt: str) -> str:
+        return self._add_embeddings_to_prompt(self.all_text_encoder_embeddings(), prompt)
+
     def materialize(self, *parts: str):
         super().materialize(*parts)
         # text_conditioner isn't in ModelType.model_parts(); it always travels with text_encoder.
@@ -177,8 +220,15 @@ class AnimaModel(BaseModel):
             if isinstance(text, str):
                 text = [text]
 
+            # Textual-inversion placeholders are substituted on the Qwen3 branch ONLY. The trained vector
+            # lives in the Qwen3 word-embedding table; the T5 branch sees the prompt as written, so the
+            # placeholder tokenizes naturally there. That is precisely what ComfyUI's Anima encoder does,
+            # and it is why a token trained here reproduces its concept there. The data loader splits the
+            # prompt the same way (prompt_qwen for Qwen3, prompt for T5).
+            qwen_text = [self.add_text_encoder_embeddings_to_prompt(t) for t in text]
+
             tokenizer_output = self.tokenizer(
-                text,
+                qwen_text,
                 max_length=PROMPT_MAX_LENGTH,
                 padding='max_length',
                 truncation=True,

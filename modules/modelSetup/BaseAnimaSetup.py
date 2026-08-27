@@ -2,13 +2,15 @@ from abc import ABCMeta
 from random import Random
 
 import modules.util.multi_gpu_util as multi
-from modules.model.AnimaModel import AnimaModel
+from modules.model.AnimaModel import AnimaModel, AnimaModelEmbedding
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupDebugMixin import ModelSetupDebugMixin
 from modules.modelSetup.mixin.ModelSetupDiffusionLossMixin import ModelSetupDiffusionLossMixin
+from modules.modelSetup.mixin.ModelSetupEmbeddingMixin import ModelSetupEmbeddingMixin
 from modules.modelSetup.mixin.ModelSetupFlowMatchingMixin import ModelSetupFlowMatchingMixin
 from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
+from modules.module.AdditionalEmbeddingWrapper import AdditionalEmbeddingWrapper
 from modules.util.checkpointing_util import (
     enable_checkpointing_for_qwen3_encoder_layers,
     enable_checkpointing_for_qwen_transformer,
@@ -25,6 +27,7 @@ class BaseAnimaSetup(
     BaseModelSetup,
     ModelSetupDiffusionLossMixin,
     ModelSetupDebugMixin,
+    ModelSetupEmbeddingMixin,
     ModelSetupNoiseMixin,
     ModelSetupFlowMatchingMixin,
     ModelSetupText2ImageMixin,
@@ -49,6 +52,90 @@ class BaseAnimaSetup(
         self._setup_model_part(model, config, "vae", config.vae)
 
         self._set_attention_backend(model.transformer, config.attention_mechanism, mask=False)
+
+    def _setup_embeddings(
+            self,
+            model: AnimaModel,
+            config: TrainConfig,
+    ):
+        # Only the Qwen3 word-embedding table is trainable. See AnimaModelEmbedding for why the T5 table
+        # inside AnimaTextConditioner is left alone.
+        additional_embeddings = []
+        for embedding_config in config.all_embedding_configs():
+            embedding_state = model.embedding_state_dicts.get(embedding_config.uuid, None)
+            if embedding_state is None:
+                with model.autocast_context:
+                    embedding_state = self._create_new_embedding(
+                        model,
+                        embedding_config,
+                        model.tokenizer,
+                        model.text_encoder,
+                    )
+            else:
+                embedding_state = embedding_state.get("qwen", None)
+
+            if embedding_state is not None:
+                embedding_state = embedding_state.to(
+                    dtype=model.text_encoder.get_input_embeddings().weight.dtype,
+                    device=self.train_device,
+                ).detach()
+
+            embedding = AnimaModelEmbedding(
+                embedding_config.uuid,
+                embedding_state,
+                embedding_config.placeholder,
+                embedding_config.is_output_embedding,
+            )
+            if embedding_config.uuid == config.embedding.uuid:
+                model.embedding = embedding
+            else:
+                additional_embeddings.append(embedding)
+
+        model.additional_embeddings = additional_embeddings
+
+        if model.tokenizer is not None:
+            self._add_embeddings_to_tokenizer(model.tokenizer, model.all_text_encoder_embeddings())
+
+    def _setup_embedding_wrapper(
+            self,
+            model: AnimaModel,
+            config: TrainConfig,
+    ):
+        if model.tokenizer is not None:
+            model.embedding_wrapper = AdditionalEmbeddingWrapper(
+                tokenizer=model.tokenizer,
+                orig_module=model.text_encoder.get_input_embeddings(),
+                embeddings=model.all_text_encoder_embeddings(),
+            )
+
+        if model.embedding_wrapper is not None:
+            model.embedding_wrapper.hook_to_module()
+
+    def _setup_embeddings_requires_grad(
+            self,
+            model: AnimaModel,
+            config: TrainConfig,
+    ):
+        for embedding, embedding_config in zip(model.all_text_encoder_embeddings(),
+                                               config.all_embedding_configs(), strict=True):
+            train_embedding = \
+                embedding_config.train \
+                and config.text_encoder.train_embedding \
+                and not self.stop_embedding_training_elapsed(embedding_config, model.train_progress)
+            embedding.requires_grad_(train_embedding)
+
+    @staticmethod
+    def _reject_output_embeddings(config: TrainConfig):
+        # An output embedding replaces the text encoder's OUTPUT rows for the placeholder's token
+        # positions. On Anima the transformer never sees the Qwen3 output: AnimaTextConditioner consumes it
+        # and emits a fixed (B, 512, 1024) sequence indexed by T5 positions, so there is no position to
+        # write the output vector into. Accepting one would train a tensor that changes nothing -- refuse
+        # it instead of silently producing a dead run.
+        if config.train_any_output_embedding():
+            raise NotImplementedError(
+                "Output embeddings are not supported for Anima: AnimaTextConditioner rewrites the text "
+                "encoder's output into its own sequence, so an output vector has no position to occupy. "
+                "Train a normal (input) embedding instead.")
 
     def predict(
             self,
