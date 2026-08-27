@@ -7,6 +7,7 @@ from modules.module.AdditionalEmbeddingWrapper import AdditionalEmbeddingWrapper
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.util.convert_util import add_prefix
 from modules.util.enum.DataType import DataType
+from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType
 from modules.util.LayerOffloadConductor import LayerOffloadConductor
 
@@ -156,6 +157,28 @@ class AnimaModel(BaseModel):
     def lora_diffusers_to_kohya(self) -> list | None:
         # kohya-ss loads the DiT with the net. wrapper stripped -> the netless body.
         return self._diffusers_to_dit()
+
+    def lora_text_encoders(self) -> list[tuple[torch.nn.Module | None, dict[ModelFormat, str]]]:
+        # Anima trains no text-encoder LoRA -- AnimaLoRASetup wraps the transformer only. This declares the
+        # Qwen3 encoder anyway because it is also the LoRA file's text-encoder NAMESPACE declaration, and the
+        # bundled-embedding keys live in that namespace: lora_original_conversion / lora_kohya_conversion
+        # append the "bundle_emb" passthrough only when a model declares a text encoder, and both run their
+        # convert() with strict=True. Without this, saving a LoRA that bundles a TI vector dies with
+        # "No conversion found for key bundle_emb..." in the COMFY and KOHYA paths.
+        #
+        # No COMFY_LORA name on purpose. It would be pure guesswork -- nothing here has ever written a
+        # Comfy-native Anima text-encoder key -- and _save_comfy raises a clear error for a TE with no COMFY
+        # name rather than silently writing keys ComfyUI drops. Whoever adds TE LoRA training for Anima adds
+        # the verified name then. Omitting it does not affect bundle_emb: that passthrough is keyed off
+        # DIFFUSERS_LORA.
+        if self.text_encoder is None:
+            return []
+        return [
+            (self.text_encoder, {
+                ModelFormat.DIFFUSERS_LORA: "text_encoder",
+                ModelFormat.KOHYA_LORA: "lora_te",
+            }),
+        ]
 
     def all_embeddings(self) -> list[AnimaModelEmbedding]:
         return self.additional_embeddings \
