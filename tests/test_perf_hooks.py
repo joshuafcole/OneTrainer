@@ -170,6 +170,112 @@ class TestTheTrainerStillTimesTheRegionsItClaimsTo:
         assert set(tics) == {"predict", "prior_predict", "backward", "optimizer"}
 
 
+def _region_spans(path):
+    """Every (label, first_line, last_line) region, paired in source order.
+
+    ``_region_labels`` counts the pairs; this one locates them. Balance says the
+    hooks exist, which is not the same as saying they are on the right side of the
+    call they name -- a ``toc`` above its ``tic`` still balances, and still reports
+    a duration measured over the wrong statements.
+    """
+    marks = []
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "perf"
+                and node.func.attr in ("tic", "toc") and node.args
+                and isinstance(node.args[0], ast.Constant)):
+            marks.append((node.lineno, node.args[0].value, node.func.attr))
+    open_at, spans = {}, []
+    for lineno, label, method in sorted(marks):
+        if method == "tic":
+            assert label not in open_at, f"perf.tic({label!r}) reopened at line {lineno} before its toc"
+            open_at[label] = lineno
+        else:
+            assert label in open_at, f"perf.toc({label!r}) at line {lineno} closes a region never opened"
+            spans.append((label, open_at.pop(label), lineno))
+    assert not open_at, f"regions opened and never closed: {open_at}"
+    return spans
+
+
+def _perf_note_arguments(path):
+    """``{note_name: source of the value expression}`` for every perf.note() call."""
+    notes = {}
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "perf"
+                and node.func.attr == "note" and len(node.args) == 2
+                and isinstance(node.args[0], ast.Constant)):
+            notes[node.args[0].value] = ast.unparse(node.args[1])
+    return notes
+
+
+class TestTheRegionsBracketTheWorkTheyName:
+    """Balanced is not the same as correct.
+
+    ``train()`` cannot be driven without a model, an optimizer and a dataloader, so
+    the statement *ordering* inside it is unreachable behaviourally. It is still
+    reachable structurally: a region has to open before it closes, and the source
+    between the two has to contain the call the label claims to be timing. This is
+    what catches a ``tic``/``toc`` pair written on the wrong sides of its call --
+    which balances, runs, and reports a number measured over the wrong work.
+    """
+
+    _PATH = _MODULES_ROOT / "trainer" / "GenericTrainer.py"
+
+    #: The call each region must enclose, and (for the two that both wrap
+    #: ``model_setup.predict``) the one it must *not*, so a swapped label is caught.
+    _MUST_ENCLOSE = {
+        "predict": ("self.model_setup.predict(", "self.model_setup.prior_model("),
+        "prior_predict": ("self.model_setup.prior_model(", None),
+        "backward": (".backward()", None),
+        "optimizer": ("self.model.optimizer.step()", None),
+    }
+
+    def test_a_region_opens_before_it_closes(self):
+        for label, first, last in _region_spans(self._PATH):
+            assert first < last, (
+                f"perf.toc({label!r}) is at line {last}, above its tic at {first} -- the region "
+                "is inverted and times everything except the call it names"
+            )
+
+    def test_each_region_encloses_the_call_it_is_named_after(self):
+        lines = self._PATH.read_text(encoding="utf-8").splitlines()
+        seen = set()
+        for label, first, last in _region_spans(self._PATH):
+            required, forbidden = self._MUST_ENCLOSE[label]
+            body = "\n".join(lines[first:last - 1])  # strictly between the two hooks
+            assert required in body, (
+                f"the {label!r} region (lines {first}-{last}) does not contain {required!r}; "
+                "it is bracketing something other than the work it reports"
+            )
+            if forbidden is not None:
+                assert forbidden not in body, (
+                    f"the {label!r} region (lines {first}-{last}) contains {forbidden!r} -- "
+                    "the two predict regions look swapped"
+                )
+            seen.add(label)
+        assert seen == set(self._MUST_ENCLOSE), f"unchecked regions: {set(self._MUST_ENCLOSE) - seen}"
+
+
+class TestTheStepNotesReportWhatTheyAreNamed:
+    """A note wired to the wrong field is a wrong number, not a missing one.
+
+    Every row is bucketed by these, so ``batch_size`` reading
+    ``gradient_accumulation_steps`` would not fail anything -- it would silently
+    make every comparison between rows meaningless. Pinned as source, because the
+    call site is inside ``train()``.
+    """
+
+    _PATH = _MODULES_ROOT / "trainer" / "GenericTrainer.py"
+
+    def test_each_note_reads_the_field_it_claims_to(self):
+        assert _perf_note_arguments(self._PATH) == {
+            "latent_tokens": "_latent_tokens(batch)",
+            "batch_size": "self.config.batch_size",
+            "rank": "multi.rank()",
+        }
+
+
 # --------------------------------------------------------------------------- 2. the off path
 
 class TestTheOffPathCallsNothing:
