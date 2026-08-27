@@ -754,14 +754,30 @@ class GenericTrainer(BaseTrainer):
             return
         if config.training_method != TrainingMethod.LORA:
             if config.training_method == TrainingMethod.SLIDER:
-                # Not merely unimplemented: for a symmetric slider the estimate is
-                # analytically zero. At step 0 the adapter is zero-init, so both
-                # trained passes see the same v == v_base, and the two MSE terms
-                # against v_base +/- eta*delta contribute gradients 2(v - target_pos)
-                # and 2(v - target_neg), which sum to 0. GA init would align the
-                # factors with float noise. Asymmetric sliders do have a signal;
-                # enabling it for them is a separate change with its own evidence.
-                print("GA init: skipping, the slider objective has no step-0 gradient to align to.")
+                # Two different reasons, so two different messages.
+                #
+                # GA init aligns the adapter factors with dL/dW of the *frozen base
+                # weight* (see this method's docstring). A symmetric slider drives
+                # that quantity to exactly zero: the two poles fit v_base + eta*delta
+                # and v_base - eta*delta, so their residuals are equal and opposite,
+                # and the base path W@c contributes the same Jacobian to both -- the
+                # sum cancels. Measured on a toy linear host: ||dL/dW|| 3.6e-07
+                # symmetric vs 7.0e+01 asymmetric.
+                #
+                # Note this is *not* a cold-start artifact and does not warm up
+                # (measured 4.4e-06 with a non-zero adapter): the cancellation is a
+                # property of fitting two opposite poles, at any adapter state. Nor
+                # does it mean a symmetric slider trains badly -- the gradient w.r.t.
+                # the adapter's own factors is healthy and in fact exactly 2x the
+                # asymmetric case, because there the multiplier's sign flips too.
+                # It is only GA's estimand that vanishes.
+                if config.slider_symmetric:
+                    print(
+                        "GA init: skipping, a symmetric slider's base-weight gradient "
+                        "cancels to zero -- there is no direction to align to."
+                    )
+                else:
+                    print("GA init: skipping, not implemented for asymmetric sliders yet.")
             return
         if self.model.train_progress.global_step > 0:
             print("GA init: skipping, training is being resumed.")

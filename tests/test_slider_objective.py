@@ -291,3 +291,94 @@ def test_rejects_zero_strength():
         mixin._slider_prompt_loss(
             run_velocity, lora.set_multiplier, c_t, pos, neg, eta=3.0, strength=0.0,
         )
+
+
+def _base_weight_grad(symmetric, warm_adapter=False, eta=3.0, strength=1.0):
+    """||dL/dW|| of the frozen base weight -- the quantity GA init aligns to."""
+    base, lora, run_velocity = _toy_model()
+    base.weight.requires_grad_(True)
+    if warm_adapter:
+        with torch.no_grad():
+            lora.lora_up.weight.copy_(torch.randn_like(lora.lora_up.weight) * 0.05)
+
+    c_t, pos, neg = _conds()
+    loss = _Mixin()._slider_prompt_loss(
+        run_velocity=run_velocity,
+        set_multiplier=lora.set_multiplier,
+        target_cond=c_t, positive_conds=pos, negative_conds=neg,
+        eta=eta, strength=strength, symmetric=symmetric,
+    )
+    base.weight.grad = None
+    loss.backward()
+    return base.weight.grad.norm().item()
+
+
+def test_symmetric_slider_cancels_the_base_weight_gradient():
+    """Why GA init is refused for a symmetric slider -- and why that is not a bug.
+
+    GA init re-initializes the adapter factors from a rank truncation of dL/dW of
+    the *frozen base weight*. A symmetric slider fits the two poles v_base+eta*d
+    and v_base-eta*d, whose residuals are equal and opposite; the base path
+    contributes the same Jacobian to both, so the sum cancels. There is nothing to
+    align to, and GA init would be aligning to float noise.
+
+    Locked as a test because the skip is otherwise justified only by a comment,
+    and because the asymmetric arm below is the evidence for the other half of
+    that comment: sliders are not categorically incompatible with GA init, only
+    symmetric ones are.
+    """
+    symmetric = _base_weight_grad(symmetric=True)
+    asymmetric = _base_weight_grad(symmetric=False)
+
+    assert asymmetric > 1e-2, "an asymmetric slider must have a real base-weight gradient"
+    assert symmetric < asymmetric * 1e-6, (
+        f"symmetric ||dL/dW||={symmetric:.3e} should cancel to noise "
+        f"against asymmetric {asymmetric:.3e}"
+    )
+
+
+def test_the_cancellation_is_not_a_cold_start_artifact():
+    """It does not warm up, so 'run GA init a few steps in' is not a workaround.
+
+    The cancellation is a property of fitting two opposite poles, not of the
+    zero-initialized adapter. Distinguishing these matters: the counterexample
+    objective's beta calibration *does* recover once the adapter warms, and the
+    natural fix there (wait, then measure) does nothing here.
+    """
+    cold = _base_weight_grad(symmetric=True, warm_adapter=False)
+    warm = _base_weight_grad(symmetric=True, warm_adapter=True)
+    reference = _base_weight_grad(symmetric=False)
+
+    assert warm < reference * 1e-4, (
+        f"warm symmetric ||dL/dW||={warm:.3e} is still noise against {reference:.3e}; "
+        "if this fails the cancellation warmed up and the skip needs revisiting"
+    )
+    assert cold < reference * 1e-4
+
+
+def test_symmetry_does_not_weaken_the_adapters_own_gradient():
+    """The flip side, and the reason the skip message must not say 'no gradient'.
+
+    Only GA's estimand vanishes. The gradient w.r.t. the adapter's own factors is
+    exactly *doubled* by symmetry, because the second pole flips the multiplier's
+    sign as well as the residual's -- two sign flips, a net addition. A reader who
+    takes 'no step-0 gradient' at face value would conclude a symmetric slider
+    cannot train, which is the opposite of true.
+    """
+    def adapter_grad(symmetric):
+        base, lora, run_velocity = _toy_model()
+        c_t, pos, neg = _conds()
+        loss = _Mixin()._slider_prompt_loss(
+            run_velocity=run_velocity, set_multiplier=lora.set_multiplier,
+            target_cond=c_t, positive_conds=pos, negative_conds=neg,
+            eta=3.0, strength=1.0, symmetric=symmetric,
+        )
+        lora.lora_up.weight.grad = None
+        loss.backward()
+        return lora.lora_up.weight.grad.norm().item()
+
+    one_pole = adapter_grad(symmetric=False)
+    two_poles = adapter_grad(symmetric=True)
+
+    assert one_pole > 1e-3
+    assert two_poles == pytest.approx(2.0 * one_pole, rel=1e-4)
