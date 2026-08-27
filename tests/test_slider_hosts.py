@@ -45,6 +45,7 @@ from modules.util.enum.DataType import DataType  # noqa: E402
 from modules.util.enum.ModelFormat import ModelFormat  # noqa: E402
 from modules.util.enum.ModelType import ModelType, PeftType  # noqa: E402
 from modules.util.enum.TrainingMethod import TrainingMethod  # noqa: E402
+from modules.util.ModelNames import EmbeddingName, ModelNames  # noqa: E402
 
 SLIDER_MODEL_TYPES = (
     ModelType.ANIMA,
@@ -602,4 +603,41 @@ def test_the_refused_set_is_exactly_the_set_that_raises_in_the_forward():
         (PeftType.LORA, True),
         (PeftType.LOKR, True),
     }
+
+# ---------------------------------------------------------------------------
+# resuming from a backup
+#
+# A slider is a LoRA on disk, so it backs up as one and must resume as one.
+# Falling through to the fine-tune branch hands an adapter directory to the
+# base-model loader: a resume that cannot work but reads like one that should.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("training_method", [TrainingMethod.LORA, TrainingMethod.SLIDER])
+def test_backup_resume_targets_the_lora_name_for_adapter_methods(training_method):
+    model_names = ModelNames(base_model="the-base-model")
+    model_names.set_backup_path(training_method, "/workspace/backup/2026-01-01")
+
+    assert model_names.lora == "/workspace/backup/2026-01-01"
+    assert model_names.base_model == "the-base-model", "the base model must survive the resume"
+
+
+def test_backup_resume_still_routes_fine_tunes_and_embeddings():
+    fine_tune = ModelNames(base_model="the-base-model")
+    fine_tune.set_backup_path(TrainingMethod.FINE_TUNE, "/backup/ft")
+    assert fine_tune.base_model == "/backup/ft"
+    assert fine_tune.lora == ""
+
+    embedding = ModelNames(embedding=EmbeddingName("uuid", "original"))
+    embedding.set_backup_path(TrainingMethod.EMBEDDING, "/backup/emb")
+    assert embedding.embedding.model_name == "/backup/emb"
+    assert embedding.base_model == ""
+
+
+def test_every_training_method_has_a_backup_destination():
+    """No silent fall-through: a method added later must be considered here."""
+    for training_method in TrainingMethod:
+        model_names = ModelNames(embedding=EmbeddingName("uuid", ""))
+        model_names.set_backup_path(training_method, "/backup/x")
+        assert "/backup/x" in (
+            model_names.lora, model_names.base_model, model_names.embedding.model_name)
 

@@ -132,13 +132,7 @@ class GenericTrainer(BaseTrainer):
             last_backup_path = self.config.get_last_backup_path()
 
             if last_backup_path:
-                if self.config.training_method == TrainingMethod.LORA:
-                    model_names.lora = last_backup_path
-                elif self.config.training_method == TrainingMethod.EMBEDDING:
-                    model_names.embedding.model_name = last_backup_path
-                else:  # fine-tunes
-                    model_names.base_model = last_backup_path
-
+                model_names.set_backup_path(self.config.training_method, last_backup_path)
                 print(f"Continuing training from backup '{last_backup_path}'...")
             else:
                 print("No backup found, continuing without backup...")

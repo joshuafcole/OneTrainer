@@ -12,7 +12,6 @@ from modules.util.compile_util import init_compile
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.EMAMode import EMAMode
-from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.time_util import get_string_timestamp
 
 import torch
@@ -71,13 +70,8 @@ class SampleWindowController:
             last_backup_path = self.initial_train_config.get_last_backup_path()
 
             if last_backup_path:
-                if self.initial_train_config.training_method == TrainingMethod.LORA:
-                    model_names.lora = last_backup_path
-                elif self.initial_train_config.training_method == TrainingMethod.EMBEDDING:
-                    model_names.embedding.model_name = last_backup_path
-                else:  # fine-tunes
-                    model_names.base_model = last_backup_path
-
+                model_names.set_backup_path(
+                    self.initial_train_config.training_method, last_backup_path)
                 print(f"Loading from backup '{last_backup_path}'...")
             else:
                 print("No backup found, loading without backup...")
