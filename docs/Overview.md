@@ -11,3 +11,5 @@
 [Captioning and Masking](CaptioningAndMasking.md)
 
 [Aspect Bucket Rebalancing](AspectBucketRebalancing.md)
+
+[Performance Profiling](PerformanceProfiling.md)
