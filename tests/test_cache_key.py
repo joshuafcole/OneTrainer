@@ -27,9 +27,12 @@ from modules.trainer.GenericTrainer import GenericTrainer
 from modules.util.bucket_limits import ANIMA_MAX_BUCKET_RESOLUTION
 from modules.util.bucket_tiers import BUCKET_KEEP_NAME, BUCKET_REPEAT_NAME, bucketing_params
 from modules.util.config.ConceptConfig import ConceptConfig
+from modules.util.config.SliderConfig import SliderAxisConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.ModelType import ModelType
+from modules.util.enum.SliderRegime import SliderRegime
+from modules.util.enum.TrainingMethod import TrainingMethod
 
 from mgds.pipelineModules.DiskCache import DiskCache
 
@@ -522,3 +525,61 @@ def test_mgds_reuses_a_cache_whose_names_changed_and_then_raises():
         # control: an unchanged name set is served, which is the whole point of reuse
         unchanged = _started_cache(tmp_dir, [], old_names)
         assert unchanged.get_item(0, "crop_resolution")["crop_resolution"] == "row0-crop_resolution"
+
+
+# --- the caption the encoder actually sees ---------------------------------
+
+def _slider_config(*axis_names, regime=SliderRegime.IMAGE, method=TrainingMethod.SLIDER):
+    config = _config()
+    config.training_method = method
+    config.slider_regime = regime
+    axes = []
+    for name in axis_names:
+        axis = SliderAxisConfig.default_values()
+        axis.name = name
+        axis.is_target = not axes
+        axes.append(axis)
+    config.slider_axes = axes
+    return config
+
+
+def test_a_coordinate_slider_does_not_reuse_un_stripped_embeddings():
+    """The dataset fingerprint reads the caption files, but a coordinate slider
+    strips the axis token out between the file and the tokenizer -- so the same
+    files encode to different text. Reusing the ordinary run's cache would leave
+    the axis in the conditioning, which is the one thing the regime exists to
+    prevent, and it would look like a slider that simply did not work."""
+    ordinary = _text_dir(_config())
+    slider = _text_dir(_slider_config("distance"))
+    assert slider != ordinary
+
+
+def test_renaming_an_axis_moves_the_text_cache():
+    """Different token stripped, different text encoded."""
+    assert _text_dir(_slider_config("distance")) != _text_dir(_slider_config("dist"))
+
+
+def test_declaring_a_second_axis_moves_the_text_cache():
+    """A non-target axis is still stripped, so it still changes the encoded text."""
+    assert _text_dir(_slider_config("distance", "age")) != _text_dir(_slider_config("distance"))
+
+
+def test_the_axis_set_is_a_set_not_an_order():
+    """Reordering rows in the axes editor strips the same tokens, so it must not
+    re-encode a dataset."""
+    assert _text_dir(_slider_config("distance", "age")) == _text_dir(_slider_config("age", "distance"))
+
+
+def test_the_axes_are_inert_outside_the_regime_that_reads_them():
+    """slider_axes survives in the config after switching regime or training
+    method, and nothing strips a caption then -- so it must not fork the cache."""
+    baseline = _text_dir(_config())
+    assert _text_dir(_slider_config("distance", regime=SliderRegime.PROMPT_PAIR)) == baseline
+    assert _text_dir(_slider_config("distance", method=TrainingMethod.LORA)) == baseline
+
+
+def test_a_coordinate_slider_does_not_re_encode_the_images():
+    """Stripping a caption changes no VAE latent. (The image cache does move for a
+    coordinate slider, but because slider_coordinate joins the cached name set --
+    not because of the axis names.)"""
+    assert _image_dir(_slider_config("distance")) == _image_dir(_slider_config("dist"))

@@ -58,6 +58,9 @@ from modules.util.bucket_tiers import BucketingParams
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.TrainConfig import TrainConfig, TrainModelPartConfig
 from modules.util.dataset_key import dataset_fingerprints
+from modules.util.enum.SliderRegime import SliderRegime
+from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.slider_caption_util import declared_axis_names
 
 
 @dataclass(frozen=True)
@@ -173,6 +176,9 @@ def _text_salt(config: TrainConfig, text_names: list[str], caption_fingerprint: 
     touches the text pipeline at all is borrow-copy, which appends duplicate rows,
     and appended rows change the row count -- which is precisely what the
     DiskCache's own length check catches and rebuilds on.
+
+    ``caption_rewrites`` covers the one case where the text the encoder sees is not
+    the text on disk -- see ``_caption_rewrites``.
     """
     # (part, layer skip, sequence length). Only encoder 2 has a configurable
     # sequence length today; the fields are read straight off TrainConfig rather
@@ -205,9 +211,34 @@ def _text_salt(config: TrainConfig, text_names: list[str], caption_fingerprint: 
         "encoders": encoders,
         "embeddings": embeddings,
         "names": sorted(text_names),
+        "caption_rewrites": _caption_rewrites(config),
         # The captions behind the embeddings -- plus the media file *list*, since
         # embeddings are cached positionally per row and which rows exist is part of
         # the identity even though their pixels are not. Media size/mtime are
         # excluded, so re-encoding an image never re-runs the text encoders.
         "dataset_captions": caption_fingerprint,
     })
+
+
+def _caption_rewrites(config: TrainConfig) -> list[str]:
+    """Pipeline stages that change the caption *between* the file and the tokenizer.
+
+    Everything else in the text salt assumes the encoder sees the caption as
+    authored, so ``caption_fingerprint`` -- which reads the files on disk -- is
+    enough to notice a caption change. A coordinate-labeled image slider breaks
+    that assumption: it strips every declared axis token out of the caption before
+    tokenizing, which is the entire point of the regime.
+
+    Without this, the two runs that must NOT share a text cache do:
+
+      * an ordinary run over the dataset, then a slider run over the same files --
+        the slider reuses embeddings computed from the un-stripped caption, so the
+        axis is still in the conditioning and the adapter has nothing to learn;
+      * a slider run, then the same run with the axis renamed -- the old, wrongly
+        stripped embeddings are served for the new axis.
+
+    Both fail silently and look like a slider that simply did not work.
+    """
+    if config.training_method != TrainingMethod.SLIDER or config.slider_regime != SliderRegime.IMAGE:
+        return []
+    return sorted(name.lower() for name in declared_axis_names(config.slider_axes))
