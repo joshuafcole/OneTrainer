@@ -7,6 +7,7 @@ from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseAnimaSetup import BaseAnimaSetup
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util import factory
+from modules.util.bucket_limits import ANIMA_MAX_BUCKET_RESOLUTION
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.TrainProgress import TrainProgress
@@ -165,4 +166,7 @@ class AnimaBaseDataLoader(
             aspect_bucketing_quantization=64,
             allow_video_files=False, #don't allow video files, but...
             vae_frame_dim=True,  #...Anima has a video-capable VAE. convert images to video dimensions
+            #cap the bucket long edge: Cosmos's RoPE table has a bounded patch range, and an
+            #extreme aspect rung at a high training resolution runs straight past it
+            aspect_bucketing_max_resolution=ANIMA_MAX_BUCKET_RESOLUTION,
         )

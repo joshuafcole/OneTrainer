@@ -5,6 +5,17 @@ from modules.dataLoader.BaseDataLoader import BaseDataLoader
 from modules.model.StableDiffusionModel import StableDiffusionModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util import factory, path_util
+from modules.util.bucket_tiers import (
+    BUCKET_BUDGET_NAME,
+    BUCKET_GROUP_NAME,
+    BUCKET_KEEP_NAME,
+    BUCKET_REPEAT_NAME,
+    BucketingParams,
+    aspect_bucket_rebalance_modules,
+    aspect_bucketing_module,
+    bucket_tags_enabled,
+    bucketing_params,
+)
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -12,7 +23,6 @@ from modules.util.TrainProgress import TrainProgress
 
 from mgds.OutputPipelineModule import OutputPipelineModule
 from mgds.pipelineModules.AspectBatchSorting import AspectBatchSorting
-from mgds.pipelineModules.AspectBucketing import AspectBucketing
 from mgds.pipelineModules.CalcAspect import CalcAspect
 from mgds.pipelineModules.CollectPaths import CollectPaths
 from mgds.pipelineModules.DecodeVAE import DecodeVAE
@@ -67,9 +77,14 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             extensions=supported_extensions, include_postfix=None, exclude_postfix=['-masklabel']
         )
 
+        # mask_path is derived in __derive_path_modules instead, so it sits after
+        # AspectBucketRebalance and covers the duplicate rows borrow-copy mints.
+        return [collect_paths]
+
+    def __derive_path_modules(self, config: TrainConfig) -> list:
         mask_path = ModifyPath(in_name='image_path', out_name='mask_path', postfix='-masklabel', extension='.png')
 
-        modules = [collect_paths]
+        modules = []
 
         if config.masked_training:
             modules.append(mask_path)
@@ -103,20 +118,20 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
 
         return modules
 
-    def __aspect_bucketing_in(self, config: TrainConfig):
+    def __aspect_bucketing_in(self, config: TrainConfig, bucketing: BucketingParams):
         calc_aspect = CalcAspect(image_in_name='image', resolution_out_name='original_resolution')
 
-        aspect_bucketing = AspectBucketing(
-            quantization=8,
+        aspect_bucketing = aspect_bucketing_module(
+            bucketing,
             resolution_in_name='original_resolution',
             target_resolution_in_name='settings.target_resolution',
             enable_target_resolutions_override_in_name='concept.image.enable_resolution_override',
+            target_resolutions_override_in_name='concept.image.resolution_override',
             target_frames_in_name='settings.target_frames',
             frame_dim_enabled=False,
-            target_resolutions_override_in_name='concept.image.resolution_override',
             scale_resolution_out_name='scale_resolution',
             crop_resolution_out_name='crop_resolution',
-            possible_resolutions_out_name='possible_resolutions'
+            possible_resolutions_out_name='possible_resolutions',
         )
 
         single_aspect_calculation = SingleAspectCalculation(
@@ -137,6 +152,20 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             modules.append(single_aspect_calculation)
 
         return modules
+
+    def __bucket_rebalance_modules(self, config: TrainConfig, bucketing: BucketingParams):
+        if not config.aspect_ratio_bucketing:
+            return []
+
+        return aspect_bucket_rebalance_modules(
+            bucketing,
+            path_in_name='image_path',
+            concept_in_name='concept',
+            target_resolution_in_name='settings.target_resolution',
+            enable_target_resolutions_override_in_name='concept.image.enable_resolution_override',
+            target_resolutions_override_in_name='concept.image.resolution_override',
+            image_extensions=path_util.supported_image_extensions(),
+        )
 
     def __crop_modules(self, config: TrainConfig):
         inputs = ['image']
@@ -189,6 +218,12 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
 
         aggregate_names = ['crop_resolution', 'image_path']
 
+        # Carry the planner's tags through the cache alongside crop_resolution. Only
+        # here: with latent caching off this loader has no VariationSorting either, and
+        # the tags reach the sorter straight from AspectBucketing.
+        if bucket_tags_enabled(config):
+            aggregate_names = aggregate_names + [BUCKET_KEEP_NAME, BUCKET_REPEAT_NAME]
+
         sort_names = ['concept']
 
         def before_cache_fun():
@@ -197,7 +232,7 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         disk_cache = DiskCache(cache_dir=config.cache_dir, split_names=split_names, aggregate_names=aggregate_names, variations_in_name='concept.image_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
                                variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_fun)
         variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'],
-                               group_enabled_in_name='concept.enabled')
+                               group_enabled_in_name='concept.enabled', group_out_name=BUCKET_GROUP_NAME, budget_out_name=BUCKET_BUDGET_NAME)
 
         modules = []
 
@@ -225,10 +260,24 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
 
         image_sample = SampleVAEDistribution(in_name='latent_image_distribution', out_name='latent_image', mode='mean')
 
+        # The planner's drop / repeat decisions; None until a tier exists to make one,
+        # which is the sorter's previous behaviour.
+        bucket_tags = bucket_tags_enabled(config)
+        keep_in_name = BUCKET_KEEP_NAME if bucket_tags else None
+        repeat_in_name = BUCKET_REPEAT_NAME if bucket_tags else None
+        # The balancing group id and SAMPLES budget, which only VariationSorting emits
+        # and this loader only builds when latent caching is on. Without them a SAMPLES
+        # budget is discarded rather than honoured, because VariationSorting no longer
+        # takes the (bucket-blind) subset itself.
+        group_in_name = BUCKET_GROUP_NAME if config.latent_caching else None
+        budget_in_name = BUCKET_BUDGET_NAME if config.latent_caching else None
+
         if config.latent_caching:
-            batch_sorting = AspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size)
+            batch_sorting = AspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size,
+                                               keep_in_name=keep_in_name, repeat_in_name=repeat_in_name, group_in_name=group_in_name, budget_in_name=budget_in_name)
         else:
-            batch_sorting = InlineAspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size)
+            batch_sorting = InlineAspectBatchSorting(resolution_in_name='crop_resolution', names=sort_names, batch_size=config.batch_size,
+                                                     keep_in_name=keep_in_name, repeat_in_name=repeat_in_name, group_in_name=group_in_name, budget_in_name=budget_in_name)
 
         output = OutputPipelineModule(names=output_names)
 
@@ -267,10 +316,16 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             train_progress: TrainProgress,
             is_validation: bool = False,
     ):
+        # One derivation, shared by the planner and the bucketer, so the two cannot be
+        # handed different geometry and pool aspect rungs differently.
+        bucketing = bucketing_params(config, quantization=8, batch_size=config.batch_size)
+
         enumerate_input = self.__enumerate_input_modules(config)
+        bucket_rebalance = self.__bucket_rebalance_modules(config, bucketing)
+        derive_paths = self.__derive_path_modules(config)
         load_input = self.__load_input_modules(config)
         mask_augmentation = self.__mask_augmentation_modules(config)
-        aspect_bucketing_in = self.__aspect_bucketing_in(config)
+        aspect_bucketing_in = self.__aspect_bucketing_in(config, bucketing)
         crop_modules = self.__crop_modules(config)
         augmentation_modules = self.__augmentation_modules(config)
         preparation_modules = self.__preparation_modules(config, model)
@@ -283,6 +338,8 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             config,
             [
                 enumerate_input,
+                bucket_rebalance,
+                derive_paths,
                 load_input,
                 mask_augmentation,
                 aspect_bucketing_in,
