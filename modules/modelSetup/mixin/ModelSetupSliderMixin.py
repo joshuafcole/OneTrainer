@@ -37,6 +37,7 @@ decoupling).
 from collections.abc import Callable, Sequence
 from typing import TypeVar
 
+from modules.util.enum.DataType import DataType
 from modules.util.enum.ModelType import PeftType
 
 import torch
@@ -75,7 +76,23 @@ class ModelSetupSliderMixin:
         dies. Same shape of trap as `supported_output_formats()`: a config
         mistake that costs a model load to discover. Checked here at setup time
         instead, once, with a message that names the control to change.
+
+        SVDQuant is the fourth way into the same forward raise and is not a PEFT
+        type at all: `quantization.svd_dtype` makes the *base* linears
+        `BaseLinearSVD`, whose `forward_with_lora` also refuses a multiplier
+        other than 1.0. Gated on the dtype alone, without also proving some part
+        is quantized -- an SVD dtype set with nothing quantized builds no SVD
+        linears, so refusing it is a false positive, but the only config it
+        rejects is one where the setting was already doing nothing, and the
+        message names the control that is set.
         """
+        if config.quantization.svd_dtype != DataType.NONE:
+            raise RuntimeError(
+                "Slider training needs an adapter with a signed multiplier, and SVDQuant "
+                "('SVD dtype' under quantization) merges the adapter into the base linear, "
+                "which has no signed delta scale. Set SVD dtype to NONE to train a slider."
+            )
+
         peft_type = config.peft_type
         if peft_type == PeftType.OFT_2:
             reason = "OFT applies an orthogonal rotation, which has no signed delta scale"

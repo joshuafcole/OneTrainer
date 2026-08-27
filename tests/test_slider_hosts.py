@@ -610,6 +610,54 @@ def test_the_refused_set_is_exactly_the_set_that_raises_in_the_forward():
     }
 
 
+def _svd_config(svd_dtype, **overrides):
+    config = _slider_config(**overrides)
+    config.quantization.svd_dtype = svd_dtype
+    return config
+
+
+def test_svdquant_is_refused_even_on_an_additive_peft_type():
+    """The fourth way into the same forward raise, and the one the PeftType loop
+    above cannot see.
+
+    quantization.svd_dtype turns the *base* linears into BaseLinearSVD, whose
+    forward_with_lora refuses any multiplier but 1.0 -- so plain LoRA, which the
+    gate otherwise accepts, still dies mid-run. Not a PEFT type, so it needs its
+    own branch and its own test; the set-comparison test iterates PeftType and
+    would never have found it.
+    """
+    for overrides in _SLIDER_COMPATIBLE_PEFT:
+        with pytest.raises(RuntimeError, match="signed multiplier") as excinfo:
+            ModelSetupSliderMixin._check_slider_peft_type(
+                _svd_config(DataType.FLOAT_8, **overrides))
+        assert "SVD dtype" in str(excinfo.value), "the message must name the control that is set"
+
+
+def test_svd_dtype_none_is_the_only_accepted_value():
+    """Every non-NONE SVD dtype builds SVD linears, so NONE is the whole allowed
+    set. Enumerated rather than spot-checked: a new DataType member added later
+    is refused by default, which is the safe direction for a guard whose failure
+    mode is a crash several minutes into a run."""
+    accepted = {d for d in DataType
+                if not _raises(lambda d=d: ModelSetupSliderMixin._check_slider_peft_type(
+                    _svd_config(d, peft_type=PeftType.LORA, lora_decompose=False)))}
+    assert accepted == {DataType.NONE}
+
+
+def _raises(fn):
+    try:
+        fn()
+    except RuntimeError:
+        return True
+    return False
+
+
+@pytest.mark.parametrize("setup_cls", [AnimaSliderSetup, StableDiffusionXLSliderSetup])
+def test_both_hosts_refuse_svdquant_before_touching_the_model(setup_cls):
+    with pytest.raises(RuntimeError, match="signed multiplier"):
+        _bare(setup_cls).setup_model(None, _svd_config(DataType.FLOAT_8))
+
+
 # ---------------------------------------------------------------------------
 # resuming from a backup
 #
