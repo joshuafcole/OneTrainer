@@ -9,7 +9,7 @@ from modules.util.config.CloudConfig import CloudConfig
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.SecretsConfig import SecretsConfig
-from modules.util.config.SliderConfig import SliderPromptConfig
+from modules.util.config.SliderConfig import SliderAxisConfig, SliderPromptConfig
 from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.ConfigPart import ConfigPart
@@ -627,6 +627,7 @@ class TrainConfig(BaseConfig):
     # (TrainingMethod.SLIDER) and are independent of the PEFT type above.
     slider_regime: SliderRegime
     slider_prompts: list[SliderPromptConfig]
+    slider_axes: list[SliderAxisConfig]   # IMAGE regime: the declared caption coordinate axes
     slider_preservation_prompts: str  # pipe-delimited; empty => bare pair (CS Eq. 7)
     slider_eta: float            # training-time guidance scale
     slider_strength: float       # adapter multiplier magnitude used while training
@@ -1351,6 +1352,7 @@ class TrainConfig(BaseConfig):
         # slider
         data.append(("slider_regime", SliderRegime.PROMPT_PAIR, SliderRegime, False))
         data.append(("slider_prompts", [], list[SliderPromptConfig], False))
+        data.append(("slider_axes", [], list[SliderAxisConfig], False))
         data.append(("slider_preservation_prompts", "", str, False))
         data.append(("slider_eta", 3.0, float, False))
         data.append(("slider_strength", 1.0, float, False))
