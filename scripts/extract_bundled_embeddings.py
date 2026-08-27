@@ -14,11 +14,20 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 from collections import defaultdict
 from pathlib import Path
 
-from safetensors import safe_open
-from safetensors.torch import save_file
+# Put the repo root on sys.path so `modules` resolves when this script is run
+# directly from scripts/ (sys.path[0] is the script dir, not the repo root).
+# path_util imports only json/os -- no torch -- so this stays cheap. Mirrors
+# scripts/generate_debug_report.py's fallback import.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from modules.util.path_util import safe_filename  # noqa: E402
+
+from safetensors import safe_open  # noqa: E402
+from safetensors.torch import save_file  # noqa: E402
 
 BUNDLE_PREFIX = "bundle_emb."
 
@@ -31,7 +40,11 @@ def extract(lora_path: Path, out_dir: Path) -> list[Path]:
             if not key.startswith(BUNDLE_PREFIX):
                 continue
             remainder = key[len(BUNDLE_PREFIX):]
-            placeholder, _, encoder_key = remainder.partition(".")
+            # rpartition: the encoder key (qwen/qwen_out/t5/...) never contains a
+            # dot, but a placeholder can (e.g. "v1.0"), so split from the RIGHT to
+            # keep the placeholder whole -- a left partition() mis-assigns it as
+            # "v1" + "0.qwen".
+            placeholder, _, encoder_key = remainder.rpartition(".")
             if not encoder_key:
                 print(f"  skipping malformed key: {key}")
                 continue
@@ -45,7 +58,12 @@ def extract(lora_path: Path, out_dir: Path) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for placeholder, tensors in grouped.items():
-        safe_name = placeholder.replace("/", "_").replace("\\", "_")
+        # OneTrainer's own sanitizer (the same call every *EmbeddingSaver.save_multiple
+        # makes on a placeholder): strips path separators AND the characters illegal on
+        # Windows (`<>:"|?*`), so a bracketed placeholder like "<token>" -- the default
+        # placeholder value -- yields a writeable, loadable "token.safetensors" instead
+        # of an invalid "<token>.safetensors".
+        safe_name = safe_filename(placeholder, allow_spaces=False, max_length=None)
         out_path = out_dir / f"{safe_name}.safetensors"
         save_file(tensors, str(out_path))
         keys_str = ", ".join(sorted(tensors.keys()))
