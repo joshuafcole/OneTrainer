@@ -130,25 +130,33 @@ def test_malformed_bundle_key_with_trailing_dot_is_skipped(tmp_path):
     assert _read_keys(written[0]) == {"qwen"}
 
 
-def test_bundle_key_with_no_dot_at_all_is_not_skipped(tmp_path):
-    # NOT a "should" -- this pins the fork's actual (imperfect) behavior.
-    # rpartition('.') on a key with no dot after the prefix returns
-    # ('', '', 'orphan'): placeholder='' and encoder_key='orphan', which is
-    # truthy, so the `if not encoder_key` guard does NOT catch it -- unlike
-    # the old left partition(), which put the whole remainder in `placeholder`
-    # and left `encoder_key` empty (correctly skipped). Switching to
-    # rpartition to fix dotted-placeholder grouping silently reopened this
-    # one dot-less-key case. Real bundle keys are always written with a dot
-    # (placeholder + "." + encoder_key) by every *LoRASaver, so this shouldn't
-    # occur on a real file -- documented here, not fixed, since it is not one
-    # of the two bugs this slice addresses.
+def test_bundle_key_with_no_dot_at_all_is_skipped(tmp_path):
+    # Regression guard for the half-swapped guard that rpartition invites.
+    # rpartition('.') on a dot-less remainder returns ('', '', 'orphan') -- so
+    # the placeholder is empty and the encoder key is truthy, exactly inverted
+    # from what left-partition() produced. Guarding `encoder_key` alone
+    # therefore accepts the malformed key and writes a nameless, hidden
+    # ".safetensors". Every *LoRASaver writes placeholder + "." + encoder_key,
+    # so a dot-less key is malformed by construction and must be skipped.
     lora = tmp_path / "lora.safetensors"
     _write_lora(lora, {"bundle_emb.orphan": torch.randn(4)})
 
     written = extract(lora, tmp_path / "out")
 
-    assert [p.name for p in written] == [".safetensors"]
-    assert _read_keys(written[0]) == {"orphan"}
+    assert written == []
+    assert not (tmp_path / "out").exists(), "a malformed-only file must not create an out dir"
+
+
+def test_bundle_key_with_empty_placeholder_is_skipped(tmp_path):
+    # The other spelling of the same defect: an explicit dot with nothing
+    # before it. rpartition gives ('', '.', 'qwen') -- encoder_key is fine,
+    # the placeholder is not.
+    lora = tmp_path / "lora.safetensors"
+    _write_lora(lora, {"bundle_emb..qwen": torch.randn(4)})
+
+    written = extract(lora, tmp_path / "out")
+
+    assert written == []
 
 
 def test_no_bundled_embeddings_returns_empty_list(tmp_path):

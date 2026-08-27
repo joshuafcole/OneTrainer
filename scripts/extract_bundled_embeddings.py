@@ -45,7 +45,14 @@ def extract(lora_path: Path, out_dir: Path) -> list[Path]:
             # keep the placeholder whole -- a left partition() mis-assigns it as
             # "v1" + "0.qwen".
             placeholder, _, encoder_key = remainder.rpartition(".")
-            if not encoder_key:
+            # Guard the PLACEHOLDER, not the encoder key. rpartition puts the
+            # whole remainder in the LAST field when there is no dot, so a
+            # malformed "bundle_emb.orphan" yields placeholder="" and a truthy
+            # encoder_key -- which an `if not encoder_key` guard waves through,
+            # writing a nameless, hidden ".safetensors". A well-formed key
+            # always has both halves, so testing the placeholder catches the
+            # malformed case and only it.
+            if not placeholder or not encoder_key:
                 print(f"  skipping malformed key: {key}")
                 continue
             grouped[placeholder][encoder_key] = f.get_tensor(key)
