@@ -4,6 +4,7 @@ import traceback
 from modules.model.AnimaModel import AnimaModel
 from modules.modelLoader.GenericFineTuneModelLoader import make_fine_tune_model_loader
 from modules.modelLoader.GenericLoRAModelLoader import make_lora_model_loader
+from modules.modelLoader.mixin.EmbeddingLoaderMixin import EmbeddingLoaderMixin
 from modules.modelLoader.mixin.HFModelLoaderMixin import HFModelLoaderMixin
 from modules.modelLoader.mixin.LoRALoaderMixin import LoRALoaderMixin
 from modules.util.config.TrainConfig import QuantizationConfig
@@ -178,14 +179,31 @@ class AnimaLoRALoader(
         return self._load(model, model_names)
 
 
+class AnimaEmbeddingLoader(
+    EmbeddingLoaderMixin,
+):
+    def __init__(self):
+        super().__init__()
+
+    def load(
+            self,
+            model: AnimaModel,
+            directory: str,
+            model_names: ModelNames,
+    ):
+        self._load(model, directory, model_names)
+
+
 AnimaLoRAModelLoader = make_lora_model_loader(
     model_spec_map={ModelType.ANIMA: "resources/sd_model_spec/anima-lora.json"},
     model_class=AnimaModel,
     model_loader_class=AnimaModelLoader,
-    embedding_loader_class=None,
+    embedding_loader_class=AnimaEmbeddingLoader,
     lora_loader_class=AnimaLoRALoader,
 )
 
+# FINE_TUNE keeps embedding_loader_class=None: AnimaFineTuneSetup still refuses embeddings outright, so
+# there is nothing for a loaded embedding state to attach to.
 AnimaFineTuneModelLoader = make_fine_tune_model_loader(
     model_spec_map={ModelType.ANIMA: "resources/sd_model_spec/anima.json"},
     model_class=AnimaModel,

@@ -25,7 +25,12 @@ class AnimaLoRASetup(
         self._create_model_part_parameters(parameter_group_collection, "transformer", model.transformer_lora, config.transformer)
 
         if config.train_any_embedding() or config.train_any_output_embedding():
-            raise NotImplementedError("Embeddings not implemented for Anima")
+            self._reject_output_embeddings(config)
+            if config.text_encoder.train_embedding:
+                self._add_embedding_param_groups(
+                    model.all_text_encoder_embeddings(), parameter_group_collection,
+                    config.embedding_learning_rate, "embeddings",
+                )
 
         return parameter_group_collection
 
@@ -34,6 +39,7 @@ class AnimaLoRASetup(
             model: AnimaModel,
             config: TrainConfig,
     ):
+        self._setup_embeddings_requires_grad(model, config)
         model.text_encoder.requires_grad_(False)
         model.text_conditioner.requires_grad_(False)
         model.transformer.requires_grad_(False)
@@ -58,6 +64,16 @@ class AnimaLoRASetup(
         model.transformer_lora.to(dtype=config.lora_weight_dtype.torch_dtype())
         model.transformer_lora.hook_to_module()
 
+        # The trained rows are concatenated onto the frozen vocab slice inside AdditionalEmbeddingWrapper,
+        # so the whole table has to share the embedding dtype -- and a token trained in fp16 stalls: the
+        # per-step update is far below the representable step at fp16's precision around a typical vocab
+        # vector.
+        if config.train_any_embedding():
+            model.text_encoder.get_input_embeddings().to(dtype=config.embedding_weight_dtype.torch_dtype())
+
+        self._setup_embeddings(model, config)
+        self._setup_embedding_wrapper(model, config)
+
         params = self.create_parameters(model, config)
         self.__setup_requires_grad(model, config)
         init_model_parameters(model, params, self.train_device)
@@ -68,7 +84,11 @@ class AnimaLoRASetup(
             config: TrainConfig,
     ):
         vae_on_train_device = not config.latent_caching
-        text_encoder_on_train_device = not config.latent_caching
+        # Training a TI token disables the text cache, so Qwen3 runs live every step (under grad) and has
+        # to stay on the train device even when latents are cached.
+        text_encoder_on_train_device = \
+            config.train_text_encoder_or_embedding() \
+            or not config.latent_caching
 
         parts = ["transformer"]
         if text_encoder_on_train_device:
@@ -93,4 +113,8 @@ class AnimaLoRASetup(
             config: TrainConfig,
             train_progress: TrainProgress
     ):
+        if config.preserve_embedding_norm:
+            self._normalize_output_embeddings(model.all_text_encoder_embeddings())
+            if model.embedding_wrapper is not None:
+                model.embedding_wrapper.normalize_embeddings()
         self.__setup_requires_grad(model, config)

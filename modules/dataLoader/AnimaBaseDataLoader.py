@@ -15,6 +15,7 @@ from mgds.pipelineModules.DecodeTokens import DecodeTokens
 from mgds.pipelineModules.DecodeVAE import DecodeVAE
 from mgds.pipelineModules.EncodeAnimaText import EncodeAnimaText
 from mgds.pipelineModules.EncodeVAE import EncodeVAE
+from mgds.pipelineModules.MapData import MapData
 from mgds.pipelineModules.RescaleImageChannels import RescaleImageChannels
 from mgds.pipelineModules.SampleVAEDistribution import SampleVAEDistribution
 from mgds.pipelineModules.SaveImage import SaveImage
@@ -33,8 +34,14 @@ class AnimaBaseDataLoader(
         encode_image = EncodeVAE(in_name='image', out_name='latent_image_distribution', vae=model.vae, autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
         image_sample = SampleVAEDistribution(in_name='latent_image_distribution', out_name='latent_image', mode='mean')
         downscale_mask = ScaleImage(in_name='mask', out_name='latent_mask', factor=0.125)
-        # Anima has no chat template — tokenize raw prompt with both tokenizers
-        tokenize_prompt = Tokenize(in_name='prompt', tokens_out_name='tokens', mask_out_name='tokens_mask', tokenizer=model.tokenizer, max_token_length=PROMPT_MAX_LENGTH)
+        # Anima has no chat template — tokenize raw prompt with both tokenizers.
+        # A textual-inversion placeholder is substituted into the QWEN branch only, into its own
+        # 'prompt_qwen' field: the trained vector lives in the Qwen3 word table, while the T5 branch must
+        # keep the prompt as authored so the placeholder tokenizes naturally there. That asymmetry is the
+        # whole point -- it is what ComfyUI's Anima encoder does, so a token trained here reproduces its
+        # concept there. Substituting on both sides would train against T5 ids no inference tool produces.
+        add_embeddings_to_prompt = MapData(in_name='prompt', out_name='prompt_qwen', map_fn=model.add_text_encoder_embeddings_to_prompt)
+        tokenize_prompt = Tokenize(in_name='prompt_qwen', tokens_out_name='tokens', mask_out_name='tokens_mask', tokenizer=model.tokenizer, max_token_length=PROMPT_MAX_LENGTH)
         tokenize_t5 = Tokenize(in_name='prompt', tokens_out_name='t5_tokens', mask_out_name='t5_tokens_mask', tokenizer=model.t5_tokenizer, max_token_length=PROMPT_MAX_LENGTH)
         # EncodeAnimaText runs Qwen3 encoder + AnimaTextConditioner; output is fixed (512, 1024)
         encode_prompt = EncodeAnimaText(
@@ -49,7 +56,11 @@ class AnimaBaseDataLoader(
         if config.masked_training or config.model_type.has_mask_input():
             modules.append(downscale_mask)
 
-        modules += [tokenize_prompt, tokenize_t5, encode_prompt]
+        modules += [add_embeddings_to_prompt, tokenize_prompt, tokenize_t5]
+        # Skip the cached conditioner output when a token is being trained: Qwen3 has to run live under
+        # grad at step time, and a cached hidden state would silently detach the only path to the token.
+        if not config.train_text_encoder_or_embedding():
+            modules.append(encode_prompt)
 
         return modules
 
@@ -61,12 +72,15 @@ class AnimaBaseDataLoader(
 
         image_aggregate_names = ['crop_resolution', 'image_path']
 
-        text_split_names = ['tokens', 'tokens_mask', 't5_tokens', 't5_tokens_mask', 'text_encoder_hidden_state']
+        text_split_names = []
 
         sort_names = image_aggregate_names + image_split_names + [
             'prompt', 'tokens', 'tokens_mask', 't5_tokens', 't5_tokens_mask', 'text_encoder_hidden_state',
             'concept'
         ]
+
+        if not config.train_text_encoder_or_embedding():
+            text_split_names += ['tokens', 'tokens_mask', 't5_tokens', 't5_tokens_mask', 'text_encoder_hidden_state']
 
         return self._cache_modules_from_names(
             model, model_setup,
@@ -75,7 +89,7 @@ class AnimaBaseDataLoader(
             text_split_names=text_split_names,
             sort_names=sort_names,
             config=config,
-            text_caching=True,
+            text_caching=not config.train_text_encoder_or_embedding(),
         )
 
     def _output_modules(self, config: TrainConfig, model: AnimaModel, model_setup: BaseAnimaSetup):
