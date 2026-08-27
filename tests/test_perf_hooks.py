@@ -178,13 +178,14 @@ def _region_spans(path):
     call they name -- a ``toc`` above its ``tic`` still balances, and still reports
     a duration measured over the wrong statements.
     """
-    marks = []
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    marks = [
+        (node.lineno, node.args[0].value, node.func.attr)
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name) and node.func.value.id == "perf"
-                and node.func.attr in ("tic", "toc") and node.args
-                and isinstance(node.args[0], ast.Constant)):
-            marks.append((node.lineno, node.args[0].value, node.func.attr))
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "perf"
+            and node.func.attr in ("tic", "toc") and node.args
+            and isinstance(node.args[0], ast.Constant))
+    ]
     open_at, spans = {}, []
     for lineno, label, method in sorted(marks):
         if method == "tic":
