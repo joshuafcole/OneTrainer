@@ -26,6 +26,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
+from modules.util.bucket_limits import ANIMA_MAX_BUCKET_RESOLUTION, max_bucket_resolution_for
 from modules.util.bucket_tiers import (
     BUCKET_BUDGET_NAME,
     BUCKET_GROUP_NAME,
@@ -38,6 +39,7 @@ from modules.util.bucket_tiers import (
 )
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.DataType import DataType
+from modules.util.enum.ModelType import ModelType
 
 from mgds.pipelineModules.AspectBatchSorting import AspectBatchSorting
 from mgds.pipelineModules.AspectBucketing import AspectBucketing
@@ -48,7 +50,13 @@ from mgds.pipelineModules.InlineAspectBatchSorting import InlineAspectBatchSorti
 from mgds.pipelineModules.ModifyPath import ModifyPath
 from mgds.pipelineModules.SingleAspectCalculation import SingleAspectCalculation
 from mgds.pipelineModules.VariationSorting import VariationSorting
-from mgds.util.bucketRebalancing import BORROW_COPY, CANONICAL_RUNG_ASPECTS, BucketTier, plan_rebalance
+from mgds.util.bucketRebalancing import (
+    BORROW_COPY,
+    CANONICAL_RUNG_ASPECTS,
+    BucketTier,
+    build_bucket_resolutions,
+    plan_rebalance,
+)
 
 QUANTIZATION = 64
 
@@ -581,3 +589,93 @@ def test_the_planner_runs_before_the_paths_it_renames_are_derived():
     kinds = [type(m) for m in modules]
 
     assert kinds.index(AspectBucketRebalance) < kinds.index(ModifyPath)
+
+
+# ---------------------------------------------------------------------------
+# the Anima long-edge cap (slice 22 Fix A)
+#
+# Slice 12 wired the cap; these assert it *does something*. The wiring tests
+# check the constant reaches both modules and that they agree. That would still
+# pass if the cap were 100000, so on its own it does not show the crash is
+# prevented.
+# ---------------------------------------------------------------------------
+
+def test_uncapped_anima_bucketing_reaches_cosmos_rope_crash_boundary():
+    """The bug this cap exists for, made self-evident.
+
+    Cosmos's RoPE table is 128 patches and 16 px/patch, so 2048 px is where a
+    side stops being representable: CosmosRotaryPosEmbed's `seq[:pe_size]`
+    silently truncates and the freqs concat then dies on a shape mismatch,
+    naming neither bucketing nor resolution. At Anima's own quantization, a
+    perfectly ordinary `resolution=1024` reaches exactly that boundary.
+    """
+    resolutions, _, _ = build_bucket_resolutions([1024], 64, 0.0, None)
+    crops = {c for group in resolutions.values() for c in group}
+    longest = max(max(w, h) for w, h in crops)
+
+    assert longest == 2048, (
+        f"expected the uncapped ladder to hit the 128-patch boundary, got {longest}")
+
+
+def test_the_anima_cap_keeps_every_bucket_inside_the_pretrained_range():
+    """...and the cap removes it, for every bucket, not just the worst one."""
+    resolutions, _, _ = build_bucket_resolutions([1024], 64, 0.0, ANIMA_MAX_BUCKET_RESOLUTION)
+    crops = {c for group in resolutions.values() for c in group}
+
+    assert crops, "the capped ladder must still produce buckets"
+    over = sorted(c for c in crops if max(c) > ANIMA_MAX_BUCKET_RESOLUTION)
+    assert not over, f"buckets past the cap: {over}"
+
+    # The cap must bite rather than be vacuous -- something has to sit at it.
+    assert max(max(w, h) for w, h in crops) == ANIMA_MAX_BUCKET_RESOLUTION
+
+
+def test_the_cap_scales_a_bucket_rather_than_dropping_it():
+    """A cap that discarded the extreme rungs would quietly change which images
+    are trainable. The clamp scales uniformly -- `clamp_resolution_to_max` takes
+    (512, 2048) to (480, 1920), aspect exactly preserved -- and the 64-grid
+    quantization that follows is the same one every other bucket goes through.
+    """
+    uncapped, _, _ = build_bucket_resolutions([1024], 64, 0.0, None)
+    capped, _, _ = build_bucket_resolutions([1024], 64, 0.0, ANIMA_MAX_BUCKET_RESOLUTION)
+
+    n_uncapped = len({c for g in uncapped.values() for c in g})
+    n_capped = len({c for g in capped.values() for c in g})
+    assert n_capped == n_uncapped, (
+        f"the cap changed the number of buckets ({n_uncapped} -> {n_capped}); "
+        "it is supposed to scale the extreme rungs, not remove them")
+
+
+def test_the_cap_is_the_pretrained_range_not_the_crash_boundary():
+    """The constant's *value*, not just that a cap exists.
+
+    Found by mutation: setting the cap to 2048 passed every other test here,
+    because 2048 is exactly where the uncapped ladder tops out -- so "nothing
+    exceeds the cap" and "something sits at the cap" are both still true. That
+    is the one value the constant is documented to avoid.
+
+    Cosmos's RoPE table is max_size 128 patches; vae_scale_factor(8) * patch(2)
+    = 16 px per patch. 128 patches = 2048 px is where it breaks. 120 patches =
+    1920 px is max_size's spatial range -- what the model was actually trained
+    on. Capping at the pretrained range rather than the failure point keeps
+    buckets in distribution instead of extrapolating RoPE into territory that
+    merely happens not to crash.
+    """
+    px_per_patch = 8 * 2          # vae_scale_factor * patch_size
+    pretrained_patches = 120      # max_size's spatial axes
+    crash_patches = 128           # the length of the position table
+
+    assert pretrained_patches * px_per_patch == ANIMA_MAX_BUCKET_RESOLUTION
+    assert crash_patches * px_per_patch > ANIMA_MAX_BUCKET_RESOLUTION, (
+        "capping at the crash boundary trains on RoPE positions the model never saw")
+    # the cap is applied before quantization, so it must sit on the grid or the
+    # quantize can round a capped edge back above it
+    assert ANIMA_MAX_BUCKET_RESOLUTION % 64 == 0
+
+
+def test_only_anima_is_capped():
+    """Every other model passes None and is bit-for-bit unaffected -- the whole
+    reason this is a lookup keyed on ModelType rather than a global."""
+    assert max_bucket_resolution_for(ModelType.ANIMA) == ANIMA_MAX_BUCKET_RESOLUTION
+    uncapped = [m for m in ModelType if max_bucket_resolution_for(m) is not None]
+    assert uncapped == [ModelType.ANIMA], f"unexpectedly capped model types: {uncapped}"
