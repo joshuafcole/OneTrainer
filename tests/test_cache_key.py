@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from modules.dataLoader.mixin.DataLoaderMgdsMixin import dataset_concepts
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
 from modules.dataLoader.StableDiffusionBaseDataLoader import StableDiffusionBaseDataLoader
+from modules.dataLoader.StableDiffusionFineTuneVaeDataLoader import StableDiffusionFineTuneVaeDataLoader
+from modules.trainer.GenericTrainer import GenericTrainer
 from modules.util.bucket_limits import ANIMA_MAX_BUCKET_RESOLUTION
 from modules.util.bucket_tiers import BUCKET_KEEP_NAME, BUCKET_REPEAT_NAME, bucketing_params
 from modules.util.config.ConceptConfig import ConceptConfig
@@ -260,6 +262,11 @@ def test_neither_cache_shares_a_directory_with_a_different_name_set():
     assert dirs(["latent_image"], ["crop_resolution", "image_path"], ["tokens"])[0] != baseline[0]
     assert dirs(["latent_image"], ["crop_resolution"], ["tokens", "pooled_state"])[1] != baseline[1]
 
+    # ... but a cached item is a dict, so the order the names arrive in is not part
+    # of what is stored and must not split one cache into two.
+    both = dirs(["latent_image"], ["crop_resolution", "image_path"], ["tokens", "pooled_state"])
+    assert dirs(["latent_image"], ["image_path", "crop_resolution"], ["pooled_state", "tokens"]) == both
+
 
 def test_turning_masked_training_on_moves_the_image_cache():
     """Split names take the same unguarded path as aggregate names, and a concrete
@@ -282,6 +289,52 @@ def test_turning_masked_training_on_moves_the_image_cache():
     assert "latent_mask" in masked.split_names
     assert masked.cache_dir != unmasked.cache_dir, \
         "a cache whose split names grew must not be reused"
+
+
+def test_the_vae_finetune_loader_salts_its_cache_the_same_way():
+    """That loader builds its own DiskCache rather than routing through the seam,
+    and gains the same two aggregate names once a tier exists -- so it carries the
+    identical hazard and must be segregated the identical way."""
+    def cache(**overrides) -> DiskCache:
+        config = _config(**overrides)
+        loader = object.__new__(StableDiffusionFineTuneVaeDataLoader)
+        bucketing = bucketing_params(config, quantization=8, batch_size=config.batch_size)
+        modules = StableDiffusionFineTuneVaeDataLoader._StableDiffusionFineTuneVaeDataLoader__cache_modules(
+            loader, config, None, bucketing, False)
+        caches = [m for m in modules if isinstance(m, DiskCache)]
+        assert len(caches) == 1
+        return caches[0]
+
+    plain = cache()
+    parent, salt = os.path.split(plain.cache_dir)
+    assert parent == os.path.join(_config().cache_dir, "vae")
+    assert len(salt) == 16
+
+    tiered = cache(aspect_ratio_bucket_min_tiers=_A_TIER)
+    assert {BUCKET_KEEP_NAME, BUCKET_REPEAT_NAME} <= set(tiered.aggregate_names)
+    assert tiered.cache_dir != plain.cache_dir
+
+    # masked training is the one setting here that moves the name set without
+    # touching the bucket geometry, so it is what shows the names are in the salt
+    masked = cache(masked_training=True)
+    assert "latent_mask" in masked.split_names and "latent_mask" not in plain.split_names
+    assert masked.cache_dir != plain.cache_dir
+
+
+def test_clear_cache_removes_every_cache_a_dataloader_writes():
+    """clear_cache_before_training used to miss the VAE fine-tune cache entirely:
+    that loader wrote its group directories straight into cache_dir, and the
+    whitelist only matched 'image', 'text' and 'epoch-*'."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for name in ("image", "text", "vae", "epoch-0", "quantization"):
+            os.makedirs(os.path.join(tmp_dir, name))
+
+        trainer = object.__new__(GenericTrainer)
+        trainer.config = _config(cache_dir=tmp_dir)
+        trainer._GenericTrainer__clear_cache()
+
+        assert sorted(os.listdir(tmp_dir)) == ["quantization"], \
+            "every latent/text cache must go, and only those"
 
 
 # --- bucket geometry -------------------------------------------------------
