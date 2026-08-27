@@ -1,7 +1,10 @@
-"""The model-agnostic Concept-Sliders training objective.
+"""The model-agnostic Concept-Sliders training objectives.
 
-Implements the velocity / flow-matching form of the Concept Sliders objective
-(Gandikota et al., ECCV 2024):
+Two of them, one per SliderRegime, sharing the multiplier plumbing and nothing
+else. ``_slider_coordinate_loss`` (IMAGE) is documented at its own definition;
+what follows is ``_slider_prompt_loss`` (PROMPT_PAIR), the velocity /
+flow-matching form of the Concept Sliders objective (Gandikota et al., ECCV
+2024):
 
     v*(x_t, c_t, t)  =  v(c_t)  +  eta * mean_p( v(c+,p) - v(c-,p) )
 
@@ -176,6 +179,96 @@ class ModelSetupSliderMixin:
         finally:
             # Restore unconditionally: a raise partway through would otherwise leave
             # the adapter parked at -strength for whatever runs next.
+            set_multiplier(_RESTING_MULTIPLIER)
+
+
+    def _slider_coordinate_loss(
+        self,
+        run_velocity: Callable[[Sequence[int]], Tensor],
+        set_multiplier: Callable[[float], None],
+        targets: Sequence[Tensor],
+        multipliers: Sequence[float],
+        loss_fn: Callable[[Tensor, Tensor], Tensor] | None = None,
+    ) -> Tensor:
+        """Coordinate-scaled reconstruction loss for the IMAGE regime.
+
+        Each sample carries its own signed multiplier ``m_i = gain_k *
+        coordinate_i``, read from that image's caption. The adapter at ``m_i``
+        must reconstruct that image's flow-matching target, so what the slider
+        learns is a calibrated response *along* the axis rather than two poles:
+        with coordinates spread over a range, the only way to fit all of them at
+        once is for the adapter's effect to scale with the multiplier, which is
+        exactly what the user dials at inference. Binary poles
+        (``coordinate in {-1, +1}``) are the special case, and are why an explicit
+        image-pair regime is not a separate thing.
+
+        There is no frozen-base pass and no eta here, unlike ``_slider_prompt_loss``.
+        The real image IS the supervision; nothing has to be synthesized, so
+        nothing has to be guided.
+
+        Args:
+            run_velocity: ``(sample_indices) -> velocity`` for those samples as one
+                batched forward, rows in the order given. The host has already
+                built each sample's noised latent and conditioning; the multiplier
+                is set here, before the call.
+            set_multiplier: sets the adapter delta scale.
+            targets: per-sample flow-matching target, each with a leading batch
+                dim of 1 so a group concatenates.
+            multipliers: per-sample multiplier, index-aligned with ``targets``.
+            loss_fn: mean-reduction elementwise loss (the group weighting below
+                assumes a mean).
+
+        Samples sharing a multiplier run as ONE forward. The multiplier is a
+        property of the adapter, not of a row, so a batch can only be split by
+        distinct multiplier -- but binary poles collapse a whole batch to two
+        forwards, and that is the common case. Weighting each group's mean by its
+        size makes the result identical to looping one sample at a time, which
+        ``test_grouping_is_exactly_the_per_sample_loop`` pins.
+
+        A sample whose multiplier is 0 is dropped before the forward. At
+        multiplier 0 the adapter is disabled, so such a term is a constant with
+        respect to every trained parameter (measured: sum|dL/dtheta| exactly 0.0
+        at m=0, 6.2 at m=0.5) -- keeping it would spend a forward to add a
+        constant to the reported loss and divide the real gradient down. Dropping
+        it is not a policy about neutral images; it is arithmetic.
+        """
+        if loss_fn is None:
+            loss_fn = F.mse_loss
+        if len(targets) != len(multipliers):
+            raise ValueError("targets and multipliers must be the same length")
+        if not targets:
+            raise ValueError("targets must be non-empty")
+
+        # dict preserves insertion order, so the multiplier sequence a test sees
+        # is the order the coordinates appeared in the batch.
+        groups: dict[float, list[int]] = {}
+        for index, multiplier in enumerate(multipliers):
+            multiplier = float(multiplier)
+            if multiplier != 0.0:
+                groups.setdefault(multiplier, []).append(index)
+
+        trained = sum(len(indices) for indices in groups.values())
+        if trained == 0:
+            raise RuntimeError(
+                "Every sample in this batch has a slider coordinate of 0, so the batch trains "
+                "nothing: at multiplier 0 the adapter is disabled and receives no gradient. The "
+                "usual cause is a declared axis name that does not match the captions -- check "
+                "the axis name on the Slider tab against a caption, e.g. '(distance:-2)'."
+            )
+
+        try:
+            loss = None
+            for multiplier, indices in groups.items():
+                set_multiplier(multiplier)
+                term = loss_fn(
+                    run_velocity(indices),
+                    torch.cat([targets[i] for i in indices], dim=0),
+                ) * len(indices)
+                loss = term if loss is None else loss + term
+            return loss / trained
+        finally:
+            # Same reason as _slider_prompt_loss: a raise partway through must not
+            # leave the adapter parked at whatever coordinate it happened to reach.
             set_multiplier(_RESTING_MULTIPLIER)
 
     # ------------------------------------------------------------------------

@@ -382,3 +382,292 @@ def test_symmetry_does_not_weaken_the_adapters_own_gradient():
 
     assert one_pole > 1e-3
     assert two_poles == pytest.approx(2.0 * one_pole, rel=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# the IMAGE regime's objective: coordinate-scaled reconstruction
+#
+# The toy dataset is built so that the *right* answer is known in closed form.
+# Each "image" x_i has a coordinate l_i, and its target is the frozen base's
+# output plus m_i * (A x_i) for one fixed low-rank A. An adapter that has learned
+# A reproduces every sample at once, and -- the claim worth testing -- also at
+# coordinates the dataset never contained.
+# ---------------------------------------------------------------------------
+
+def _coordinate_model(rank=4):
+    torch.manual_seed(0)
+    base = nn.Linear(D, D, bias=False)
+    base.weight.requires_grad_(False)
+    lora = LoRAModule("t.l", base, rank, float(rank))
+    lora.hook_to_module()
+    return base, lora
+
+
+def _coordinate_batch(coords, gain=1.0, rank=4, seed=11):
+    """(inputs, the closed-form ideal adapter, per-sample multipliers)."""
+    torch.manual_seed(seed)
+    xs = [torch.randn(1, D) for _ in coords]
+    u = torch.randn(D, rank) * 0.5
+    v = torch.randn(rank, D) * 0.5
+    a_matrix = u @ v
+
+    def apply_a(x):
+        return x @ a_matrix.T
+
+    return xs, apply_a, [gain * c for c in coords]
+
+
+def _coordinate_targets(base, lora, xs, apply_a, multipliers):
+    lora.set_multiplier(0.0)
+    with torch.no_grad():
+        return [(base(x) + m * apply_a(x)).detach() for x, m in zip(xs, multipliers, strict=True)]
+
+
+def _run_velocity_for(base, xs):
+    def run_velocity(indices):
+        return base(torch.cat([xs[i] for i in indices], dim=0))
+    return run_velocity
+
+
+def test_coordinate_adapter_learns_a_response_that_scales_with_the_coordinate():
+    """The decisive test: what the regime claims is a *calibrated* axis.
+
+    Fitting several coordinates at once is only possible if the adapter's effect
+    is linear in the multiplier -- so the check is not "the loss went down" but
+    "the trained adapter is right at a coordinate the dataset never contained".
+    That is precisely what the user does at inference when they drag the slider
+    somewhere between the labels they captioned.
+    """
+    mixin = _Mixin()
+    base, lora = _coordinate_model()
+    # Enough images that they span the input space -- otherwise the adapter can
+    # fit every training sample while agreeing with nothing off their span, and
+    # the generalization claim below would be untested rather than true.
+    coords = [-2.0, -1.0, 1.0, 2.0] * 12
+    xs, apply_a, multipliers = _coordinate_batch(coords, gain=0.5)
+    targets = _coordinate_targets(base, lora, xs, apply_a, multipliers)
+    run_velocity = _run_velocity_for(base, xs)
+
+    opt = torch.optim.Adam(lora.parameters(), lr=5e-2)
+    first = None
+    for _ in range(800):
+        opt.zero_grad()
+        loss = mixin._slider_coordinate_loss(run_velocity, lora.set_multiplier, targets, multipliers)
+        loss.backward()
+        opt.step()
+        if first is None:
+            first = loss.item()
+    assert loss.item() < first * 1e-3, f"loss {first:.4f} -> {loss.item():.4f}"
+
+    # an unseen coordinate, and an unseen input
+    torch.manual_seed(99)
+    probe = torch.randn(1, D)
+    lora.set_multiplier(0.0)
+    base_out = base(probe).detach()
+    for unseen in (0.35, -1.4, 3.0):
+        lora.set_multiplier(unseen)
+        learned = base(probe).detach() - base_out
+        want = unseen * apply_a(probe)
+        assert torch.allclose(learned, want, atol=5e-2, rtol=5e-2), (
+            f"at multiplier {unseen} the adapter is not on the axis it was calibrated to: "
+            f"{learned} vs {want}"
+        )
+
+
+def test_grouping_is_exactly_the_per_sample_loop():
+    """Samples sharing a multiplier are batched into one forward. That is an
+    optimization, so it has to be arithmetically invisible -- weighting each
+    group's mean by its size is what makes it so, and dropping that weight is a
+    silent reweighting of the dataset toward whichever coordinate is rarest."""
+    mixin = _Mixin()
+    base, lora = _coordinate_model()
+    coords = [1.0, -1.0, 1.0, 1.0, -1.0]
+    xs, apply_a, multipliers = _coordinate_batch(coords)
+    targets = _coordinate_targets(base, lora, xs, apply_a, multipliers)
+    with torch.no_grad():
+        lora.lora_up.weight.copy_(torch.randn_like(lora.lora_up.weight) * 0.1)
+    run_velocity = _run_velocity_for(base, xs)
+
+    grouped = mixin._slider_coordinate_loss(run_velocity, lora.set_multiplier, targets, multipliers)
+
+    one_at_a_time = []
+    for i, m in enumerate(multipliers):
+        lora.set_multiplier(m)
+        one_at_a_time.append(F.mse_loss(run_velocity([i]), targets[i]))
+    looped = sum(one_at_a_time) / len(one_at_a_time)
+
+    assert torch.allclose(grouped, looped, atol=1e-6), f"{grouped.item()} != {looped.item()}"
+
+
+def test_samples_sharing_a_multiplier_run_as_one_forward():
+    """The multiplier belongs to the adapter, not to a row, so a batch can only be
+    split by distinct multiplier -- but binary poles are the common case and
+    collapse to two forwards, not five."""
+    mixin = _Mixin()
+    base, lora = _coordinate_model()
+    coords = [1.0, -1.0, 1.0, 1.0, -1.0]
+    xs, apply_a, multipliers = _coordinate_batch(coords)
+    targets = _coordinate_targets(base, lora, xs, apply_a, multipliers)
+
+    seen = []
+    inner = _run_velocity_for(base, xs)
+
+    def run_velocity(indices):
+        seen.append((lora.multiplier, list(indices)))
+        return inner(indices)
+
+    mixin._slider_coordinate_loss(run_velocity, lora.set_multiplier, targets, multipliers)
+    assert seen == [(1.0, [0, 2, 3]), (-1.0, [1, 4])]
+
+
+def test_the_multiplier_is_set_before_the_forward():
+    """Recorded per forward: an implementation that sets the multiplier after
+    running the model would train every sample at the previous coordinate and
+    still report a falling loss."""
+    mixin = _Mixin()
+    base, lora = _coordinate_model()
+    xs, apply_a, multipliers = _coordinate_batch([2.0, -3.0])
+    targets = _coordinate_targets(base, lora, xs, apply_a, multipliers)
+    inner = _run_velocity_for(base, xs)
+
+    seen = []
+
+    def run_velocity(indices):
+        seen.append(lora.multiplier)
+        return inner(indices)
+
+    lora.set_multiplier(0.75)
+    mixin._slider_coordinate_loss(run_velocity, lora.set_multiplier, targets, multipliers)
+    assert seen == multipliers
+
+
+def test_a_zero_coordinate_sample_never_reaches_the_model():
+    """At multiplier 0 the adapter is disabled, so such a term is a constant with
+    respect to every trained parameter: it would cost a forward, add a constant to
+    the reported loss, and divide the real gradient down. Measured directly below,
+    so this is arithmetic rather than a policy about neutral images."""
+    mixin = _Mixin()
+    base, lora = _coordinate_model()
+    coords = [1.0, 0.0, -1.0]
+    xs, apply_a, multipliers = _coordinate_batch(coords)
+    targets = _coordinate_targets(base, lora, xs, apply_a, multipliers)
+    with torch.no_grad():
+        lora.lora_up.weight.copy_(torch.randn_like(lora.lora_up.weight) * 0.1)
+    inner = _run_velocity_for(base, xs)
+
+    seen = []
+
+    def run_velocity(indices):
+        seen.extend(indices)
+        return inner(indices)
+
+    loss = mixin._slider_coordinate_loss(run_velocity, lora.set_multiplier, targets, multipliers)
+    assert seen == [0, 2], "the zero-coordinate sample must not cost a forward"
+
+    # and it is out of the divisor too, not merely out of the numerator
+    trained_only = mixin._slider_coordinate_loss(
+        _run_velocity_for(base, [xs[0], xs[2]]), lora.set_multiplier,
+        [targets[0], targets[2]], [multipliers[0], multipliers[2]],
+    )
+    assert torch.allclose(loss, trained_only, atol=1e-6)
+
+
+def test_a_zero_multiplier_really_does_carry_no_gradient():
+    """The measurement the drop above rests on. If a future adapter type made the
+    multiplier-0 path differentiable, dropping those samples would start throwing
+    away real signal and this fails first."""
+    base, lora = _coordinate_model()
+    xs, _apply_a, _ = _coordinate_batch([1.0])
+    with torch.no_grad():
+        lora.lora_up.weight.copy_(torch.randn_like(lora.lora_up.weight) * 0.1)
+    target = torch.randn(1, D)
+
+    def grad_at(multiplier):
+        for p in lora.parameters():
+            p.grad = None
+        lora.set_multiplier(multiplier)
+        F.mse_loss(base(xs[0]), target).backward()
+        return sum(p.grad.abs().sum().item() for p in lora.parameters() if p.grad is not None)
+
+    assert grad_at(0.0) == 0.0
+    assert grad_at(0.5) > 1e-3
+
+
+def test_a_batch_of_only_zero_coordinates_is_refused():
+    """The shape a mistyped axis name takes: every caption parses to no coordinate,
+    every multiplier is 0, and the run would otherwise train nothing while
+    reporting a plausible loss. There is no loss to return here either -- a term
+    with no grad_fn fails in backward() with a much worse message."""
+    mixin = _Mixin()
+    base, lora = _coordinate_model()
+    xs, apply_a, multipliers = _coordinate_batch([0.0, 0.0])
+    targets = _coordinate_targets(base, lora, xs, apply_a, multipliers)
+    with pytest.raises(RuntimeError, match="axis name"):
+        mixin._slider_coordinate_loss(
+            _run_velocity_for(base, xs), lora.set_multiplier, targets, multipliers)
+
+
+def test_coordinate_loss_rejects_a_mismatched_or_empty_batch():
+    mixin = _Mixin()
+    base, lora = _coordinate_model()
+    xs, apply_a, multipliers = _coordinate_batch([1.0, -1.0])
+    targets = _coordinate_targets(base, lora, xs, apply_a, multipliers)
+    run_velocity = _run_velocity_for(base, xs)
+    with pytest.raises(ValueError):
+        mixin._slider_coordinate_loss(run_velocity, lora.set_multiplier, targets, multipliers[:1])
+    with pytest.raises(ValueError):
+        mixin._slider_coordinate_loss(run_velocity, lora.set_multiplier, [], [])
+
+
+def test_coordinate_loss_leaves_the_adapter_at_the_resting_multiplier():
+    mixin = _Mixin()
+    base, lora = _coordinate_model()
+    xs, apply_a, multipliers = _coordinate_batch([2.0, -3.0])
+    targets = _coordinate_targets(base, lora, xs, apply_a, multipliers)
+
+    mixin._slider_coordinate_loss(
+        _run_velocity_for(base, xs), lora.set_multiplier, targets, multipliers)
+    assert lora.multiplier == 1.0
+
+    def exploding(indices):
+        raise RuntimeError("boom")
+
+    lora.set_multiplier(0.25)
+    with pytest.raises(RuntimeError, match="boom"):
+        mixin._slider_coordinate_loss(exploding, lora.set_multiplier, targets, multipliers)
+    assert lora.multiplier == 1.0
+
+
+def test_a_coordinate_slider_has_a_real_base_weight_gradient():
+    """The symmetric prompt-pair slider's dL/dW cancels to zero, which is why GA
+    init is refused there. That argument does NOT carry over: a coordinate slider
+    fits one residual per image against a real target, so the base-weight gradient
+    is an ordinary reconstruction gradient and does not cancel at any coordinate
+    spread -- including one symmetric about 0.
+
+    So the GA-init skip for this regime is "not wired up and not validated", not
+    "there is nothing to align to", and the message a user sees must say the one
+    that is true. This test is the evidence for that distinction; if GA init is
+    ever wired to the IMAGE regime, this is what says it was worth doing.
+    """
+    def coordinate_base_grad(coords):
+        base, lora = _coordinate_model()
+        base.weight.requires_grad_(True)
+        xs, apply_a, multipliers = _coordinate_batch(coords)
+        targets = _coordinate_targets(base, lora, xs, apply_a, multipliers)
+        loss = _Mixin()._slider_coordinate_loss(
+            _run_velocity_for(base, xs), lora.set_multiplier, targets, multipliers)
+        base.weight.grad = None
+        loss.backward()
+        return base.weight.grad.norm().item()
+
+    symmetric_prompt_pair = _base_weight_grad(symmetric=True)
+    symmetric_coords = coordinate_base_grad([-2.0, -1.0, 1.0, 2.0])
+    asymmetric_coords = coordinate_base_grad([1.0, 2.0])
+
+    assert symmetric_coords > 1e-2, (
+        f"coordinate ||dL/dW||={symmetric_coords:.3e} -- if this ever cancels, the "
+        "prompt-pair reason for skipping GA init would apply here too"
+    )
+    assert asymmetric_coords > 1e-2
+    assert symmetric_coords > symmetric_prompt_pair * 1e4
