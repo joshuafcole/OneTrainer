@@ -320,7 +320,8 @@ class AnimaSliderSetup(
                 )[0]
 
             loss = self._slider_coordinate_loss(
-                run_velocity, wrapper.set_multiplier, targets, multipliers)
+                run_velocity, wrapper.set_multiplier, targets, multipliers,
+                axis=resolve_target_axis(config.slider_axes).name)
 
         return {"loss": loss}
 

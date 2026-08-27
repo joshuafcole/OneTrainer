@@ -607,6 +607,25 @@ def test_a_batch_of_only_zero_coordinates_is_refused():
             _run_velocity_for(base, xs), lora.set_multiplier, targets, multipliers)
 
 
+def test_the_refusal_names_the_axis_that_was_actually_declared():
+    """The failure this guard catches is a typo, and a typo is two nearly-identical
+    strings the user cannot diff by eye. So the message has to quote the name it was
+    given -- 'siez' -- and show the caption token it would have to match, instead of
+    offering an unrelated example and leaving them to spot the difference."""
+    mixin = _Mixin()
+    base, lora = _coordinate_model()
+    xs, apply_a, multipliers = _coordinate_batch([0.0, 0.0])
+    targets = _coordinate_targets(base, lora, xs, apply_a, multipliers)
+    with pytest.raises(RuntimeError) as excinfo:
+        mixin._slider_coordinate_loss(
+            _run_velocity_for(base, xs), lora.set_multiplier, targets, multipliers,
+            axis="siez")
+    message = str(excinfo.value)
+    assert "'siez'" in message, "the declared axis must be quoted back"
+    assert "(siez:-2)" in message, "the caption token to match must be shown literally"
+    assert "distance" not in message, "an unrelated example axis is what this replaces"
+
+
 def test_coordinate_loss_rejects_a_mismatched_or_empty_batch():
     mixin = _Mixin()
     base, lora = _coordinate_model()

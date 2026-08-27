@@ -189,6 +189,7 @@ class ModelSetupSliderMixin:
         targets: Sequence[Tensor],
         multipliers: Sequence[float],
         loss_fn: Callable[[Tensor, Tensor], Tensor] | None = None,
+        axis: str | None = None,
     ) -> Tensor:
         """Coordinate-scaled reconstruction loss for the IMAGE regime.
 
@@ -249,6 +250,23 @@ class ModelSetupSliderMixin:
 
         trained = sum(len(indices) for indices in groups.values())
         if trained == 0:
+            # Name the axis that was actually declared. The overwhelmingly common
+            # cause is a typo in it, and two nearly-identical strings are exactly
+            # what a user cannot diff by eye -- so quote the one we were given and
+            # show the literal caption token it would have to match, rather than
+            # offering an unrelated example and leaving them to spot the
+            # difference themselves.
+            if axis:
+                raise RuntimeError(
+                    f"Every sample in this batch has a slider coordinate of 0, so the batch "
+                    f"trains nothing: at multiplier 0 the adapter is disabled and receives no "
+                    f"gradient. Not one caption in this batch declared a coordinate on the "
+                    f"axis you asked for, {axis!r}, so for these images the axis is absent "
+                    f"rather than zero. A caption opts in by spelling that name exactly, as "
+                    f"in '({axis}:-2)'. Check the axis name on the Slider tab character by "
+                    f"character against a caption -- if the captions say something else, it "
+                    f"is the two spellings that disagree, not the data."
+                )
             raise RuntimeError(
                 "Every sample in this batch has a slider coordinate of 0, so the batch trains "
                 "nothing: at multiplier 0 the adapter is disabled and receives no gradient. The "
