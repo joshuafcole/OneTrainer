@@ -753,6 +753,15 @@ class GenericTrainer(BaseTrainer):
         if config.peft_init_mode != PeftInitMode.GRADIENT or config.peft_type not in (PeftType.LOKR, PeftType.LORA):
             return
         if config.training_method != TrainingMethod.LORA:
+            if config.training_method == TrainingMethod.SLIDER:
+                # Not merely unimplemented: for a symmetric slider the estimate is
+                # analytically zero. At step 0 the adapter is zero-init, so both
+                # trained passes see the same v == v_base, and the two MSE terms
+                # against v_base +/- eta*delta contribute gradients 2(v - target_pos)
+                # and 2(v - target_neg), which sum to 0. GA init would align the
+                # factors with float noise. Asymmetric sliders do have a signal;
+                # enabling it for them is a separate change with its own evidence.
+                print("GA init: skipping, the slider objective has no step-0 gradient to align to.")
             return
         if self.model.train_progress.global_step > 0:
             print("GA init: skipping, training is being resumed.")
