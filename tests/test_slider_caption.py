@@ -4,8 +4,8 @@ This is the surface a user touches by hand: they type coordinates into captions
 and trust that (a) the coordinate is read the way they wrote it and (b) nothing
 else in the caption is disturbed. Both halves are pinned here.
 
-``slider_caption_util`` is torch-free, so this file imports nothing but the
-parser -- no model, no MGDS, no CUDA. Run with
+``slider_caption_util`` is torch-free, so this file imports nothing heavier than
+a config class -- no model, no MGDS, no CUDA. Run with
 ``python -m pytest tests/test_slider_caption.py``.
 """
 
@@ -16,7 +16,12 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from modules.util.slider_caption_util import parse_slider_coordinates  # noqa: E402
+from modules.util.config.SliderConfig import SliderAxisConfig  # noqa: E402
+from modules.util.slider_caption_util import (  # noqa: E402
+    declared_axis_names,
+    parse_slider_coordinates,
+    resolve_target_axis,
+)
 
 AXES = ["distance"]
 
@@ -146,3 +151,58 @@ def test_an_axis_name_with_regex_metacharacters_is_matched_literally():
     cleaned, coords = parse_slider_coordinates("a car, (axb:1)", ["a.b"])
     assert coords == {}
     assert cleaned == "a car, (axb:1)"
+
+
+# ---------------------------------------------------------------------------
+# which axes are declared, and which one drives the multiplier
+# ---------------------------------------------------------------------------
+
+def _axis(name, gain_k=1.0, is_target=True, enabled=True):
+    axis = SliderAxisConfig.default_values()
+    axis.name, axis.gain_k, axis.is_target, axis.enabled = name, gain_k, is_target, enabled
+    return axis
+
+
+def test_every_declared_axis_is_stripped_not_only_the_target():
+    """Declaring a confounder is how a user keeps it out of the conditioning, so
+    a non-target axis is still a name the caption pipeline removes."""
+    axes = [_axis("distance"), _axis("age", is_target=False)]
+    assert declared_axis_names(axes) == ["distance", "age"]
+
+
+def test_a_disabled_or_unnamed_axis_declares_nothing():
+    axes = [_axis("distance"), _axis("age", enabled=False), _axis("  ", is_target=False)]
+    assert declared_axis_names(axes) == ["distance"]
+
+
+def test_the_target_axis_is_the_one_flagged():
+    axes = [_axis("age", is_target=False), _axis("distance", gain_k=0.5)]
+    target = resolve_target_axis(axes)
+    assert target.name == "distance" and target.gain_k == 0.5
+
+
+@pytest.mark.parametrize("axes,expected", [
+    ([], "at least one declared axis"),
+    ([_axis("distance", enabled=False)], "at least one declared axis"),
+    ([_axis("   ")], "at least one declared axis"),
+    ([_axis("distance", is_target=False)], "No slider axis is flagged as the target"),
+    ([_axis("distance"), _axis("age")], "Exactly one slider axis may be the target"),
+])
+def test_an_unusable_axis_set_is_refused_with_the_control_to_change(axes, expected):
+    """Every one of these is a config mistake, and the only way a user fixes it is
+    on the Slider tab -- so the message has to name it rather than describe an
+    internal invariant."""
+    with pytest.raises(RuntimeError, match=expected):
+        resolve_target_axis(axes)
+
+
+def test_the_refusal_names_the_axes_it_is_talking_about():
+    with pytest.raises(RuntimeError, match="'distance', 'age'"):
+        resolve_target_axis([_axis("distance"), _axis("age")])
+
+
+def test_a_disabled_axis_does_not_count_as_a_second_target():
+    """Switching an axis off is how a user parks it; it must not keep colliding
+    with the axis they switched on."""
+    axes = [_axis("distance"), _axis("age", enabled=False)]
+    assert resolve_target_axis(axes).name == "distance"
