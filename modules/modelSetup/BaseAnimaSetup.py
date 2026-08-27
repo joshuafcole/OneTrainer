@@ -72,6 +72,12 @@ class BaseAnimaSetup(
                 rand=rand,
                 tokens=batch.get("tokens"),
                 tokens_mask=batch.get("tokens_mask"),
+                # The conditioner takes the T5 ids as queries; they are a separate cached tensor, not part
+                # of text_encoder_hidden_state. They must be passed whenever the cached conditioner output
+                # is gated off -- which is exactly the TI path, where Qwen3 runs live so gradient can reach
+                # the trained token.
+                t5_tokens=batch.get("t5_tokens"),
+                t5_tokens_mask=batch.get("t5_tokens_mask"),
                 text_encoder_output=batch['text_encoder_hidden_state'] \
                     if 'text_encoder_hidden_state' in batch and not config.train_text_encoder_or_embedding() else None,
                 text_encoder_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,

@@ -163,12 +163,16 @@ class AnimaModel(BaseModel):
             text: str | list[str] = None,
             tokens: Tensor = None,
             tokens_mask: Tensor = None,
+            t5_tokens: Tensor = None,
+            t5_tokens_mask: Tensor = None,
             text_encoder_layer_skip: int = 0,
             text_encoder_dropout_probability: float | None = None,
             text_encoder_output: Tensor = None,
     ) -> Tensor:
         # Two-stage encoding: Qwen3 text encoder → AnimaTextConditioner (with T5 token ids as queries).
-        # text_encoder_output, when provided from cache, is already the conditioner output.
+        # text_encoder_output, when provided from cache, is already the conditioner output. The T5 ids are
+        # a separate input to the conditioner, so a caller that supplies pre-tokenized `tokens` and wants a
+        # live encode must supply `t5_tokens` too (the data loader caches both).
         if tokens is None and text is not None:
             if isinstance(text, str):
                 text = [text]
@@ -190,22 +194,29 @@ class AnimaModel(BaseModel):
                 truncation=True,
                 return_tensors="pt",
             )
-            t5_ids = t5_output.input_ids.to(self.text_encoder.device)
-            t5_mask = t5_output.attention_mask.to(self.text_encoder.device)
+            t5_tokens = t5_output.input_ids.to(self.text_encoder.device)
+            t5_tokens_mask = t5_output.attention_mask.to(self.text_encoder.device)
 
         if text_encoder_output is None:
+            if t5_tokens is None or t5_tokens_mask is None:
+                raise ValueError(
+                    "AnimaTextConditioner needs T5 token ids. Pass t5_tokens/t5_tokens_mask along with "
+                    "tokens, or pass text, or pass a cached text_encoder_output.")
             with self.text_encoder_autocast_context:
                 qwen_hidden = self.text_encoder(
                     tokens,
                     attention_mask=tokens_mask.float(),
                     output_hidden_states=False,
+                    # No KV cache: this forward is an encode, and on the TI path it runs under grad every
+                    # step. A cache would only pin activations for a decode that never happens.
+                    use_cache=False,
                 ).last_hidden_state
                 # zero out padding positions (mirrors diffusers AnimaTextEncoderStep)
                 qwen_hidden = qwen_hidden * tokens_mask.to(qwen_hidden).unsqueeze(-1)
                 text_encoder_output = self.text_conditioner(
                     source_hidden_states=qwen_hidden.to(dtype=self.text_conditioner.dtype),
-                    target_input_ids=t5_ids,
-                    target_attention_mask=t5_mask,
+                    target_input_ids=t5_tokens,
+                    target_attention_mask=t5_tokens_mask,
                     source_attention_mask=tokens_mask,
                 )
 
