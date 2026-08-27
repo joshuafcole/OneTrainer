@@ -8,14 +8,18 @@ never drags a whole dataset back through the VAE.
 Pure stdlib plus a temp directory: no model, no torch, no GPU.
 """
 
+import builtins
+import json
 import os
 import sys
 import tempfile
+import threading
+from contextlib import contextmanager
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from modules.util.config.ConceptConfig import ConceptConfig
-from modules.util.dataset_key import dataset_fingerprints
+from modules.util.dataset_key import _RECORD_NAME, dataset_fingerprints
 
 
 def _concept(path, **overrides) -> ConceptConfig:
@@ -44,15 +48,47 @@ def _dataset(tmp_dir, images=("a.png", "b.png"), captions=None):
     return concept_dir
 
 
-def _fingerprint(concept_dir, **overrides):
-    return dataset_fingerprints([_concept(concept_dir, **overrides)])
+def _fingerprint(concept_dir, cache_dir=None, **overrides):
+    """``cache_dir=None`` is "keep no digest record", so every media file is hashed
+    on every call. That is the right default for the tests below that ask *what*
+    the fingerprint sees; the tests that ask *how often it reads* pass a real
+    directory."""
+    return dataset_fingerprints([_concept(concept_dir, **overrides)], cache_dir)
+
+
+def _record(cache_dir):
+    """The record as it sits on disk, unparsed by the module under test."""
+    with open(os.path.join(cache_dir, _RECORD_NAME), encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+@contextmanager
+def _watching_opens():
+    """Every path handed to ``open`` while the block runs.
+
+    A record hit has to be shown to perform no *read*, and the only honest way to
+    say that is to count opens. Timing would measure the page cache.
+    """
+    opened = []
+    real_open = builtins.open
+
+    def counted(file, *args, **kwargs):
+        if not isinstance(file, int):
+            opened.append(os.path.abspath(os.fspath(file)))
+        return real_open(file, *args, **kwargs)
+
+    builtins.open = counted
+    try:
+        yield opened
+    finally:
+        builtins.open = real_open
 
 
 def test_a_dataset_with_no_rows_fingerprints_the_same_however_it_got_there():
     # No concepts, and concepts that contribute nothing, hold the same tensors --
     # so they must not be handed separate cache directories.
     with tempfile.TemporaryDirectory() as tmp_dir:
-        assert dataset_fingerprints([]) == _fingerprint(_dataset(tmp_dir), enabled=False)
+        assert dataset_fingerprints([], None) == _fingerprint(_dataset(tmp_dir), enabled=False)
 
 
 def test_fingerprints_are_stable_and_16_hex():
@@ -112,19 +148,25 @@ def test_a_same_length_caption_reword_moves_only_the_caption_fingerprint():
         assert before[0] == after[0], "a caption edit must never move the media fingerprint"
 
 
-def test_a_same_size_image_replacement_moves_the_media_fingerprint():
-    """Media are identified by size and mtime, not by their bytes -- hashing every
-    image on every launch would cost more than the re-encode the cache saves. The
-    mtime half is what covers a replacement that happens to keep the same size, so
-    it is set explicitly here rather than left to filesystem timestamp resolution."""
+def test_a_same_size_replacement_moves_the_media_fingerprint_with_the_mtime_frozen():
+    """Media are identified by their *bytes*, so neither half of the old
+    ``(size, mtime)`` proxy can hide a replacement. Both halves are pinned here on
+    purpose: the replacement keeps the byte count, and the timestamp is set back to
+    what it was -- which is what ``touch -r``, a restore tool, or a filesystem with
+    coarse mtime granularity does for free.
+
+    This is the un-recorded call. With a record in play the same edit is the one
+    case the record cannot see; see
+    ``test_a_record_hit_reads_nothing_and_writes_nothing``."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         concept_dir = _dataset(tmp_dir, images=("a.png",))
         image = os.path.join(concept_dir, "a.png")
-        os.utime(image, ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
+        frozen = 1_000_000_000_000_000_000
+        os.utime(image, ns=(frozen, frozen))
         before = _fingerprint(concept_dir)
 
         _write(image, b"z" * os.path.getsize(image))  # same size, different bytes
-        os.utime(image, ns=(2_000_000_000_000_000_000, 2_000_000_000_000_000_000))
+        os.utime(image, ns=(frozen, frozen))
         assert _fingerprint(concept_dir)[0] != before[0]
 
 
@@ -173,7 +215,7 @@ def test_a_disabled_concept_is_neither_walked_nor_counted():
 
         # ... and so must be indistinguishable from not listing it at all, which is
         # the cache with the same contents.
-        assert disabled == dataset_fingerprints([])
+        assert disabled == dataset_fingerprints([], None)
         other_dir = _dataset(tmp_dir + "-other")
         assert _fingerprint(other_dir, enabled=False) == disabled
 
@@ -186,7 +228,7 @@ def test_an_unlistable_path_is_distinct_from_another_concepts_empty_directory():
         os.makedirs(empty_dir)
         missing = _fingerprint(os.path.join(tmp_dir, "does-not-exist"))
         assert missing != _fingerprint(empty_dir)
-        assert missing != dataset_fingerprints([])
+        assert missing != dataset_fingerprints([], None)
 
 
 def test_concept_order_is_significant():
@@ -196,8 +238,8 @@ def test_concept_order_is_significant():
         first = _dataset(tmp_dir, images=("a.png",))
         second = os.path.join(tmp_dir, "second")
         _write(os.path.join(second, "b.png"), b"other")
-        forward = dataset_fingerprints([_concept(first), _concept(second)])
-        reverse = dataset_fingerprints([_concept(second), _concept(first)])
+        forward = dataset_fingerprints([_concept(first), _concept(second)], None)
+        reverse = dataset_fingerprints([_concept(second), _concept(first)], None)
         assert forward != reverse
 
 
@@ -210,3 +252,193 @@ def test_the_walk_is_not_memoized_across_calls():
         before = _fingerprint(concept_dir)
         _write(os.path.join(concept_dir, "a.png"), b"edited between two runs")
         assert _fingerprint(concept_dir) != before
+
+
+# --- the digest record -----------------------------------------------------
+#
+# Media are hashed, but a hash of every file on every launch is ~170x a stat, so
+# each digest is recorded under cache_dir keyed on (size, mtime_ns) and re-read
+# only when that key moves. These tests are about the record: that it makes the
+# right call cheap, that it never makes a wrong call cheap, and that it cannot
+# take a run down with it.
+
+
+def test_a_bumped_mtime_over_identical_bytes_does_not_move_the_media_fingerprint():
+    """The point of the whole record.
+
+    ``git checkout`` of a dataset repo, an rsync without ``--times``, a restore
+    from a backup: every one of them rewrites timestamps over bytes that did not
+    change. While mtime was part of the dataset's identity that meant a fresh salt
+    and a full re-encode of an unchanged dataset. It must now be invisible -- both
+    with a record (the bumped stat forces a re-read, which finds the same bytes)
+    and without one (nothing ever looked at the timestamp)."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cache_dir = os.path.join(tmp_dir, "cache")
+        concept_dir = _dataset(tmp_dir, images=("a.png", "b.png"))
+        recorded_before = _fingerprint(concept_dir, cache_dir=cache_dir)
+        plain_before = _fingerprint(concept_dir)
+
+        for name in os.listdir(concept_dir):
+            os.utime(os.path.join(concept_dir, name), ns=(2**60, 2**60))
+
+        assert _fingerprint(concept_dir, cache_dir=cache_dir)[0] == recorded_before[0], \
+            "a timestamp is not content: the salt must not move"
+        assert _fingerprint(concept_dir)[0] == plain_before[0]
+
+
+def test_a_record_hit_reads_nothing_and_writes_nothing():
+    """Steady state is a stat per media file and nothing else.
+
+    Asserted against a counting ``open``, not against a stopwatch: a warm page
+    cache makes a real read fast enough to pass a timing test. The caption is the
+    control -- captions carry no record by design, so one *must* appear in the same
+    list, or the counter is not watching the right thing.
+
+    The record file itself must also not be rewritten when nothing changed. A
+    launch that writes nothing cannot lose a race with a concurrent one."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cache_dir = os.path.join(tmp_dir, "cache")
+        concept_dir = _dataset(tmp_dir, images=("a.png",))
+        image = os.path.abspath(os.path.join(concept_dir, "a.png"))
+        caption = os.path.abspath(os.path.join(concept_dir, "a.txt"))
+
+        cold = _fingerprint(concept_dir, cache_dir=cache_dir)
+        written_at = os.stat(os.path.join(cache_dir, _RECORD_NAME)).st_mtime_ns
+
+        with _watching_opens() as opened:
+            warm = _fingerprint(concept_dir, cache_dir=cache_dir)
+
+        assert warm == cold, "the recorded digest must be the digest of the bytes"
+        assert image not in opened, "a record hit must not open the file it vouches for"
+        assert caption in opened, "captions have no record and are read every launch"
+        assert os.stat(os.path.join(cache_dir, _RECORD_NAME)).st_mtime_ns == written_at, \
+            "an unchanged dataset must not rewrite the record"
+
+
+def test_changed_bytes_move_the_media_fingerprint_through_the_record():
+    """The record may only ever save a read, never an invalidation. An ordinary
+    edit moves the stat key, so the file is re-hashed and the new digest reaches
+    the salt."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cache_dir = os.path.join(tmp_dir, "cache")
+        concept_dir = _dataset(tmp_dir, images=("a.png",))
+        image = os.path.abspath(os.path.join(concept_dir, "a.png"))
+        before = _fingerprint(concept_dir, cache_dir=cache_dir)
+        recorded_before = _record(cache_dir)["files"][image]
+
+        _write(os.path.join(concept_dir, "a.png"), b"entirely different pixels")
+        after = _fingerprint(concept_dir, cache_dir=cache_dir)
+
+        assert after[0] != before[0]
+        assert _record(cache_dir)["files"][image][2] != recorded_before[2], \
+            "the new digest must be written back, or every launch re-hashes it"
+
+
+def test_a_size_change_with_the_mtime_preserved_is_re_hashed():
+    """The record keys on *both* halves of the stat, so a size change is caught even
+    when the timestamp is put back -- which a copy tool that preserves mtime does
+    on every file it writes."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cache_dir = os.path.join(tmp_dir, "cache")
+        concept_dir = _dataset(tmp_dir, images=("a.png",))
+        image = os.path.join(concept_dir, "a.png")
+        frozen = 1_000_000_000_000_000_000
+        os.utime(image, ns=(frozen, frozen))
+        before = _fingerprint(concept_dir, cache_dir=cache_dir)
+
+        _write(image, b"x" * (os.path.getsize(image) + 1))  # one byte longer
+        os.utime(image, ns=(frozen, frozen))
+
+        assert _fingerprint(concept_dir, cache_dir=cache_dir)[0] != before[0]
+
+
+def test_an_unusable_record_is_rebuilt_instead_of_raising():
+    """Missing, truncated mid-write, not JSON at all, or written by a version that
+    does not exist yet: every one of them has to mean "hash everything once", never
+    a run that cannot start. A record is an optimisation, and an optimisation may
+    not be load-bearing."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        concept_dir = _dataset(tmp_dir, images=("a.png",))
+        expected = _fingerprint(concept_dir)
+
+        corruptions = [
+            None,                                              # never written
+            "",                                                # created, never filled
+            '{"version": 1, "files": {"/a.png": [1, 2, "de',   # torn mid-write
+            "not json at all",
+            '{"version": 99, "files": {}}',                    # a shape from the future
+            '{"version": 1, "files": "not a mapping"}',
+            '{"version": 1, "files": {"/a.png": ["nonsense"]}}',
+        ]
+        for i, content in enumerate(corruptions):
+            cache_dir = os.path.join(tmp_dir, f"cache-{i}")
+            os.makedirs(cache_dir)
+            if content is not None:
+                _write(os.path.join(cache_dir, _RECORD_NAME), content)
+
+            assert _fingerprint(concept_dir, cache_dir=cache_dir) == expected, content
+            # ... and the damaged record is replaced by a good one, so the cost is
+            # paid once rather than on every launch from here on.
+            assert _record(cache_dir)["version"] == 1
+            assert _fingerprint(concept_dir, cache_dir=cache_dir) == expected
+
+
+def test_two_writers_never_leave_a_torn_record():
+    """Two runs can share one cache_dir -- a training run and a sample window, two
+    configs launched back to back. The record is written to a temp file in the same
+    directory and moved into place with os.replace, so a reader sees the old file or
+    the new one and never a half-written one. The loser of a race loses only its own
+    entries, and re-establishes them next launch."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cache_dir = os.path.join(tmp_dir, "cache")
+        failures = []
+
+        def churn(tag):
+            concept_dir = _dataset(os.path.join(tmp_dir, tag), images=(f"{tag}.png",))
+            try:
+                for i in range(25):
+                    # a fresh size every round, so every pass misses the record and
+                    # writes a new one
+                    _write(os.path.join(concept_dir, f"{tag}.png"), bytes([i]) * (i + 1))
+                    _fingerprint(concept_dir, cache_dir=cache_dir)
+                    _record(cache_dir)  # raises if it ever catches a torn file
+            except Exception as error:  # noqa: BLE001 -- re-raised on the main thread
+                failures.append(error)
+
+        threads = [threading.Thread(target=churn, args=(tag,)) for tag in ("one", "two")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not failures, failures
+        assert os.listdir(cache_dir) == [_RECORD_NAME], "no temp file may be left behind"
+
+
+def test_walking_one_concept_does_not_evict_anothers_entries():
+    """Entries have to be pruned or the record grows forever, but only against the
+    files walked *for the concepts walked this run*. Prune globally and two configs
+    that alternate -- a small smoke-test concept and the real dataset -- would evict
+    each other every launch and re-hash every launch, which is the whole cost this
+    record exists to remove."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cache_dir = os.path.join(tmp_dir, "cache")
+        first = _dataset(os.path.join(tmp_dir, "first"), images=("a.png", "gone.png"))
+        second = _dataset(os.path.join(tmp_dir, "second"), images=("b.png",))
+        kept = os.path.abspath(os.path.join(second, "b.png"))
+
+        _fingerprint(first, cache_dir=cache_dir)
+        _fingerprint(second, cache_dir=cache_dir)
+
+        # A run that walks only the first concept ...
+        os.remove(os.path.join(first, "gone.png"))
+        _fingerprint(first, cache_dir=cache_dir)
+        files = _record(cache_dir)["files"]
+
+        # ... prunes what it walked and found gone ...
+        assert os.path.abspath(os.path.join(first, "gone.png")) not in files
+        # ... and leaves the concept it never looked at alone.
+        assert kept in files
+        with _watching_opens() as opened:
+            _fingerprint(second, cache_dir=cache_dir)
+        assert kept not in opened, "the surviving entry must still be a record hit"

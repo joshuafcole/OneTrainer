@@ -124,8 +124,16 @@ def cache_salts(
 
     Computed together because the two share one walk of the dataset, which is the
     expensive part.
+
+    ``config.cache_dir`` is handed to the dataset walk, not just used to place the
+    result: the media fingerprint keeps its per-file digest record at the root of
+    it, so that walk is a stat per file instead of a read per file. It is the
+    training cache directory, not ``config.quantization.cache_dir`` (a Huggingface
+    hub dir that happens to share the name). An empty value -- which is what the
+    field holds when a user has cleared it -- means the walk keeps no record and
+    hashes every media file, which is slower and exactly as correct.
     """
-    media_fingerprint, caption_fingerprint = dataset_fingerprints(concepts)
+    media_fingerprint, caption_fingerprint = dataset_fingerprints(concepts, config.cache_dir or None)
     return CacheSalts(
         image=_image_salt(config, bucketing, image_names, media_fingerprint),
         text=_text_salt(config, text_names, caption_fingerprint),
@@ -214,8 +222,9 @@ def _text_salt(config: TrainConfig, text_names: list[str], caption_fingerprint: 
         "caption_rewrites": _caption_rewrites(config),
         # The captions behind the embeddings -- plus the media file *list*, since
         # embeddings are cached positionally per row and which rows exist is part of
-        # the identity even though their pixels are not. Media size/mtime are
-        # excluded, so re-encoding an image never re-runs the text encoders.
+        # the identity even though their pixels are not. The media *content*
+        # digests are excluded, so re-encoding an image never re-runs the text
+        # encoders.
         "dataset_captions": caption_fingerprint,
     })
 

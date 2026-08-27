@@ -11,8 +11,10 @@ this whole mechanism exists to work around, so that if either is ever fixed
 upstream the failure lands here, next to the reason.
 """
 
+import atexit
 import json
 import os
+import shutil
 import sys
 import tempfile
 import types
@@ -29,6 +31,7 @@ from modules.util.bucket_tiers import BUCKET_KEEP_NAME, BUCKET_REPEAT_NAME, buck
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.SliderConfig import SliderAxisConfig
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.dataset_key import _RECORD_NAME as DATASET_RECORD_NAME
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.SliderRegime import SliderRegime
@@ -63,11 +66,20 @@ class _Loader(DataLoaderText2ImageMixin):
         return []
 
 
+# cache_dir is no longer only a place to *compute* a path from: the dataset walk
+# keeps its per-file digest record at the root of it, so it has to be somewhere
+# this suite may actually write. One directory for the whole module, because
+# several tests compare the salt directory two configs choose and that comparison
+# only means anything while cache_dir is the same string in both.
+_CACHE_DIR = tempfile.mkdtemp(prefix="onetrainer-cache-key-")
+atexit.register(shutil.rmtree, _CACHE_DIR, True)
+
+
 def _config(**overrides) -> TrainConfig:
     config = TrainConfig.default_values()
     config.model_type = ModelType.STABLE_DIFFUSION_15
     config.base_model_name = "/models/sd15.safetensors"
-    config.cache_dir = "/workspace/cache"
+    config.cache_dir = _CACHE_DIR
     config.batch_size = 4
     config.multi_gpu = False
     config.latent_caching = True
@@ -331,12 +343,18 @@ def test_clear_cache_removes_every_cache_a_dataloader_writes():
     with tempfile.TemporaryDirectory() as tmp_dir:
         for name in ("image", "text", "vae", "epoch-0", "quantization"):
             os.makedirs(os.path.join(tmp_dir, name))
+        # The dataset fingerprint record sits at the root of cache_dir and must
+        # outlive a clear: it describes the *dataset*, not the cache, so clearing
+        # the cache should cost a re-encode and not also a re-hash of every file.
+        record = os.path.join(tmp_dir, DATASET_RECORD_NAME)
+        with open(record, "w") as fh:
+            fh.write("{}")
 
         trainer = object.__new__(GenericTrainer)
         trainer.config = _config(cache_dir=tmp_dir)
         trainer._GenericTrainer__clear_cache()
 
-        assert sorted(os.listdir(tmp_dir)) == ["quantization"], \
+        assert sorted(os.listdir(tmp_dir)) == [DATASET_RECORD_NAME, "quantization"], \
             "every latent/text cache must go, and only those"
 
 
