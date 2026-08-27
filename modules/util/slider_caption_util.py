@@ -37,10 +37,12 @@ _VALUE = r"[-+]?(?:\d+\.?\d*|\.\d+)"
 
 
 def _axis_pattern(axis_names: list[str]) -> "re.Pattern[str] | None":
-    # Longest name first. Python's alternation backtracks, so "age" would not
-    # actually swallow "(age_group:1)" -- but the ordering makes that independent
-    # of backtracking rather than reliant on it.
-    names = sorted({n.strip() for n in axis_names if n and n.strip()}, key=len, reverse=True)
+    # Order-preserving dedup, so the compiled pattern is the same every run. The
+    # order does not affect which axis wins: alternation backtracks, so declaring
+    # "age" before "age_group" still resolves "(age_group:1)" to age_group -- the
+    # shorter branch matches the name but then fails on the ":" and is retried.
+    # (test_a_prefix_of_an_axis_name_does_not_swallow_the_longer_one pins that.)
+    names = list(dict.fromkeys(n.strip() for n in axis_names if n and n.strip()))
     if not names:
         return None
     alternation = "|".join(re.escape(name) for name in names)
