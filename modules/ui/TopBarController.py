@@ -4,7 +4,7 @@ import traceback
 import webbrowser
 from contextlib import suppress
 
-from modules.util import path_util
+from modules.util import create, path_util
 from modules.util.config.SecretsConfig import SecretsConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
@@ -52,8 +52,12 @@ class TopBarController:
             TrainingMethod.LORA: "LoRA",
             TrainingMethod.EMBEDDING: "Embedding",
             TrainingMethod.FINE_TUNE_VAE: "Fine Tune VAE",
+            TrainingMethod.SLIDER: "Slider",
         }
-        return [(labels[m], m) for m in model_type.supported_training_methods()]
+        # create.supported_training_methods, not ModelType's: methods a model opts
+        # into by registering a setup are not expressible in the enum's grouped
+        # tuples. See its docstring.
+        return [(labels[m], m) for m in create.supported_training_methods(model_type)]
 
     def load_preset_tree(self, dir: str = "training_presets") -> list[tuple[str, str | list]]:
         # mirrors whatever directory structure happens to exist under `dir`; a node is either

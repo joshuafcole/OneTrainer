@@ -37,6 +37,8 @@ from modules.modelSetup.StableDiffusionXLSliderSetup import (  # noqa: E402
     SliderConditioning,
     StableDiffusionXLSliderSetup,
 )
+from modules.ui.BaseSliderTabView import BaseSliderTabView  # noqa: E402
+from modules.ui.TopBarController import TopBarController  # noqa: E402
 from modules.util import factory  # noqa: E402
 from modules.util.config.SliderConfig import SliderPromptConfig  # noqa: E402
 from modules.util.config.TrainConfig import TrainConfig  # noqa: E402
@@ -44,6 +46,7 @@ from modules.util.enum.ConceptType import ConceptType  # noqa: E402
 from modules.util.enum.DataType import DataType  # noqa: E402
 from modules.util.enum.ModelFormat import ModelFormat  # noqa: E402
 from modules.util.enum.ModelType import ModelType, PeftType  # noqa: E402
+from modules.util.enum.SliderRegime import SliderRegime  # noqa: E402
 from modules.util.enum.TrainingMethod import TrainingMethod  # noqa: E402
 from modules.util.ModelNames import EmbeddingName, ModelNames  # noqa: E402
 
@@ -539,6 +542,8 @@ def test_lora_weight_dtype_default_is_untouched():
     """A guard on the config surface, not the slider: the slider fields must not
     have displaced anything in TrainConfig's default ordering."""
     assert TrainConfig.default_values().lora_weight_dtype == DataType.FLOAT_32
+
+
 # ---------------------------------------------------------------------------
 # the PEFT-type gate
 #
@@ -604,6 +609,7 @@ def test_the_refused_set_is_exactly_the_set_that_raises_in_the_forward():
         (PeftType.LOKR, True),
     }
 
+
 # ---------------------------------------------------------------------------
 # resuming from a backup
 #
@@ -641,3 +647,39 @@ def test_every_training_method_has_a_backup_destination():
         assert "/backup/x" in (
             model_names.lora, model_names.base_model, model_names.embedding.model_name)
 
+
+# ---------------------------------------------------------------------------
+# the UI surfaces
+# ---------------------------------------------------------------------------
+
+def test_every_training_method_has_a_dropdown_label():
+    """TopBarController indexes a dict by TrainingMethod. A method without an
+    entry is a KeyError that takes down the whole top bar, and only for the model
+    types that advertise it -- so it can ship looking fine."""
+    config = _config(model_type=ModelType.ANIMA, training_method=TrainingMethod.SLIDER)
+    controller = TopBarController.__new__(TopBarController)
+    controller.train_config = config
+
+    for model_type in ModelType:
+        labels = dict(controller.get_training_methods(model_type))
+        assert labels, f"{model_type} offers no training method at all"
+
+    anima = [method for _, method in controller.get_training_methods(ModelType.ANIMA)]
+    assert TrainingMethod.SLIDER in anima
+    sd15 = [method for _, method in controller.get_training_methods(ModelType.STABLE_DIFFUSION_15)]
+    assert TrainingMethod.SLIDER not in sd15
+
+
+def test_every_regime_declares_its_blocks_and_its_hint():
+    """The regime selector hides every block not named for the current regime. A
+    regime missing from the map therefore renders an *empty* tab rather than
+    failing -- so the map is checked against the enum, not the other way round."""
+    for regime in SliderRegime:
+        assert BaseSliderTabView.blocks_for_regime(regime), f"{regime} shows no settings block"
+        assert BaseSliderTabView.hint_for_regime(regime), f"{regime} has no hint text"
+
+
+def test_the_prompt_pair_regime_shows_the_prompt_list():
+    blocks = BaseSliderTabView.blocks_for_regime(SliderRegime.PROMPT_PAIR)
+    assert "prompt_list" in blocks, "the triples are the whole input of this regime"
+    assert "prompt_pair" in blocks

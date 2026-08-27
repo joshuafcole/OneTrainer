@@ -19,6 +19,7 @@ from modules.ui.CtkModelTabView import CtkModelTabView
 from modules.ui.CtkProfilingWindowView import CtkProfilingWindowView
 from modules.ui.CtkSampleWindowView import CtkSampleWindowView
 from modules.ui.CtkSamplingTabView import CtkSamplingTabView
+from modules.ui.CtkSliderTabView import CtkSliderTabView
 from modules.ui.CtkTopBarView import CtkTopBarView
 from modules.ui.CtkTrainingTabView import CtkTrainingTabView
 from modules.ui.CtkVideoToolUIView import CtkVideoToolUIView
@@ -26,6 +27,7 @@ from modules.ui.LoraTabController import LoraTabController
 from modules.ui.ModelTabController import ModelTabController
 from modules.ui.ProfilingWindowController import ProfilingWindowController
 from modules.ui.SamplingTabController import SamplingTabController
+from modules.ui.SliderTabController import SliderTabController
 from modules.ui.TopBarController import TopBarController
 from modules.ui.TrainingTabController import TrainingTabController
 from modules.ui.TrainUIController import TrainUIController
@@ -113,6 +115,7 @@ class CtkTrainUIView(BaseTrainUIView, ctk.CTk):
         self.model_tab = None
         self.training_tab = None
         self.lora_tab = None
+        self.slider_tab = None
         self.cloud_tab = None
         self.additional_embeddings_tab = None
 
@@ -368,6 +371,9 @@ class CtkTrainUIView(BaseTrainUIView, ctk.CTk):
         if self.lora_tab:
             self.lora_tab.refresh_ui()
 
+        if self.slider_tab:
+            self.slider_tab.refresh_ui()
+
         self._update_additional_embeddings_tab(model_type)
 
     def _update_additional_embeddings_tab(self, model_type: ModelType):
@@ -389,14 +395,23 @@ class CtkTrainUIView(BaseTrainUIView, ctk.CTk):
         if self.model_tab:
             self.model_tab.refresh_ui()
 
-        if training_method != TrainingMethod.LORA and "LoRA" in self.tabview._tab_dict:
+        # a slider IS a LoRA -- the network is configured on the same tab, and only
+        # the objective differs -- so SLIDER shows the LoRA tab too, plus its own.
+        wants_lora_tab = training_method in (TrainingMethod.LORA, TrainingMethod.SLIDER)
+
+        if not wants_lora_tab and "LoRA" in self.tabview._tab_dict:
             self.tabview.delete("LoRA")
             self.lora_tab = None
+        if training_method != TrainingMethod.SLIDER and "slider" in self.tabview._tab_dict:
+            self.tabview.delete("slider")
+            self.slider_tab = None
         if training_method != TrainingMethod.EMBEDDING and "embedding" in self.tabview._tab_dict:
             self.tabview.delete("embedding")
 
-        if training_method == TrainingMethod.LORA and "LoRA" not in self.tabview._tab_dict:
+        if wants_lora_tab and "LoRA" not in self.tabview._tab_dict:
             self.lora_tab = CtkLoraTabView(self.tabview.add("LoRA"), LoraTabController(self.controller.train_config), self.ui_state)
+        if training_method == TrainingMethod.SLIDER and "slider" not in self.tabview._tab_dict:
+            self.slider_tab = CtkSliderTabView(self.tabview.add("slider"), SliderTabController(self.controller.train_config), self.ui_state)
         if training_method == TrainingMethod.EMBEDDING and "embedding" not in self.tabview._tab_dict:
             self.embedding_tab(self.tabview.add("embedding"))
 

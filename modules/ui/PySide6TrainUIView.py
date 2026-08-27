@@ -18,10 +18,12 @@ from modules.ui.PySide6ModelTabView import PySide6ModelTabView
 from modules.ui.PySide6ProfilingWindowView import PySide6ProfilingWindowView
 from modules.ui.PySide6SampleWindowView import PySide6SampleWindowView
 from modules.ui.PySide6SamplingTabView import PySide6SamplingTabView
+from modules.ui.PySide6SliderTabView import PySide6SliderTabView
 from modules.ui.PySide6TopBarView import PySide6TopBarView
 from modules.ui.PySide6TrainingTabView import PySide6TrainingTabView
 from modules.ui.PySide6VideoToolUIView import PySide6VideoToolUIView
 from modules.ui.SamplingTabController import SamplingTabController
+from modules.ui.SliderTabController import SliderTabController
 from modules.ui.TopBarController import TopBarController
 from modules.ui.TrainingTabController import TrainingTabController
 from modules.ui.TrainUIController import TrainUIController
@@ -62,6 +64,7 @@ class PySide6TrainView(BaseTrainUIView, QMainWindow, metaclass=QtABCMeta):
         self.model_tab = None
         self.training_tab = None
         self.lora_tab = None
+        self.slider_tab = None
         self.cloud_tab = None
         self.concepts_tab = None
         self.sampling_tab = None
@@ -334,6 +337,8 @@ class PySide6TrainView(BaseTrainUIView, QMainWindow, metaclass=QtABCMeta):
             self.training_tab.refresh_ui()
         if self.lora_tab:
             self.lora_tab.refresh_ui()
+        if self.slider_tab:
+            self.slider_tab.refresh_ui()
         self._update_additional_embeddings_tab(model_type)
 
     def _update_additional_embeddings_tab(self, model_type: ModelType):
@@ -350,18 +355,30 @@ class PySide6TrainView(BaseTrainUIView, QMainWindow, metaclass=QtABCMeta):
         if self.model_tab:
             self.model_tab.refresh_ui()
 
-        if training_method != TrainingMethod.LORA and 'LoRA' in self._tab_widgets:
+        # a slider IS a LoRA -- the network is configured on the same tab, and only
+        # the objective differs -- so SLIDER shows the LoRA tab too, plus its own.
+        wants_lora_tab = training_method in (TrainingMethod.LORA, TrainingMethod.SLIDER)
+
+        if not wants_lora_tab and 'LoRA' in self._tab_widgets:
             self.tabview.removeTab(self.tabview.indexOf(self._tab_widgets['LoRA']))
             del self._tab_widgets['LoRA']
             self.lora_tab = None
+        if training_method != TrainingMethod.SLIDER and 'slider' in self._tab_widgets:
+            self.tabview.removeTab(self.tabview.indexOf(self._tab_widgets['slider']))
+            del self._tab_widgets['slider']
+            self.slider_tab = None
         if training_method != TrainingMethod.EMBEDDING and 'embedding' in self._tab_widgets:
             self.tabview.removeTab(self.tabview.indexOf(self._tab_widgets['embedding']))
             del self._tab_widgets['embedding']
 
-        if training_method == TrainingMethod.LORA and 'LoRA' not in self._tab_widgets:
+        if wants_lora_tab and 'LoRA' not in self._tab_widgets:
             self.lora_tab = PySide6LoraTabView(None, LoraTabController(self.controller.train_config), self.ui_state)
             self.tabview.addTab(self.lora_tab, 'LoRA')
             self._tab_widgets['LoRA'] = self.lora_tab
+        if training_method == TrainingMethod.SLIDER and 'slider' not in self._tab_widgets:
+            self.slider_tab = PySide6SliderTabView(None, SliderTabController(self.controller.train_config), self.ui_state)
+            self.tabview.addTab(self.slider_tab, 'slider')
+            self._tab_widgets['slider'] = self.slider_tab
         if training_method == TrainingMethod.EMBEDDING and 'embedding' not in self._tab_widgets:
             tab_page = self._create_scrollable_tab(self._configure_embedding_frame)
             self.tabview.addTab(tab_page, 'embedding')
