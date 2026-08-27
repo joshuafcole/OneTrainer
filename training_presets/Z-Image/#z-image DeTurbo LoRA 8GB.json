@@ -21,7 +21,6 @@
         "weight_dtype": "FLOAT_32"
     },
     "train_dtype": "BFLOAT_16",
-    "weight_dtype": "BFLOAT_16",
     "output_dtype": "BFLOAT_16",
     "layer_filter": "^(?=.*attention)(?!.*refiner).*,^(?=.*feed_forward)(?!.*refiner).*",
     "layer_filter_preset": "attn-mlp",

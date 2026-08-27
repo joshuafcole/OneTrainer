@@ -18,7 +18,6 @@
         "weight_dtype": "FLOAT_32"
     },
     "train_dtype": "BFLOAT_16",
-    "weight_dtype": "BFLOAT_16",
     "output_dtype": "BFLOAT_16",
     "timestep_distribution": "INVERTED_PARABOLA",
     "noising_weight": 7.7,
