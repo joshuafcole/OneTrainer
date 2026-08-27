@@ -56,6 +56,31 @@ factory.import_dir("modules/modelSaver", "modules.modelSaver")
 factory.import_dir("modules/modelSetup", "modules.modelSetup")
 factory.import_dir("modules/dataLoader", "modules.dataLoader")
 
+def supported_training_methods(model_type: ModelType) -> tuple[TrainingMethod, ...]:
+    """Every training method offered for `model_type`, in dropdown order.
+
+    ModelType.supported_training_methods() answers with grouped tuples shared by
+    six to eight model types apiece, so a method that only some members of a group
+    implement cannot be expressed there -- appending SLIDER to Anima's tuple would
+    advertise it for qwen, z_image, flux_2, ernie, krea2 and ideogram too, none of
+    which have a slider host.
+
+    So the opt-in methods are gated on the factory instead: a model offers SLIDER
+    exactly when a setup is registered for it. There is no list to keep in sync --
+    adding a host is what adds the dropdown entry.
+    """
+    methods = list(model_type.supported_training_methods())
+    for method in _FACTORY_GATED_TRAINING_METHODS:
+        if method not in methods and factory.get(BaseModelSetup, model_type, method) is not None:
+            methods.append(method)
+    return tuple(methods)
+
+
+# Methods a model type opts into by registering a setup, rather than by being
+# named in ModelType.supported_training_methods().
+_FACTORY_GATED_TRAINING_METHODS = (TrainingMethod.SLIDER,)
+
+
 def create_model_loader(
         model_type: ModelType,
         training_method: TrainingMethod = TrainingMethod.FINE_TUNE,

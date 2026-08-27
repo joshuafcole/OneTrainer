@@ -123,3 +123,115 @@ class ModelSetupSliderMixin:
             # Restore unconditionally: a raise partway through would otherwise leave
             # the adapter parked at -strength for whatever runs next.
             set_multiplier(_RESTING_MULTIPLIER)
+
+    # ------------------------------------------------------------------------
+    # Host-neutral plumbing.
+    #
+    # Everything below turns TrainConfig into the objective's arguments and
+    # touches no model API at all, so both hosts share it verbatim and it is
+    # testable without a model. The one host-specific step -- turning a prompt
+    # string into a conditioning -- is passed in as `encode`.
+    # ------------------------------------------------------------------------
+
+    def _slider_triples(self, config) -> list:
+        """The enabled prompt triples, or a UI-actionable error."""
+        triples = [t for t in config.slider_prompts if t.enabled]
+        if not triples:
+            raise RuntimeError(
+                "Slider training needs at least one enabled prompt pair (see the Slider tab)."
+            )
+        return triples
+
+    def _choose_triple(self, triples: list, rand):
+        """Pick one triple, weighted. A weight of 0 excludes a triple without the
+        user having to delete it; all-zero weights fall back to uniform rather
+        than raising, since that is what an all-zero list plainly means."""
+        weights = [max(0.0, t.weight) for t in triples]
+        total = sum(weights)
+        if total <= 0.0:
+            return rand.choice(triples)
+        r = rand.random() * total
+        acc = 0.0
+        for triple, w in zip(triples, weights, strict=True):
+            acc += w
+            if r <= acc:
+                return triple
+        return triples[-1]
+
+    @staticmethod
+    def _slider_preservation_contexts(config) -> list[str]:
+        """The disentanglement set P, parsed from the free-text field.
+
+        Split on newlines *and* pipes: a multi-line text box and a single-line
+        entry are the same field on two toolkits, and a user who typed one
+        separator should not silently get a single context containing the other.
+        """
+        raw = config.slider_preservation_prompts.replace("\n", "|")
+        return [part.strip() for part in raw.split("|") if part.strip()]
+
+    def _slider_prompt_pairs(self, triple, config) -> tuple[list[str], list[str]]:
+        """The c+/c- *prompt strings* whose velocity difference is the guidance
+        direction.
+
+        Bare pair (CS Eq. 7) when no preservation set is configured. Otherwise the
+        attribute poles are re-stated in each preservation context and the
+        objective averages the per-context delta (the disentanglement mean, CS
+        Eq. 8). The bare pair is always included, so adding a context widens the
+        average rather than replacing it.
+        """
+        contexts = self._slider_preservation_contexts(config)
+        if not contexts:
+            return [triple.positive], [triple.negative]
+
+        positive, negative = [], []
+        for ctx in [None, *contexts]:
+            positive.append(triple.positive if ctx is None else f"{triple.positive}, {ctx}")
+            negative.append(triple.negative if ctx is None else f"{triple.negative}, {ctx}")
+        return positive, negative
+
+    def _slider_cached_conditioning(
+        self,
+        text: str,
+        encode: Callable[[str], Conditioning],
+    ) -> Conditioning:
+        """Encode ``text`` once per run.
+
+        The slider prompts are fixed for the whole run and the text encoders are
+        frozen, so re-encoding them every step is pure cost -- on Anima that is a
+        Qwen3 forward per prompt per step. The cache lives on the setup instance,
+        which is created per run.
+        """
+        cache = getattr(self, "_slider_cond_cache", None)
+        if cache is None:
+            cache = {}
+            self._slider_cond_cache = cache
+        if text not in cache:
+            cache[text] = encode(text)
+        return cache[text]
+
+    @staticmethod
+    def _slider_sample_noise_level(config, rand) -> float:
+        """A noise level in [0, 1] drawn uniformly from the configured range.
+
+        Bounds are order-insensitive: a user who swaps min and max gets the range
+        they clearly meant, not an empty one.
+        """
+        lo, hi = float(config.slider_sigma_min), float(config.slider_sigma_max)
+        lo, hi = max(0.0, min(lo, hi)), min(1.0, max(lo, hi))
+        return lo + (hi - lo) * rand.random()
+
+    @staticmethod
+    def _slider_resolution(config) -> tuple[int, int]:
+        """(height, width) in pixels for the synthetic latent.
+
+        Prompt-pair training has no dataset, so there is no bucketing to read the
+        resolution from -- it comes from the same `resolution` field the rest of
+        the trainer uses. A multi-resolution list trains one slider at one size;
+        the first entry wins.
+        """
+        token = config.resolution.split(",")[0].strip().lower()
+        if "x" in token:
+            h_str, w_str = token.split("x", 1)
+            return int(h_str), int(w_str)
+        size = int(token)
+        return size, size

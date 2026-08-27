@@ -14,10 +14,11 @@ Small float Linears only: CPU, no GPU, no model download. Run with
 import os
 import sys
 
-import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
