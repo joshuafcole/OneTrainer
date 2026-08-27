@@ -174,14 +174,15 @@ def _text_salt(config: TrainConfig, text_names: list[str], caption_fingerprint: 
     and appended rows change the row count -- which is precisely what the
     DiskCache's own length check catches and rebuilds on.
     """
-    # (part, layer skip, sequence length). Encoder 1 has no configurable sequence
-    # length; every other field is declared on TrainConfig, so they are read
-    # directly rather than through getattr.
+    # (part, layer skip, sequence length). Only encoder 2 has a configurable
+    # sequence length today; the fields are read straight off TrainConfig rather
+    # than through getattr so a renamed or removed one is a failure here instead of
+    # a silently constant contribution to the digest.
     specs: list[tuple[TrainModelPartConfig, int, int | None]] = [
         (config.text_encoder, config.text_encoder_layer_skip, None),
         (config.text_encoder_2, config.text_encoder_2_layer_skip, config.text_encoder_2_sequence_length),
-        (config.text_encoder_3, config.text_encoder_3_layer_skip, config.text_encoder_3_sequence_length),
-        (config.text_encoder_4, config.text_encoder_4_layer_skip, config.text_encoder_4_sequence_length),
+        (config.text_encoder_3, config.text_encoder_3_layer_skip, None),
+        (config.text_encoder_4, config.text_encoder_4_layer_skip, None),
     ]
     encoders = [
         {"name": name, "layer_skip": layer_skip, "seq_len": seq_len}

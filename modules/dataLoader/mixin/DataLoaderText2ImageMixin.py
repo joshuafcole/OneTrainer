@@ -4,6 +4,7 @@ from abc import ABCMeta, abstractmethod
 from collections.abc import Callable
 
 import modules.util.multi_gpu_util as multi
+from modules.dataLoader.mixin.DataLoaderMgdsMixin import dataset_concepts
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
@@ -19,6 +20,8 @@ from modules.util.bucket_tiers import (
     bucket_tags_enabled,
     bucketing_params,
 )
+from modules.util.cache_key import cache_salts
+from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.DataType import DataType
 from modules.util.TrainProgress import TrainProgress
@@ -71,6 +74,15 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     # no module produces is a pipeline error, so the sorter must not ask for them
     # unless they are actually on the wire.
     _emits_bucket_balancing = False
+
+    # Set by _create_dataset, read by _cache_modules_from_names: the two inputs to
+    # the cache salts that only _create_dataset knows. `bucketing` carries the
+    # per-dataloader quantization and long-edge cap, which are constructor
+    # arguments rather than config fields; `concepts` is the resolved, validation-
+    # filtered concept list. Passing them as arguments instead would mean changing
+    # a signature every concrete loader calls.
+    _cache_bucketing: BucketingParams | None = None
+    _cache_concepts: list[ConceptConfig] = []
 
     def _enumerate_input_modules(self, config: TrainConfig, allow_videos: bool = False) -> list:
         supported_extensions = set()
@@ -394,9 +406,6 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             text_caching: bool,
             before_cache_image_fun: Callable[[], None] | None = None,
     ):
-        image_cache_dir = os.path.join(config.cache_dir, "image")
-        text_cache_dir = os.path.join(config.cache_dir, "text")
-
         # Carry the planner's tags exactly like crop_resolution: as image-cache
         # aggregates (restored after caching) and in sort_names (so VariationSorting
         # carries them when latent caching is off). The batch sorter reads them at the
@@ -405,6 +414,28 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             bucket_tag_names = [BUCKET_KEEP_NAME, BUCKET_REPEAT_NAME]
             image_aggregate_names = list(image_aggregate_names) + bucket_tag_names
             sort_names = list(sort_names) + bucket_tag_names
+
+        # Nest each cache under a salt of everything the DiskCache group key does not
+        # capture -- model identity, resolution, bucket geometry, dataset content, and
+        # the very names cached below. This is what makes reusing a cache across runs
+        # safe: a changed identity gets a fresh directory instead of colliding with
+        # stale tensors or raising KeyError on a name that was not there when it was
+        # built. Computed after the bucket tags are added so the names it sees are the
+        # names the DiskCache is given. See modules/util/cache_key.py.
+        if self._cache_bucketing is None:
+            raise RuntimeError(
+                "cache salts are unset: _cache_modules_from_names must be reached through "
+                "DataLoaderText2ImageMixin._create_dataset, which derives the bucket geometry."
+            )
+        salts = cache_salts(
+            config,
+            bucketing=self._cache_bucketing,
+            concepts=self._cache_concepts,
+            image_names=list(image_split_names) + list(image_aggregate_names),
+            text_names=list(text_split_names),
+        )
+        image_cache_dir = os.path.join(config.cache_dir, "image", salts.image)
+        text_cache_dir = os.path.join(config.cache_dir, "text", salts.text)
 
         if before_cache_image_fun is None:
             def prepare_vae():
@@ -468,6 +499,10 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             batch_size=config.batch_size * (multi.world_size() if config.multi_gpu else 1),
             max_resolution=aspect_bucketing_max_resolution,
         )
+        # Handed to _cache_modules_from_names, which builds the cache salts but sees
+        # neither the derived geometry nor which concepts this dataset draws from.
+        self._cache_bucketing = bucketing
+        self._cache_concepts = dataset_concepts(config, is_validation)
 
         enumerate_input = self._enumerate_input_modules(config, allow_videos=allow_video_files)
         bucket_rebalance = self._bucket_rebalance_modules(config, bucketing)

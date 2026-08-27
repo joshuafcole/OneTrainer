@@ -25,6 +25,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from modules.dataLoader.mixin.DataLoaderMgdsMixin import dataset_concepts
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
 from modules.util.bucket_limits import ANIMA_MAX_BUCKET_RESOLUTION, max_bucket_resolution_for
 from modules.util.bucket_tiers import (
@@ -90,6 +91,7 @@ def _config(**overrides) -> TrainConfig:
     config.multi_gpu = False
     config.latent_caching = True
     config.aspect_ratio_bucketing = True
+    config.concepts = []  # resolved in memory, so no concept file is read
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
@@ -128,13 +130,23 @@ def _sorter(loader, config):
 
 
 def _image_cache(cache_modules):
-    """The image DiskCache; _cache_modules_from_names also builds a text one."""
-    caches = [m for m in cache_modules if isinstance(m, DiskCache) and os.path.basename(m.cache_dir) == "image"]
+    """The image DiskCache; _cache_modules_from_names also builds a text one.
+
+    Both now sit one level under their "image"/"text" directory, in a
+    content-addressed salt directory (modules/util/cache_key.py).
+    """
+    caches = [
+        m for m in cache_modules
+        if isinstance(m, DiskCache) and os.path.basename(os.path.dirname(m.cache_dir)) == "image"
+    ]
     assert len(caches) == 1
     return caches[0]
 
 
-def _cache_modules(loader, config):
+def _cache_modules(loader, config, max_resolution=None):
+    # _create_dataset hands these to the cache seam; see DataLoaderText2ImageMixin.
+    loader._cache_bucketing = _params(config, max_resolution)
+    loader._cache_concepts = dataset_concepts(config, is_validation=False)
     return loader._cache_modules_from_names(
         model=None,
         model_setup=None,
