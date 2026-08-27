@@ -1044,7 +1044,7 @@ def test_the_ga_estimation_pass_opts_out_of_the_repulsion():
     losses = _Mixin()._flow_matching_losses(batch, data, _config(batch_size=1), torch.device("cpu"))
 
     assert torch.isfinite(losses).all()
-    assert TELEMETRY.take().rows == 0, "an opted-out pass must not report repulsion telemetry"
+    assert TELEMETRY.take().stats.rows == 0, "an opted-out pass must not report repulsion telemetry"
 
 
 def test_the_opt_out_did_not_weaken_the_missing_reference_guard():
