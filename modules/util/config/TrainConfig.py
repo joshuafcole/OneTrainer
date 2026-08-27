@@ -1322,7 +1322,7 @@ class TrainConfig(BaseConfig):
         data.append(("save_every", 0, int, False))
         data.append(("save_every_unit", TimeUnit.NEVER, TimeUnit, False))
         data.append(("save_skip_first", 0, int, False))
-        data.append(("save_on_train_end", True, bool, False))
+        data.append(("save_on_train_end", False, bool, False))
         data.append(("save_filename_prefix", "", str, False))
 
         # secrets
