@@ -1094,6 +1094,9 @@ class GenericTrainer(BaseTrainer):
                     perf.step_begin(train_progress.global_step)
                     perf.note("latent_tokens", _latent_tokens(batch))
                     perf.note("batch_size", self.config.batch_size)
+                    # Every rank writes to the same OT_PERF_OUT, so the rows have to say
+                    # which one they came from or a multi-GPU log silently averages ranks.
+                    perf.note("rank", multi.rank())
 
                 with (
                     TorchMemoryRecorder(enabled=multi.is_master() and train_progress.global_step in _MEMORY_PROFILE_STEPS, filename=f"memory-step{train_progress.global_step}-{get_string_timestamp()}.pickle"),

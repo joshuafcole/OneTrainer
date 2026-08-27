@@ -48,6 +48,8 @@ One `{"kind": "step"}` row per training step:
 * `vram_peak_alloc_gb`, `vram_peak_reserved_gb`, `recompiles`.
 * `offload_xfers`, `offload_onload` — layer transfers actually performed this step
   (present only when layer offloading moved something).
+* `rank` — which GPU wrote the row. Under multi-GPU every rank appends to the same
+  `OT_PERF_OUT`, so filter on this before reading a breakdown as one device's.
 
 One `{"kind": "cache"}` row per cached `(group, variation)` build, from the mgds
 side: items, wall clock, items/s, and megapixels/s of VAE encoding.
