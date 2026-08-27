@@ -731,6 +731,30 @@ def test_the_dose_forecast_does_not_disturb_the_training_generator():
     assert draw(mixin, live_gen) == baseline
 
 
+def test_the_band_reaches_the_beta_calibration_and_not_only_the_loss():
+    """Found by mutation: `SCHEDULE.observe(delta, band)` -> `observe(delta)` broke
+    nothing.
+
+    Every visible number survives it -- the losses are identical, so is the whole
+    telemetry window -- and the only casualty is beta, calibrated against a delta
+    scale drawn from rows the band removed from training. `test_beta_calibrates_
+    on_the_rows_the_band_lets_through` pins the schedule's behaviour and cannot
+    see the call site, so this watches the call itself.
+    """
+    TELEMETRY.reset()
+    seen = []
+    SCHEDULE.observe = lambda delta, band_weight=None: seen.append(band_weight)
+    try:
+        _run_banded(low=0.0, high=0.5, timestep=949)   # u = 0.95, fully out of band
+    finally:
+        del SCHEDULE.observe
+    TELEMETRY.reset()
+
+    assert len(seen) == 1
+    assert seen[0] is not None                  # the band was handed over...
+    assert float(seen[0].sum().item()) == 0.0   # ...and it is the muting one
+
+
 def test_the_band_mutes_a_counterexample_row_outside_it():
     """Routing, on the flow branch: a row whose noise level falls outside the
     band contributes nothing, while the positive beside it is untouched -- the
