@@ -44,6 +44,8 @@ BUCKET_OVERRIDE_RUNG_NAME = 'bucket_override_rung'
 STRATEGY_VALUES = ['drop', 'donate', 'borrow', 'repeat']
 # Borrow sub-modes. Ignored by every other strategy.
 MODE_VALUES = [BORROW_MOVE, BORROW_COPY]
+# Multi-resolution budget selection, see TrainConfig.aspect_ratio_bucket_resolution_mode.
+RESOLUTION_MODE_VALUES = ['split', 'rotate']
 
 
 def parse_bucket_tiers(tier_dicts: list[dict[str, str]] | None) -> list[BucketTier]:
@@ -99,6 +101,20 @@ def has_copy_tier(tiers: list[BucketTier]) -> bool:
     return any(tier.strategy == BORROW and tier.mode == BORROW_COPY for tier in tiers)
 
 
+def parse_resolution_mode(resolution_mode: str | None) -> str:
+    """Validate the multi-resolution budget mode.
+
+    mgds treats anything it does not recognise as "split", so a typo would silently
+    turn the feature off. Rejecting it here means the user is told instead.
+    """
+    mode = (resolution_mode or 'split').strip().lower()
+    if mode not in RESOLUTION_MODE_VALUES:
+        raise ValueError(
+            f"unknown aspect_ratio_bucket_resolution_mode: {resolution_mode!r} "
+            f"(expected one of {RESOLUTION_MODE_VALUES})")
+    return mode
+
+
 @dataclass(frozen=True)
 class BucketingParams:
     """The bucket geometry AspectBucketing and AspectBucketRebalance must share.
@@ -118,6 +134,7 @@ class BucketingParams:
     tolerance: float
     max_resolution: int | None
     batch_size: int
+    resolution_mode: str
     tiers: list[BucketTier]
 
     @property
@@ -163,6 +180,7 @@ def bucketing_params(
         tolerance=config.aspect_ratio_bucket_tolerance,
         max_resolution=max_resolution,
         batch_size=batch_size,
+        resolution_mode=parse_resolution_mode(config.aspect_ratio_bucket_resolution_mode),
         tiers=parse_bucket_tiers(config.aspect_ratio_bucket_min_tiers),
     )
 
@@ -205,6 +223,7 @@ def aspect_bucketing_module(
         keep_out_name=BUCKET_KEEP_NAME if emits_tags else None,
         repeat_out_name=BUCKET_REPEAT_NAME if emits_tags else None,
         override_rung_in_name=BUCKET_OVERRIDE_RUNG_NAME if consumer_mode else None,
+        resolution_mode=params.resolution_mode,
         max_resolution=params.max_resolution,
     )
 
