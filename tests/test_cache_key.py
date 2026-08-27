@@ -199,10 +199,16 @@ def test_the_text_cache_tracks_the_encoders_and_the_embeddings():
 def test_the_text_cache_ignores_excluded_encoders_and_image_changes():
     baseline = _text_dir(_config())
 
-    excluded = _config()
-    excluded.text_encoder_3.include = False
-    excluded.text_encoder_3.model_name = "/models/garbage"
-    assert _text_dir(excluded) == _text_dir(_config(text_encoder_3=excluded.text_encoder_3))
+    # An excluded encoder's checkpoint changes nothing, so two configs that differ
+    # only in it share a cache -- while excluding it at all is a real change.
+    def excluding(model_name):
+        config = _config()
+        config.text_encoder_3.include = False
+        config.text_encoder_3.model_name = model_name
+        return _text_dir(config)
+
+    assert excluding("/models/garbage") == excluding("/models/other-garbage")
+    assert excluding("/models/garbage") != baseline
 
     assert _text_dir(_config(resolution="768")) == baseline
     other_vae = _config()

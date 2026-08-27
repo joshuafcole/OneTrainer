@@ -133,7 +133,7 @@ def _image_salt(
         config: TrainConfig,
         bucketing: BucketingParams,
         image_names: list[str],
-        media_fingerprint: str | None,
+        media_fingerprint: str,
 ) -> str:
     """Identity of everything that changes a cached VAE latent for a given source
     image and crop.
@@ -158,7 +158,7 @@ def _image_salt(
     })
 
 
-def _text_salt(config: TrainConfig, text_names: list[str], caption_fingerprint: str | None) -> str:
+def _text_salt(config: TrainConfig, text_names: list[str], caption_fingerprint: str) -> str:
     """Identity of everything that changes a cached text-encoder embedding for a
     given prompt: each *included* text encoder (checkpoint, layer skip, sequence
     length) and any embedding that extends the tokenizer vocabulary.

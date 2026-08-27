@@ -65,11 +65,9 @@ _MEDIA_EXTENSIONS = path_util.supported_image_extensions() | path_util.supported
 # The text a cached embedding is encoded from.
 _CAPTION_EXTENSIONS = path_util.supported_caption_extensions()
 
-# Stand-in for a concept whose directory cannot be listed (a missing path, a
-# permissions error, a Huggingface dataset name that is not a local dir). Recorded
-# rather than skipped so "unreadable" and "empty" stay distinguishable -- the two
-# mean very different things, and silently collapsing them would let a path typo
-# reuse another concept's cache.
+# Stand-in for a file that cannot be stat'd or read. It has to digest to
+# *something*, and a constant is the conservative choice: two files that both fail
+# read as the same, which at worst costs a spurious re-cache once they can be read.
 _UNREADABLE = "?"
 
 # The leaf/branch shape fed to _digest: a tree of strings, ints and sequences.
@@ -121,7 +119,7 @@ def _media_stat(path: str) -> tuple[int, int] | str:
 def _iter_files(root: str, include_subdirectories: bool) -> list[tuple[str, str]] | None:
     """``(relative posix path, absolute path)`` for every file under ``root``, sorted.
 
-    ``None`` when ``root`` cannot be listed. Sorting is what makes the fingerprint
+    ``None`` when ``root`` cannot be listed at all. Sorting is what makes the fingerprint
     independent of filesystem enumeration order, so the same dataset on two
     machines digests identically.
     """
@@ -155,12 +153,8 @@ def _concept_header(concept: ConceptConfig) -> tuple[str, bool, bool]:
     )
 
 
-def dataset_fingerprints(concepts: list[ConceptConfig]) -> tuple[str | None, str | None]:
+def dataset_fingerprints(concepts: list[ConceptConfig]) -> tuple[str, str]:
     """``(media_fingerprint, caption_fingerprint)`` over every enabled concept.
-
-    Both are ``None`` when there is nothing to fingerprint, so a run with no
-    concepts at all salts to a stable value rather than to the digest of an empty
-    walk that could later mean something else.
 
     - **media** moves when an image/video is added, removed, replaced or resized.
       It is what the *image* (VAE latent) cache must key on.
@@ -168,8 +162,9 @@ def dataset_fingerprints(concepts: list[ConceptConfig]) -> tuple[str | None, str
       list changes -- embeddings are cached positionally per row, so which rows
       exist is part of the identity even though their pixels are not.
 
-    A disabled concept contributes only its header: its files are not walked (they
-    produce no rows) but re-enabling it must still move the salt.
+    A disabled concept is skipped entirely: it produces no rows, so a cache built
+    with it disabled is interchangeable with one built without it. Enabling it
+    still moves both fingerprints, because its files then enter the walk.
 
     One walk serves both fingerprints. The walk is the expensive part -- a stat per
     media file, a read per caption -- and the two salts are computed together, so
@@ -178,9 +173,6 @@ def dataset_fingerprints(concepts: list[ConceptConfig]) -> tuple[str | None, str
     long-lived and can start a second run after the dataset was edited, which is
     exactly the case a memo would answer wrongly.
     """
-    if not concepts:
-        return None, None
-
     media_leaves: list[_Node] = []
     caption_leaves: list[_Node] = []
 
@@ -188,16 +180,21 @@ def dataset_fingerprints(concepts: list[ConceptConfig]) -> tuple[str | None, str
         header = _concept_header(concept)
         path, enabled, include_subdirectories = header
 
+        # A disabled concept produces no rows -- mgds' CollectPaths skips it
+        # outright -- so it contributes nothing here either. Not even its header:
+        # a cache built with it disabled holds exactly what a cache built without
+        # it at all would hold, and telling the two apart would only re-encode a
+        # dataset for a difference no tensor can see. Walking it would be worse
+        # still: editing a disabled concept would push the enabled ones back
+        # through the VAE.
         if not enabled:
-            media_leaves.append(header)
-            caption_leaves.append(header)
             continue
 
-        files = _iter_files(path, include_subdirectories)
-        if files is None:
-            media_leaves.append((header, _UNREADABLE))
-            caption_leaves.append((header, _UNREADABLE))
-            continue
+        # An unlistable path (a typo, a permissions error, a Huggingface dataset
+        # name that is not a local dir) contributes no files. The path itself is in
+        # the header, so this cannot be confused with a different concept's empty
+        # directory.
+        files = _iter_files(path, include_subdirectories) or []
 
         media: list[_Node] = []
         captions: list[_Node] = []

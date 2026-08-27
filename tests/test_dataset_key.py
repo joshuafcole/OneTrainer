@@ -48,10 +48,11 @@ def _fingerprint(concept_dir, **overrides):
     return dataset_fingerprints([_concept(concept_dir, **overrides)])
 
 
-def test_no_concepts_yields_no_fingerprint():
-    # A run with no dataset at all must produce a stable value rather than the
-    # digest of an empty walk, which could later come to mean something else.
-    assert dataset_fingerprints([]) == (None, None)
+def test_a_dataset_with_no_rows_fingerprints_the_same_however_it_got_there():
+    # No concepts, and concepts that contribute nothing, hold the same tensors --
+    # so they must not be handed separate cache directories.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        assert dataset_fingerprints([]) == _fingerprint(_dataset(tmp_dir), enabled=False)
 
 
 def test_fingerprints_are_stable_and_16_hex():
@@ -159,24 +160,33 @@ def test_subdirectories_are_walked_only_when_the_concept_says_so():
             "a nested file must be visible when the concept recurses"
 
 
-def test_a_disabled_concept_is_not_walked_but_still_counts():
+def test_a_disabled_concept_is_neither_walked_nor_counted():
     with tempfile.TemporaryDirectory() as tmp_dir:
         concept_dir = _dataset(tmp_dir)
         enabled = _fingerprint(concept_dir, enabled=True)
         disabled = _fingerprint(concept_dir, enabled=False)
-        assert enabled != disabled, "toggling a concept must move the fingerprint"
-        # a disabled concept produces no rows, so editing its files is invisible
+        assert enabled != disabled, "enabling a concept adds rows, so it must move"
+
+        # It produces no rows, so editing its files must be invisible ...
         _write(os.path.join(concept_dir, "a.png"), b"changed while disabled")
         assert _fingerprint(concept_dir, enabled=False) == disabled
 
+        # ... and so must be indistinguishable from not listing it at all, which is
+        # the cache with the same contents.
+        assert disabled == dataset_fingerprints([])
+        other_dir = _dataset(tmp_dir + "-other")
+        assert _fingerprint(other_dir, enabled=False) == disabled
 
-def test_a_missing_path_is_distinct_from_an_empty_directory():
+
+def test_an_unlistable_path_is_distinct_from_another_concepts_empty_directory():
+    """A path typo must not reuse a different concept's cache. The path is in the
+    header, so an unlistable directory needs no marker of its own to stay apart."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         empty_dir = os.path.join(tmp_dir, "empty")
         os.makedirs(empty_dir)
         missing = _fingerprint(os.path.join(tmp_dir, "does-not-exist"))
-        empty = _fingerprint(empty_dir)
-        assert missing != empty, "a path typo must not reuse an empty concept's cache"
+        assert missing != _fingerprint(empty_dir)
+        assert missing != dataset_fingerprints([])
 
 
 def test_concept_order_is_significant():
