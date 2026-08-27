@@ -29,6 +29,7 @@ from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.loss.counterexample_loss import SCHEDULE as counterexample_schedule
 from modules.util.loss.counterexample_loss import TELEMETRY as counterexample_telemetry
 from modules.util.profiling_util import PeakMemoryRecorder, TorchMemoryRecorder, TorchProfiler
 from modules.util.sample_metadata import SampleProvenance, hash_text
@@ -94,6 +95,16 @@ class GenericTrainer(BaseTrainer):
         self.last_save_filename: str | None = None
 
     def start(self):
+        # Both are process-global singletons, and a process can train more than
+        # once: the GUI runs the trainer on a thread and keeps the process alive
+        # across Start presses. Without this, run 2 inherits run 1's FROZEN beta
+        # -- calibrated against a different model, resolution, or band -- and
+        # says nothing about it, because a beta carried over is indistinguishable
+        # from one configured. That is exactly the back-to-back shape an A/B
+        # bake-off has.
+        counterexample_schedule.reset()
+        counterexample_telemetry.reset()
+
         if multi.is_master():
             self.__save_config_to_workspace()
 
