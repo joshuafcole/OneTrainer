@@ -189,6 +189,11 @@ class BaseTrainingTabView(ABC):
     def __setup_anima_ui(self, column_0, column_1, column_2, controller, ui_state):
         self.__create_base_frame(column_0, 0, controller, ui_state)
         self.__create_text_encoder_frame(column_0, 1, ui_state, supports_clip_skip=False, supports_training=False)
+        # Anima trains no text-encoder LoRA (hence supports_training=False above) but it does train
+        # embeddings -- both as the standalone EMBEDDING method and alongside a transformer LoRA -- so the
+        # embedding frame belongs here. Without it the embedding learning rate and norm preservation are
+        # reachable only by hand-editing a preset.
+        self.__create_embedding_frame(column_0, 4, ui_state)
 
         self.__create_base2_frame(column_1, 0, controller, ui_state)
         self.__create_transformer_frame(column_1, 1, ui_state, supports_guidance_scale=False, supports_force_attention_mask=False)
