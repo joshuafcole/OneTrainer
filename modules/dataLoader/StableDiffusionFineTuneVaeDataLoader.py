@@ -2,6 +2,7 @@ import os
 import re
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
+from modules.dataLoader.mixin.DataLoaderMgdsMixin import dataset_concepts
 from modules.model.StableDiffusionModel import StableDiffusionModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util import factory, path_util
@@ -16,6 +17,7 @@ from modules.util.bucket_tiers import (
     bucket_tags_enabled,
     bucketing_params,
 )
+from modules.util.cache_key import cache_salts
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -210,7 +212,13 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
 
         return modules
 
-    def __cache_modules(self, config: TrainConfig, model: StableDiffusionModel):
+    def __cache_modules(
+            self,
+            config: TrainConfig,
+            model: StableDiffusionModel,
+            bucketing: BucketingParams,
+            is_validation: bool,
+    ):
         split_names = ['image', 'latent_image_distribution']
 
         if config.masked_training:
@@ -229,7 +237,20 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         def before_cache_fun():
             self._setup_cache_device(model, self.train_device, self.temp_device, config)
 
-        disk_cache = DiskCache(cache_dir=config.cache_dir, split_names=split_names, aggregate_names=aggregate_names, variations_in_name='concept.image_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
+        # Nest under a content-addressed salt, exactly as the text2image loaders do:
+        # this cache is keyed on the same group key, has the same length-only
+        # staleness check, and gains the same two aggregate names once a tier exists.
+        # See modules/util/cache_key.py.
+        salts = cache_salts(
+            config,
+            bucketing=bucketing,
+            concepts=dataset_concepts(config, is_validation),
+            image_names=split_names + aggregate_names,
+            text_names=[],
+        )
+        cache_dir = os.path.join(config.cache_dir, "vae", salts.image)
+
+        disk_cache = DiskCache(cache_dir=cache_dir, split_names=split_names, aggregate_names=aggregate_names, variations_in_name='concept.image_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
                                variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_fun)
         variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'],
                                group_enabled_in_name='concept.enabled', group_out_name=BUCKET_GROUP_NAME, budget_out_name=BUCKET_BUDGET_NAME)
@@ -329,7 +350,7 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         crop_modules = self.__crop_modules(config)
         augmentation_modules = self.__augmentation_modules(config)
         preparation_modules = self.__preparation_modules(config, model)
-        cache_modules = self.__cache_modules(config, model)
+        cache_modules = self.__cache_modules(config, model, bucketing, is_validation)
         output_modules = self.__output_modules(config)
 
         debug_modules = self.__debug_modules(config, model)

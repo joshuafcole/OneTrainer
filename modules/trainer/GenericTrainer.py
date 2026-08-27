@@ -234,7 +234,11 @@ class GenericTrainer(BaseTrainer):
         if os.path.isdir(self.config.cache_dir):
             for filename in os.listdir(self.config.cache_dir):
                 path = os.path.join(self.config.cache_dir, filename)
-                if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text']):
+                # 'vae' is the VAE fine-tune loader's latent cache. It used to write its
+                # group directories straight into cache_dir, where this whitelist never
+                # matched them, so clear_cache_before_training silently did nothing for
+                # that training method.
+                if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text', 'vae']):
                     shutil.rmtree(path)
 
     def __prune_backups(self, backups_to_keep: int):
