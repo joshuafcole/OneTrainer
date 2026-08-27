@@ -410,6 +410,16 @@ class TrainConfig(BaseConfig):
     concept_file_name: str
     concepts: list[ConceptConfig]
     aspect_ratio_bucketing: bool
+    # Collapse aspect buckets whose ratios differ by no more than this onto one
+    # crop resolution, so fewer samples are lost to per-bucket drop-last. 0 keeps
+    # the exact bucket set aspect ratio bucketing has always produced.
+    aspect_ratio_bucket_tolerance: float
+    # Rules for aspect buckets too small to fill a batch, smallest max_size first.
+    # Each dict has "max_size" (int), "strategy" (drop|donate|borrow|repeat) and
+    # "mode" (move|copy, borrow only). Strings in a dict rather than a typed list
+    # because ConfigList stores strings, as scheduler_params does. Empty => the
+    # previous behaviour, where a sparse bucket is silently dropped.
+    aspect_ratio_bucket_min_tiers: list[dict[str, str]]
     latent_caching: bool
     clear_cache_before_training: bool
 
@@ -1115,6 +1125,8 @@ class TrainConfig(BaseConfig):
         data.append(("concept_file_name", "training_concepts/concepts.json", str, False))
         data.append(("concepts", None, list[ConceptConfig], True))
         data.append(("aspect_ratio_bucketing", True, bool, False))
+        data.append(("aspect_ratio_bucket_tolerance", 0.0, float, False))
+        data.append(("aspect_ratio_bucket_min_tiers", [], list[dict[str, str]], True))
         data.append(("latent_caching", True, bool, False))
         data.append(("clear_cache_before_training", True, bool, False))
 
