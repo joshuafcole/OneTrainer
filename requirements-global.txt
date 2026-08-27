@@ -32,7 +32,14 @@ pooch==1.8.2
 open-clip-torch==2.32.0
 
 # data loader
--e git+https://github.com/Nerogar/mgds.git@3a6994a#egg=mgds
+# up/integration is the fork replacement, not a PR: it tracks OUR mgds branch,
+# which stacks M1 (bucket tolerance), M2 (bucket rebalancing) and M4 (the OT_PERF
+# probe) on Nerogar's master. The trainer imports mgds.perf_probe unguarded at
+# module scope (slice 13), so 3a6994a -- master, which has no perf_probe -- cannot
+# even import this branch's GenericTrainer. Each per-slice PR cut off
+# upstream/master carries its own pin: slice 13's advances to whatever Nerogar SHA
+# exists once M4 merges there. This line is deliberately not that pin.
+-e git+https://github.com/joshuafcole/mgds.git@699c2b6#egg=mgds
 
 # optimizers
 dadaptation==3.2 # dadaptation optimizers
