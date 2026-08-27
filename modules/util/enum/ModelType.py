@@ -272,7 +272,10 @@ class ModelType(Enum):
     def supported_output_formats(self, training_method: TrainingMethod) -> list[ModelFormat]:
         if training_method == TrainingMethod.EMBEDDING:
             return [ModelFormat.SAFETENSORS]
-        elif training_method == TrainingMethod.LORA:
+        elif training_method in (TrainingMethod.LORA, TrainingMethod.SLIDER):
+            # a slider IS a LoRA on disk -- only the training objective differs, so it
+            # saves in exactly the LoRA formats. Without this branch a slider run trains
+            # to completion and then dies in the else below, at save time.
             return self.supported_lora_formats()
         elif training_method in (TrainingMethod.FINE_TUNE, TrainingMethod.FINE_TUNE_VAE):
             return self.supported_full_model_formats()
