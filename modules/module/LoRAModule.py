@@ -131,9 +131,13 @@ class PeftBase(nn.Module):
         per adapted layer per step.
 
         Sliders mutate the multiplier every step (0.0 / +s / -s / rest), so hold
-        it in a device tensor and fill it in place instead. ``1.0`` is returned
-        as a literal so the ordinary LoRA path -- where the multiplier is set
-        once and never moves -- keeps folding it away entirely.
+        it in a device tensor instead -- a *fresh* one, rebuilt by
+        ``set_multiplier``. Never filled in place: the slider accumulates the
+        +pole and -pole losses and backprops once, so the +pole's tensor is
+        still saved for backward when the -pole sets the next value, and an
+        in-place write trips autograd's version counter. ``1.0`` is returned as
+        a literal so the ordinary LoRA path -- where the multiplier is set once
+        and never moves -- keeps folding it away entirely.
         """
         if self.multiplier == 1.0:
             return 1.0
