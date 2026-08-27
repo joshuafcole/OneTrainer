@@ -319,10 +319,26 @@ def test_all_disabled_samples_leave_bookkeeping_unwritten():
 #    flip them is visible as a one-line change against a failing test.
 # ---------------------------------------------------------------------------
 
-def test_shipped_defaults_are_true():
+def test_shipped_defaults_split_sample_from_save():
+    """The two knobs ship differently, and the asymmetry is the whole argument.
+
+    `end()` already writes the final weights to `output_model_destination` on
+    every run that trained a step, so `save_on_train_end` does not rescue a lost
+    model -- it adds a *second* copy in the workspace. That is a few MB for a
+    LoRA and gigabytes for a full finetune, paid by every run, to duplicate
+    bytes the user already has. It ships OFF.
+
+    Sampling is the half that was genuinely missing: nothing captures the final
+    state's images when the step count is not a multiple of the interval, and
+    the cost is zero for a user with no enabled sample configs, since
+    __sample_loop iterates only over those. It ships ON.
+
+    Pinned so revisiting either is a one-line change against a failing
+    assertion, not a silent drift.
+    """
     config = TrainConfig.default_values()
     assert config.sample_on_train_end is True
-    assert config.save_on_train_end is True
+    assert config.save_on_train_end is False
 
 
 # ---------------------------------------------------------------------------
