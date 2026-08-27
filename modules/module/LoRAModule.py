@@ -534,8 +534,18 @@ class LoKrModule(PeftBase):
 
         device = self.train_device if self.train_device is not None else grad.device
         grad = grad.to(device=device, dtype=torch.float32)
+        # Guard the gradient, not the singular value. `torch.linalg.svd` *raises*
+        # on a non-finite input, so a `not torch.isfinite(sigma)` test placed
+        # after the call can never see one -- the exception has already left the
+        # function. A degenerate layer must be skipped (and counted as skipped),
+        # not turned into a crash that aborts the whole estimation pass.
+        if not torch.isfinite(grad).all():
+            return None
         w1_t, w2_t, sigma = nearest_kron_factors(grad, self.out_l, self.out_k, self.in_m, self.in_n)
-        if not torch.isfinite(sigma) or sigma == 0:
+        # An all-zero gradient is different: the SVD succeeds and hands back
+        # sigma == 0, which would make `sqrt_sigma` zero and the factors
+        # meaningless. That half of the old guard was always reachable; keep it.
+        if sigma == 0:
             return None
 
         return (w1_t, w2_t) if self.init_from_factors(w1_t, w2_t, gain) else None
