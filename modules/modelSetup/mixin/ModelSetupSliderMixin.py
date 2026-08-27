@@ -37,6 +37,8 @@ decoupling).
 from collections.abc import Callable, Sequence
 from typing import TypeVar
 
+from modules.util.enum.ModelType import PeftType
+
 import torch
 from torch import Tensor
 from torch.nn import functional as F
@@ -46,13 +48,48 @@ from torch.nn import functional as F
 # hosts stay type-checked (Anima: a Tensor; SDXL: a SliderConditioning pair).
 Conditioning = TypeVar("Conditioning")
 
-# Where the adapter is left once a step is done. Sampling-during-training and the
-# saver both expect the adapter at its nominal strength, and the next step re-zeros
-# it before the base passes anyway.
+# Where the adapter is left once a step is done.
+#
+# Not `strength`, and not 0.0. The saver is indifferent -- a LoRA file stores the
+# factors, and the multiplier is not one of them -- so the only thing this decides
+# is what sampling-during-training shows. 1.0 is the multiplier every inference
+# stack applies by default, so a training sample at 1.0 previews the file the user
+# is about to load. The next step re-zeros it before the base passes anyway.
 _RESTING_MULTIPLIER = 1.0
 
 
 class ModelSetupSliderMixin:
+    @staticmethod
+    def _check_slider_peft_type(config) -> None:
+        """Refuse a PEFT type whose adapter has no signed multiplier.
+
+        A slider *is* the multiplier: the objective needs the adapter off (0.0)
+        for the frozen-base passes and at +/-strength for the trained ones, and
+        the file is only worth training because the user can dial it afterwards.
+        DoRA, OFT and weight-decomposed LoKr recompose the base weight instead of
+        adding a scaled delta, so a signed scale is not defined for them and
+        LoRAModule raises `NotImplementedError` for any multiplier but 1.0.
+
+        It raises in the *forward*, though -- so without this check a slider run
+        configured that way loads the whole model, starts training, and only then
+        dies. Same shape of trap as `supported_output_formats()`: a config
+        mistake that costs a model load to discover. Checked here at setup time
+        instead, once, with a message that names the control to change.
+        """
+        peft_type = config.peft_type
+        if peft_type == PeftType.OFT_2:
+            reason = "OFT applies an orthogonal rotation, which has no signed delta scale"
+        elif peft_type == PeftType.LORA and config.lora_decompose:
+            reason = "DoRA ('Decompose Weights' on the LoRA tab) scales a recomposed weight, not a delta"
+        elif peft_type == PeftType.LOKR and config.lokr_weight_decompose:
+            reason = "weight-decomposed LoKr ('Decompose Weights' on the LoRA tab) is DoRA-shaped"
+        else:
+            return
+        raise RuntimeError(
+            f"Slider training needs an adapter with a signed multiplier, and {reason}. "
+            f"Pick LoRA, LoHa, or LoKr without weight decomposition on the LoRA tab."
+        )
+
     def _slider_prompt_loss(
         self,
         run_velocity: Callable[[Conditioning], Tensor],

@@ -113,6 +113,7 @@ class StableDiffusionXLSliderSetup(
             model: StableDiffusionXLModel,
             config: TrainConfig,
     ):
+        self._check_slider_peft_type(config)
         self._check_trainable_parts(config)
 
         model.text_encoder_1_lora = None

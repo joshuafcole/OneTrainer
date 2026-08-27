@@ -47,6 +47,21 @@ class AnimaSliderSetup(
     AnimaLoRASetup,
     ModelSetupSliderMixin,
 ):
+    def setup_model(
+            self,
+            model: AnimaModel,
+            config: TrainConfig,
+    ):
+        # Nothing to add to AnimaLoRASetup's adapter construction -- Anima builds
+        # only a transformer adapter and already refuses embeddings, so there is
+        # no text-encoder adapter that could sit in the optimizer without ever
+        # receiving gradient (contrast StableDiffusionXLSliderSetup, which has to
+        # suppress two). The one thing worth establishing here is that the chosen
+        # PEFT type has a multiplier to slide -- setup_model is the first per-run
+        # hook a setup gets, so this is as early as the check can land.
+        self._check_slider_peft_type(config)
+        super().setup_model(model, config)
+
     def setup_train_device(
             self,
             model: AnimaModel,

@@ -32,6 +32,7 @@ from modules.modelLoader.BaseModelLoader import BaseModelLoader  # noqa: E402
 from modules.modelSaver.BaseModelSaver import BaseModelSaver  # noqa: E402
 from modules.modelSetup.AnimaSliderSetup import AnimaSliderSetup  # noqa: E402
 from modules.modelSetup.BaseModelSetup import BaseModelSetup  # noqa: E402
+from modules.modelSetup.mixin.ModelSetupSliderMixin import ModelSetupSliderMixin  # noqa: E402
 from modules.modelSetup.StableDiffusionXLSliderSetup import (  # noqa: E402
     SliderConditioning,
     StableDiffusionXLSliderSetup,
@@ -42,7 +43,7 @@ from modules.util.config.TrainConfig import TrainConfig  # noqa: E402
 from modules.util.enum.ConceptType import ConceptType  # noqa: E402
 from modules.util.enum.DataType import DataType  # noqa: E402
 from modules.util.enum.ModelFormat import ModelFormat  # noqa: E402
-from modules.util.enum.ModelType import ModelType  # noqa: E402
+from modules.util.enum.ModelType import ModelType, PeftType  # noqa: E402
 from modules.util.enum.TrainingMethod import TrainingMethod  # noqa: E402
 
 SLIDER_MODEL_TYPES = (
@@ -537,3 +538,68 @@ def test_lora_weight_dtype_default_is_untouched():
     """A guard on the config surface, not the slider: the slider fields must not
     have displaced anything in TrainConfig's default ordering."""
     assert TrainConfig.default_values().lora_weight_dtype == DataType.FLOAT_32
+# ---------------------------------------------------------------------------
+# the PEFT-type gate
+#
+# DoRA, OFT and weight-decomposed LoKr recompose the base weight instead of
+# adding a scaled delta, so LoRAModule raises for any multiplier but 1.0 -- and
+# it raises in the *forward*. Without a setup-time check that is a config
+# mistake you pay a full model load to discover, the same shape of trap as a
+# training method missing from supported_output_formats().
+# ---------------------------------------------------------------------------
+
+_SLIDER_INCOMPATIBLE_PEFT = [
+    ({"peft_type": PeftType.OFT_2}, "orthogonal rotation"),
+    ({"peft_type": PeftType.LORA, "lora_decompose": True}, "DoRA"),
+    ({"peft_type": PeftType.LOKR, "lokr_weight_decompose": True}, "weight-decomposed LoKr"),
+]
+
+_SLIDER_COMPATIBLE_PEFT = [
+    {"peft_type": PeftType.LORA, "lora_decompose": False},
+    {"peft_type": PeftType.LOHA},
+    {"peft_type": PeftType.LOKR, "lokr_weight_decompose": False},
+]
+
+
+@pytest.mark.parametrize("overrides,reason", _SLIDER_INCOMPATIBLE_PEFT)
+def test_peft_types_without_a_signed_multiplier_are_refused(overrides, reason):
+    with pytest.raises(RuntimeError, match="signed multiplier") as excinfo:
+        ModelSetupSliderMixin._check_slider_peft_type(_slider_config(**overrides))
+    assert reason in str(excinfo.value), "the message must name what is wrong, not just that it is"
+
+
+@pytest.mark.parametrize("overrides", _SLIDER_COMPATIBLE_PEFT)
+def test_additive_peft_types_are_accepted(overrides):
+    ModelSetupSliderMixin._check_slider_peft_type(_slider_config(**overrides))
+
+
+@pytest.mark.parametrize("overrides,_reason", _SLIDER_INCOMPATIBLE_PEFT)
+@pytest.mark.parametrize("setup_cls", [AnimaSliderSetup, StableDiffusionXLSliderSetup])
+def test_both_hosts_check_the_peft_type_before_building_an_adapter(setup_cls, overrides, _reason):
+    """setup_model is the first per-run hook a setup gets. Passing None for the
+    model is the assertion: the check has to fire before anything touches it."""
+    with pytest.raises(RuntimeError, match="signed multiplier"):
+        _bare(setup_cls).setup_model(None, _slider_config(**overrides))
+
+
+def test_the_refused_set_is_exactly_the_set_that_raises_in_the_forward():
+    """The gate and LoRAModule must not drift apart. A PEFT type that stops (or
+    starts) supporting a signed multiplier has to change both, and letting one
+    move alone is either a false refusal or the late failure this gate exists to
+    prevent."""
+    refused = set()
+    for peft_type in PeftType:
+        for decompose in (False, True):
+            config = _slider_config(
+                peft_type=peft_type, lora_decompose=decompose, lokr_weight_decompose=decompose)
+            try:
+                ModelSetupSliderMixin._check_slider_peft_type(config)
+            except RuntimeError:
+                refused.add((peft_type, decompose))
+
+    assert refused == {
+        (PeftType.OFT_2, False), (PeftType.OFT_2, True),
+        (PeftType.LORA, True),
+        (PeftType.LOKR, True),
+    }
+
