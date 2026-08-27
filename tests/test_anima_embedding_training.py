@@ -31,17 +31,6 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import pytest  # noqa: E402
-from diffusers import (  # noqa: E402
-    AnimaTextConditioner,
-    AutoencoderKLQwenImage,
-    CosmosTransformer3DModel,
-    FlowMatchEulerDiscreteScheduler,
-)
-from safetensors.torch import load_file  # noqa: E402
-from tokenizers import Tokenizer, models, pre_tokenizers  # noqa: E402
-from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3Model  # noqa: E402
-
 from modules.dataLoader.AnimaBaseDataLoader import AnimaBaseDataLoader  # noqa: E402
 from modules.model.AnimaModel import AnimaModel  # noqa: E402
 from modules.modelLoader.AnimaModelLoader import AnimaEmbeddingModelLoader  # noqa: E402
@@ -60,6 +49,18 @@ from modules.util.enum.ModelFormat import ModelFormat  # noqa: E402
 from modules.util.enum.ModelType import ModelType  # noqa: E402
 from modules.util.enum.TrainingMethod import TrainingMethod  # noqa: E402
 from modules.util.TrainProgress import TrainProgress  # noqa: E402
+
+from diffusers import (  # noqa: E402
+    AnimaTextConditioner,
+    AutoencoderKLQwenImage,
+    CosmosTransformer3DModel,
+    FlowMatchEulerDiscreteScheduler,
+)
+from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3Model  # noqa: E402
+
+import pytest  # noqa: E402
+from safetensors.torch import load_file  # noqa: E402
+from tokenizers import Tokenizer, models, pre_tokenizers  # noqa: E402
 
 CPU = torch.device("cpu")
 PLACEHOLDER = "<smoketoken>"
@@ -290,7 +291,7 @@ def test_a_bundled_token_survives_the_save_round_trip(tmp_path, model_format):
     assert key in written, \
         f"the bundled TI vector is missing from the {model_format} file: {sorted(written)[:5]}"
     assert torch.allclose(written[key], vector.detach().to(torch.float32))
-    assert any(k.startswith("diffusion_model.") or k.startswith("lora_unet") for k in written), \
+    assert any(k.startswith(("diffusion_model.", "lora_unet")) for k in written), \
         "the adapter itself did not make it into the file"
 
 
