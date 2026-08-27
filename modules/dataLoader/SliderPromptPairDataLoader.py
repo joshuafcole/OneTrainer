@@ -17,15 +17,14 @@ It implements the BaseDataLoader surface the trainer actually touches
 construction.
 
 The loader is model-agnostic -- it emits no model-specific tensors -- so the same
-class is registered for every model type with a slider setup.
+class serves every model type with a slider setup. It does not register itself:
+SliderDataLoader owns the (model type, SLIDER) slot and dispatches to this class
+for the PROMPT_PAIR regime.
 """
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
-from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ConceptType import ConceptType
-from modules.util.enum.ModelType import ModelType
-from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.TrainProgress import TrainProgress
 
 import torch
@@ -99,16 +98,3 @@ class SliderPromptPairDataLoader(BaseDataLoader):
     def _create_dataset(self, config, model, model_setup, train_progress, is_validation):
         # Abstract in BaseDataLoader; unused here because __init__ is overridden.
         return None
-
-
-# One entry per model type with a slider setup. create_data_loader falls back to
-# the model-type-only loader, so without these a slider run would silently get the
-# model's ordinary MGDS loader and then fail for want of a dataset.
-SLIDER_DATA_LOADER_MODEL_TYPES = (
-    ModelType.ANIMA,
-    ModelType.STABLE_DIFFUSION_XL_10_BASE,
-    ModelType.STABLE_DIFFUSION_XL_10_BASE_INPAINTING,
-)
-
-for _model_type in SLIDER_DATA_LOADER_MODEL_TYPES:
-    factory.register(BaseDataLoader, SliderPromptPairDataLoader, _model_type, TrainingMethod.SLIDER)

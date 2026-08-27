@@ -26,7 +26,10 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import modules.util.create as create  # noqa: E402  (populates the factory registry)
+from modules.dataLoader.AnimaBaseDataLoader import AnimaBaseDataLoader  # noqa: E402
+from modules.dataLoader.AnimaSliderImageDataLoader import AnimaSliderImageDataLoader  # noqa: E402
 from modules.dataLoader.BaseDataLoader import BaseDataLoader  # noqa: E402
+from modules.dataLoader.SliderDataLoader import SliderDataLoader  # noqa: E402
 from modules.dataLoader.SliderPromptPairDataLoader import SliderPromptPairDataLoader  # noqa: E402
 from modules.modelLoader.BaseModelLoader import BaseModelLoader  # noqa: E402
 from modules.modelSaver.BaseModelSaver import BaseModelSaver  # noqa: E402
@@ -40,7 +43,7 @@ from modules.modelSetup.StableDiffusionXLSliderSetup import (  # noqa: E402
 from modules.ui.BaseSliderTabView import BaseSliderTabView  # noqa: E402
 from modules.ui.TopBarController import TopBarController  # noqa: E402
 from modules.util import factory  # noqa: E402
-from modules.util.config.SliderConfig import SliderPromptConfig  # noqa: E402
+from modules.util.config.SliderConfig import SliderAxisConfig, SliderPromptConfig  # noqa: E402
 from modules.util.config.TrainConfig import TrainConfig  # noqa: E402
 from modules.util.enum.ConceptType import ConceptType  # noqa: E402
 from modules.util.enum.DataType import DataType  # noqa: E402
@@ -125,7 +128,7 @@ def test_a_slider_model_can_save_load_and_feed_itself(model_type):
     assert factory.get(BaseModelSetup, model_type, TrainingMethod.SLIDER) is not None
     assert factory.get(BaseModelSaver, model_type, TrainingMethod.SLIDER) is not None
     assert factory.get(BaseModelLoader, model_type, TrainingMethod.SLIDER) is not None
-    assert factory.get(BaseDataLoader, model_type, TrainingMethod.SLIDER) is SliderPromptPairDataLoader
+    assert factory.get(BaseDataLoader, model_type, TrainingMethod.SLIDER) is SliderDataLoader
 
     formats = model_type.supported_output_formats(TrainingMethod.SLIDER)
     assert formats == model_type.supported_lora_formats()
@@ -168,6 +171,31 @@ def test_loader_drives_the_step_count_and_keeps_the_prior_paths_inert():
         assert batch["concept_type"] == [ConceptType.STANDARD.value] * 2
         assert all(ConceptType(c) == ConceptType.STANDARD for c in batch["concept_type"])
     assert len(loader.get_data_loader()) == 7
+
+
+def test_the_slot_dispatches_on_the_regime():
+    """One factory entry, two regimes with opposite needs: PROMPT_PAIR has no
+    dataset at all, IMAGE wants the model's whole MGDS pipeline. The factory keys
+    on (model type, training method) and cannot see a regime, so the dispatch has
+    to happen at construction -- and it is picked here rather than by an
+    `if` inside a loader that would then have to be both things."""
+    assert SliderDataLoader._create_impl(
+        _config(model_type=ModelType.ANIMA, slider_regime=SliderRegime.PROMPT_PAIR),
+    ) is SliderPromptPairDataLoader
+    assert SliderDataLoader._create_impl(
+        _config(model_type=ModelType.ANIMA, slider_regime=SliderRegime.IMAGE),
+    ) is AnimaSliderImageDataLoader
+
+
+def test_a_model_without_an_image_regime_loader_says_so_instead_of_falling_back():
+    """SDXL has a prompt-pair slider host and no coordinate-labeled one. Falling
+    back to its ordinary loader would emit no slider_coordinate, and the run would
+    die on a missing batch key several minutes in, after the model load."""
+    with pytest.raises(NotImplementedError, match="image slider regime is not implemented"):
+        SliderDataLoader._create_impl(_config(
+            model_type=ModelType.STABLE_DIFFUSION_XL_10_BASE,
+            slider_regime=SliderRegime.IMAGE,
+        ))
 
 
 def test_validation_is_empty_rather_than_broken():
@@ -731,3 +759,125 @@ def test_the_prompt_pair_regime_shows_the_prompt_list():
     blocks = BaseSliderTabView.blocks_for_regime(SliderRegime.PROMPT_PAIR)
     assert "prompt_list" in blocks, "the triples are the whole input of this regime"
     assert "prompt_pair" in blocks
+
+
+# ---------------------------------------------------------------------------
+# the coordinate-labeled image loader
+#
+# The pipeline is driven for real -- _load_input_modules builds the actual MGDS
+# nodes and their map_fns are run -- so what is asserted is what the loader built,
+# not what a test handed it. The MGDS boundary itself (an image on disk, a VAE) is
+# the only thing stubbed.
+# ---------------------------------------------------------------------------
+
+def _axis(name, gain_k=1.0, is_target=True, enabled=True):
+    axis = SliderAxisConfig.default_values()
+    axis.name, axis.gain_k, axis.is_target, axis.enabled = name, gain_k, is_target, enabled
+    return axis
+
+
+def _image_loader(*axes):
+    loader = object.__new__(AnimaSliderImageDataLoader)
+    config = _config(
+        model_type=ModelType.ANIMA,
+        slider_regime=SliderRegime.IMAGE,
+        slider_axes=list(axes),
+    )
+    return loader, config
+
+
+def _coordinate_nodes(loader, config):
+    """The two nodes the loader appends, found by what they produce rather than by
+    position -- upstream may add input modules of its own."""
+    modules = loader._load_input_modules(config, DataType.FLOAT_32, vae_frame_dim=True)
+    extract = [m for m in modules if getattr(m, "out_name", None) == "slider_coordinate"]
+    strip = [m for m in modules
+             if getattr(m, "out_name", None) == "prompt" and getattr(m, "in_name", None) == "prompt"]
+    assert len(extract) == 1 and len(strip) == 1
+    return modules, extract[0], strip[0]
+
+
+def test_the_loader_reads_the_coordinate_and_strips_it_from_the_caption():
+    loader, config = _image_loader(_axis("distance", gain_k=4.0))
+    _modules, extract, strip = _coordinate_nodes(loader, config)
+
+    caption = "a photo of a car on a road, (distance:-2)"
+    assert torch.equal(extract.map_fn(caption), torch.tensor([-2.0]))
+    assert strip.map_fn(caption) == "a photo of a car on a road"
+
+
+def test_the_coordinate_is_read_before_the_caption_is_stripped():
+    """Order inside the input stage, which no per-node test can see. Strip first
+    and the extractor is handed a caption the coordinate has already left, so every
+    sample reads 0.0 and the run trains nothing while reporting a falling loss.
+
+    Both nodes are in the input stage for the other half of the ordering: tag
+    dropout runs later, and must not get a chance to delete a coordinate token
+    before it is removed deliberately."""
+    loader, config = _image_loader(_axis("distance"))
+    modules, extract, strip = _coordinate_nodes(loader, config)
+    assert modules.index(extract) < modules.index(strip)
+
+
+def test_the_gain_is_not_baked_into_the_cached_coordinate():
+    """gain_k is applied at step time, so retuning it does not invalidate a latent
+    cache that can take an hour to rebuild."""
+    loader, config = _image_loader(_axis("distance", gain_k=4.0))
+    _modules, extract, _strip = _coordinate_nodes(loader, config)
+    assert torch.equal(extract.map_fn("x, (distance:-2)"), torch.tensor([-2.0]))
+
+
+def test_a_caption_with_no_coordinate_is_zero_rather_than_an_error():
+    """One unlabelled image must not take the run down mid-epoch. It trains
+    nothing (the objective drops it) and a whole batch of them is refused there,
+    where the message can name the axis."""
+    loader, config = _image_loader(_axis("distance"))
+    _modules, extract, strip = _coordinate_nodes(loader, config)
+    assert torch.equal(extract.map_fn("a photo of a car"), torch.tensor([0.0]))
+    assert strip.map_fn("a photo of a car") == "a photo of a car"
+
+
+def test_a_declared_confounder_is_stripped_but_does_not_supply_the_coordinate():
+    """The reason to declare a second axis at all: keep it out of the conditioning
+    on a run that is not training it."""
+    loader, config = _image_loader(_axis("distance"), _axis("age", is_target=False))
+    _modules, extract, strip = _coordinate_nodes(loader, config)
+
+    caption = "a portrait, (distance:-2), (age:60)"
+    assert torch.equal(extract.map_fn(caption), torch.tensor([-2.0]))
+    assert strip.map_fn(caption) == "a portrait"
+
+
+def test_an_unusable_axis_set_fails_while_the_dataset_is_being_wired():
+    """Not per image inside MGDS, and not after the model load: _load_input_modules
+    resolves the axes once, so a config mistake surfaces with the config still on
+    screen."""
+    loader, config = _image_loader(_axis("distance"), _axis("age"))
+    with pytest.raises(RuntimeError, match="Exactly one slider axis"):
+        loader._load_input_modules(config, DataType.FLOAT_32, vae_frame_dim=True)
+
+
+def test_the_coordinate_survives_the_caching_boundary():
+    """A per-sample tensor missing from the cache split is silently absent from the
+    batch rather than an error -- the run gets several minutes in and then dies on
+    a KeyError. So the split, the sort and the output list are all checked."""
+    loader, config = _image_loader(_axis("distance"))
+    captured = {}
+
+    loader._cache_modules_from_names = lambda *a, **kw: captured.update(kw) or []
+    loader._output_modules_from_out_names = lambda *a, **kw: captured.update(kw) or []
+    model = _FakeAnimaModel()
+    model.vae = None
+    loader._cache_modules(config, model=model, model_setup=None)
+    loader._output_modules(config, model=model, model_setup=None)
+
+    assert "slider_coordinate" in captured["image_split_names"]
+    assert "slider_coordinate" in captured["sort_names"]
+    assert "slider_coordinate" in captured["output_names"]
+
+
+def test_the_ordinary_anima_loader_adds_nothing():
+    """The hook the loader above uses lives on AnimaBaseDataLoader, so this is the
+    check that it changed nothing for every other Anima training method."""
+    loader = object.__new__(AnimaBaseDataLoader)
+    assert loader._additional_split_names(_config(model_type=ModelType.ANIMA)) == []

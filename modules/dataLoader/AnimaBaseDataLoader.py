@@ -30,6 +30,19 @@ class AnimaBaseDataLoader(
     BaseDataLoader,
     DataLoaderText2ImageMixin,
 ):
+    def _additional_split_names(self, config: TrainConfig) -> list[str]:
+        """Extra PER-SAMPLE tensors a subclass has added to the pipeline.
+
+        A subclass that appends a module producing one tensor per image has to
+        say so here, not only in its output names: the cache split is what
+        carries a per-sample tensor across the caching boundary, and a name
+        missing from it is silently absent from the batch rather than an error.
+        Exposing it as a hook keeps the split, the sort and the output list in
+        one place, so a change to Anima's caching cannot quietly stop applying
+        to a subclass.
+        """
+        return []
+
     def _preparation_modules(self, config: TrainConfig, model: AnimaModel):
         rescale_image = RescaleImageChannels(image_in_name='image', image_out_name='image', in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1)
         encode_image = EncodeVAE(in_name='image', out_name='latent_image_distribution', vae=model.vae, autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
@@ -67,6 +80,7 @@ class AnimaBaseDataLoader(
 
     def _cache_modules(self, config: TrainConfig, model: AnimaModel, model_setup: BaseAnimaSetup):
         image_split_names = ['latent_image', 'original_resolution', 'crop_offset']
+        image_split_names += self._additional_split_names(config)
 
         if config.masked_training or config.model_type.has_mask_input():
             image_split_names.append('latent_mask')
@@ -103,6 +117,7 @@ class AnimaBaseDataLoader(
             't5_tokens_mask',
             'original_resolution', 'crop_resolution', 'crop_offset',
         ]
+        output_names += self._additional_split_names(config)
 
         if config.masked_training or config.model_type.has_mask_input():
             output_names.append('latent_mask')
