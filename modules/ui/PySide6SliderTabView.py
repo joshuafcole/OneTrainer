@@ -1,5 +1,6 @@
 from modules.ui.BaseSliderTabView import BaseSliderPromptWidgetView, BaseSliderTabView
 from modules.ui.PySide6ConfigListView import PySide6ConfigListView
+from modules.ui.PySide6SliderAxesWindowView import PySide6SliderAxesWindowView
 from modules.ui.SliderTabController import SliderTabController
 from modules.util.ui import pyside6_components
 from modules.util.ui.PySide6UIState import PySide6UIState
@@ -24,6 +25,10 @@ class PySide6SliderTabView(PySide6ConfigListView, BaseSliderTabView):
         pyside6_components._layout(self.top_frame).addWidget(settings_frame, 1, 0, 1, 6)
         pyside6_components._layout(settings_frame).setColumnStretch(0, 1)
         self.build_slider_settings(settings_frame)
+
+    def _open_axes_window(self) -> None:
+        self.controller.open_axes_window(
+            self.top_frame, self.ui_state, PySide6SliderAxesWindowView).exec()
 
     def _set_block_visible(self, widget, visible: bool) -> None:
         if widget is None:

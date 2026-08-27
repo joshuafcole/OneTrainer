@@ -10,6 +10,9 @@ from modules.util.enum.SliderRegime import SliderRegime
 # add another branch to a callback.
 _BLOCKS_BY_REGIME: dict[SliderRegime, frozenset[str]] = {
     SliderRegime.PROMPT_PAIR: frozenset({"prompt_pair", "prompt_list"}),
+    # No prompt_list: the coordinate regime's input is the Concepts tab, and
+    # leaving the triples on screen would suggest they were being read.
+    SliderRegime.IMAGE: frozenset({"image"}),
 }
 
 _HINT_BY_REGIME: dict[SliderRegime, str] = {
@@ -17,6 +20,12 @@ _HINT_BY_REGIME: dict[SliderRegime, str] = {
         "Prompt-pair regime: add positive/negative prompt triples below. There is no image "
         "dataset -- the frozen base supplies the guidance direction and the training latents "
         "are generated. The Concepts tab is not used."
+    ),
+    SliderRegime.IMAGE: (
+        "Image (coordinate) regime: an ordinary dataset from the Concepts tab, whose captions "
+        "say where each image sits on the axis -- \"a photo of a car on a road, (distance:-2)\". "
+        "That token is taken out of the caption and used as the adapter multiplier instead. "
+        "Declare the axis name under Coordinate axes below. Prompt triples are not used."
     ),
 }
 
@@ -34,6 +43,11 @@ class BaseSliderTabView(BaseConfigListView):
     def _set_block_visible(self, widget, visible: bool) -> None:
         """Show or hide one settings block. The only toolkit-specific part of the
         regime machinery."""
+
+    @abstractmethod
+    def _open_axes_window(self) -> None:
+        """Open the coordinate-axes editor. Toolkit-specific only because the
+        window class is."""
 
     @staticmethod
     def blocks_for_regime(regime: SliderRegime) -> frozenset[str]:
@@ -121,6 +135,15 @@ class BaseSliderTabView(BaseConfigListView):
                     "the bare positive/negative pair.")
         self.components.entry(
             preservation, 0, 1, self.ui_state, "slider_preservation_prompts", width=560)
+
+        image = self.components.inline_frame(master, 3, 0)
+        self._blocks["image"] = image
+        self.components.label(
+            image, 0, 0, "Coordinate axes",
+            tooltip="The axis names your captions use, e.g. 'distance' for a caption reading "
+                    "'(distance:-2)'. Declared axes are stripped from the caption before "
+                    "training; the one flagged as the target supplies the multiplier.")
+        self.components.button(image, 0, 1, "edit axes...", command=self._open_axes_window)
 
         # last, so its construction-time callback finds every block above
         self.components.options_kv(

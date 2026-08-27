@@ -14,6 +14,7 @@ expose today -- a keyword renamed upstream fails here rather than at run time on
 GPU. CPU only. Run with ``python -m pytest tests/test_slider_hosts.py``.
 """
 
+import copy
 import os
 import sys
 from contextlib import nullcontext
@@ -41,6 +42,13 @@ from modules.modelSetup.StableDiffusionXLSliderSetup import (  # noqa: E402
     StableDiffusionXLSliderSetup,
 )
 from modules.ui.BaseSliderTabView import BaseSliderTabView  # noqa: E402
+from modules.ui.CtkSliderTabView import CtkSliderTabView  # noqa: E402
+from modules.ui.PySide6SliderTabView import PySide6SliderTabView  # noqa: E402
+from modules.ui.SliderAxesWindowController import (  # noqa: E402
+    SliderAxesWindowController,
+    SliderAxisListController,
+)
+from modules.ui.SliderTabController import SliderTabController  # noqa: E402
 from modules.ui.TopBarController import TopBarController  # noqa: E402
 from modules.util import factory  # noqa: E402
 from modules.util.config.SliderConfig import SliderAxisConfig, SliderPromptConfig  # noqa: E402
@@ -781,6 +789,48 @@ def test_the_prompt_pair_regime_shows_the_prompt_list():
     blocks = BaseSliderTabView.blocks_for_regime(SliderRegime.PROMPT_PAIR)
     assert "prompt_list" in blocks, "the triples are the whole input of this regime"
     assert "prompt_pair" in blocks
+
+
+def test_the_image_regime_hides_the_prompt_list():
+    """Its input is the Concepts tab. Leaving the triples on screen would say they
+    were being read, and they are not."""
+    blocks = BaseSliderTabView.blocks_for_regime(SliderRegime.IMAGE)
+    assert "image" in blocks
+    assert "prompt_list" not in blocks
+    assert "prompt_pair" not in blocks
+
+
+def test_every_regime_can_be_selected():
+    """The other half of the block map: a regime with blocks but no dropdown entry
+    is unreachable, and one with an entry but no blocks renders an empty tab."""
+    controller = SliderTabController(_config())
+    offered = [regime for _label, regime in controller.get_slider_regimes()]
+    assert offered == list(SliderRegime)
+
+
+def test_both_toolkits_can_open_the_axes_editor():
+    """The tab hides which toolkit it is on behind _open_axes_window, so a missing
+    implementation is an abstract-method TypeError at tab construction -- which
+    only happens for a user who picked SLIDER."""
+    for view_cls in (CtkSliderTabView, PySide6SliderTabView):
+        assert not view_cls.__abstractmethods__, view_cls.__abstractmethods__
+        assert "_open_axes_window" in vars(view_cls)
+
+
+def test_the_axes_editor_edits_the_configs_own_axis_list():
+    """Not a copy: the window is opened from the tab and dismissed, and whatever
+    the user typed has to be on the TrainConfig that gets saved."""
+    config = _config()
+    controller = SliderAxesWindowController(config)
+    assert controller.config is config
+
+    axes = SliderAxisListController(config)
+    axis = axes.create_new_element()
+    assert axis.name == "", "a pre-filled axis name is a row that looks configured and trains nothing"
+
+    # a cloned row must not keep the original's uuid, or the two rows are one row
+    clone = axes.randomize_uuid(copy.deepcopy(axis))
+    assert clone.uuid != axis.uuid
 
 
 # ---------------------------------------------------------------------------

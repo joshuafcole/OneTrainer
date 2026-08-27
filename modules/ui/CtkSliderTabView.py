@@ -1,5 +1,6 @@
 from modules.ui.BaseSliderTabView import BaseSliderPromptWidgetView, BaseSliderTabView
 from modules.ui.CtkConfigListView import CtkConfigListView
+from modules.ui.CtkSliderAxesWindowView import CtkSliderAxesWindowView
 from modules.ui.SliderTabController import SliderTabController
 from modules.util.ui import ctk_components
 from modules.util.ui.CtkUIState import CtkUIState
@@ -24,6 +25,11 @@ class CtkSliderTabView(CtkConfigListView, BaseSliderTabView):
         settings_frame.grid(row=1, column=0, columnspan=6, sticky="new", pady=(8, 0))
         settings_frame.grid_columnconfigure(0, weight=1)
         self.build_slider_settings(settings_frame)
+
+    def _open_axes_window(self) -> None:
+        window = self.controller.open_axes_window(self, self.ui_state, CtkSliderAxesWindowView)
+        self.wait_window(window)
+        self.refresh_ui()
 
     def _set_block_visible(self, widget, visible: bool) -> None:
         if widget is None or not widget.winfo_exists():
