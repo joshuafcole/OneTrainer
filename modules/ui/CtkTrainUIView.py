@@ -10,6 +10,7 @@ from modules.ui.BaseTrainUIView import BaseTrainUIView
 from modules.ui.CloudTabController import CloudTabController
 from modules.ui.ConceptTabController import ConceptTabController
 from modules.ui.CtkAdditionalEmbeddingsTabView import CtkAdditionalEmbeddingsTabView
+from modules.ui.CtkBucketTierParamsWindowView import CtkBucketTierParamsWindowView
 from modules.ui.CtkCaptionUIView import CtkCaptionUIView
 from modules.ui.CtkCloudTabView import CtkCloudTabView
 from modules.ui.CtkConceptTabView import CtkConceptTabView
@@ -200,6 +201,10 @@ class CtkTrainUIView(BaseTrainUIView, ctk.CTk):
 
     def open_manual_sample_window(self):
         self.controller.open_manual_sample_window(self, CtkSampleWindowView)
+
+    def open_bucket_tier_params_window(self):
+        self.wait_window(
+            self.controller.open_bucket_tier_params_window(self, self.ui_state, CtkBucketTierParamsWindowView))
 
     def wait_window(self, window):
         ctk.CTk.wait_window(self, window)

@@ -9,6 +9,7 @@ from modules.ui.LoraTabController import LoraTabController
 from modules.ui.ModelTabController import ModelTabController
 from modules.ui.ProfilingWindowController import ProfilingWindowController
 from modules.ui.PySide6AdditionalEmbeddingsTabView import PySide6AdditionalEmbeddingsTabView
+from modules.ui.PySide6BucketTierParamsWindowView import PySide6BucketTierParamsWindowView
 from modules.ui.PySide6CaptionUIView import PySide6CaptionUIView
 from modules.ui.PySide6CloudTabView import PySide6CloudTabView
 from modules.ui.PySide6ConceptTabView import PySide6ConceptTabView
@@ -175,6 +176,9 @@ class PySide6TrainView(BaseTrainUIView, QMainWindow, metaclass=QtABCMeta):
 
     def open_manual_sample_window(self):
         self.controller.open_manual_sample_window(self, PySide6SampleWindowView)
+
+    def open_bucket_tier_params_window(self):
+        self.controller.open_bucket_tier_params_window(self, self.ui_state, PySide6BucketTierParamsWindowView).exec()
 
     def wait_window(self, window):
         window.exec()

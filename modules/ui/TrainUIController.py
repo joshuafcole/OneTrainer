@@ -11,6 +11,7 @@ from pathlib import Path
 
 import scripts.generate_debug_report
 from modules.ui.BaseTrainUIView import BaseTrainUIView
+from modules.ui.BucketTierParamsWindowController import BucketTierParamsWindowController
 from modules.ui.CaptionUIController import CaptionUIController
 from modules.ui.ConvertModelUIController import ConvertModelUIController
 from modules.ui.SampleWindowController import SampleWindowController
@@ -163,6 +164,9 @@ class TrainUIController:
             base_model_name=self.train_config.base_model_name,
             huggingface_token=self.train_config.secrets.huggingface_token,
         ).create_window(parent, view_cls)
+
+    def open_bucket_tier_params_window(self, parent, ui_state, view_cls):
+        return view_cls(parent, BucketTierParamsWindowController(self.train_config), ui_state)
 
     def open_sampling_tool(self, parent, view_cls):
         if self.sample_window is not None:

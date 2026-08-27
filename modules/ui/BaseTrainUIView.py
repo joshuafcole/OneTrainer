@@ -6,6 +6,7 @@ from modules.util.enum.DataType import DataType
 from modules.util.enum.GradientReducePrecision import GradientReducePrecision
 from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.PathIOType import PathIOType
+from modules.util.ui.validation_helpers import check_range
 
 
 class BaseTrainUIView(ABC):
@@ -75,6 +76,9 @@ class BaseTrainUIView(ABC):
 
     def save_now(self):
         self.controller.save_now()
+
+    @abstractmethod
+    def open_bucket_tier_params_window(self): pass
 
     @abstractmethod
     def open_dataset_tool(self): pass
@@ -233,6 +237,36 @@ class BaseTrainUIView(ABC):
         self.components.label(frame, 0, 0, "Aspect Ratio Bucketing",
                          tooltip="Aspect ratio bucketing enables training on images with different aspect ratios")
         self.components.switch(frame, 0, 1, ui_state, "aspect_ratio_bucketing")
+
+        self.components.label(frame, 0, 3, "Bucket Aspect Tolerance",
+                         tooltip="Collapse aspect buckets whose ratios differ by no more than this onto a single "
+                                 "crop resolution, so fewer images are lost to the batch sorter dropping a bucket "
+                                 "it cannot fill. 0 keeps the exact bucket set aspect ratio bucketing has always "
+                                 "produced; larger values are looser and fill batches more easily, at the cost of "
+                                 "cropping some images a little further from their real aspect.",
+                         wide_tooltip=True)
+        self.components.entry(frame, 0, 4, ui_state, "aspect_ratio_bucket_tolerance",
+                              extra_validate=check_range(lower=0))
+
+        self.components.label(frame, 1, 3, "Resolution Mode",
+                         tooltip="How a run with several training resolutions picks between them.\n"
+                                 "Split: every image picks one at random, so a single aspect scatters across all "
+                                 "of them and a small dataset fragments into buckets too small to train.\n"
+                                 "Rotate: the whole epoch trains at one resolution and the choice rotates across "
+                                 "the run, so nothing fragments, the step count per epoch is constant, and you "
+                                 "still get multi-scale coverage -- across the run instead of within each epoch.",
+                         wide_tooltip=True)
+        self.components.options_kv(frame, 1, 4, [
+            ("Split", "split"),
+            ("Rotate", "rotate"),
+        ], ui_state, "aspect_ratio_bucket_resolution_mode")
+
+        self.components.label(frame, 2, 3, "Min Bucket Tiers",
+                         tooltip="What to do with aspect buckets holding too few images to fill a batch. Such a "
+                                 "bucket is discarded today and its images never train, silently. Configure tiers "
+                                 "to drop, donate, borrow or repeat instead. Empty leaves the current behaviour.",
+                         wide_tooltip=True)
+        self.components.button(frame, 2, 4, "configure tiers", self.open_bucket_tier_params_window)
 
         # latent caching
         self.components.label(frame, 1, 0, "Latent Caching",
