@@ -39,6 +39,8 @@ from modules.util.loss.counterexample_loss import (  # noqa: E402
     counterexample_losses,
     counterexample_stats,
     counterexample_weight,
+    noise_band_weight,
+    noise_level_from_snr,
     ramp_steps,
 )
 
@@ -134,6 +136,9 @@ def test_the_shipped_defaults_ask_for_auto_calibration():
     assert config.counterexample_beta == 0.0
     assert isinstance(config.counterexample_ramp, float)
     assert config.counterexample_ramp == 0.25
+    # 0 / 1 is "no band", and the band function proves it is exactly a no-op.
+    assert config.counterexample_band_low == 0.0
+    assert config.counterexample_band_high == 1.0
 
     # 0 never reaches the objective: SCHEDULE.beta() substitutes a real one.
     assert SCHEDULE.beta(config.counterexample_beta, 0, 100) > 0.0
@@ -373,6 +378,153 @@ def test_telemetry_accumulates_across_micro_steps_and_drains():
 
 
 # ---------------------------------------------------------------------------
+# the noise band
+# ---------------------------------------------------------------------------
+
+
+def _u(alphas_cumprod: torch.Tensor) -> torch.Tensor:
+    """The coordinate under test, written out independently of the implementation."""
+    snr = alphas_cumprod / (1.0 - alphas_cumprod)
+    return 1.0 / (1.0 + snr.sqrt())
+
+
+def test_the_coordinate_has_exactly_one_implementation():
+    """Everything that reasons about where on the schedule the term acts must not
+    be able to disagree about what u is. They call the same function; this pins
+    that it is the published one."""
+    snr = torch.tensor([((1 - s) / s) ** 2 for s in (0.1, 0.35, 0.5, 0.8)])
+    assert torch.allclose(
+        noise_level_from_snr(snr), torch.tensor([0.1, 0.35, 0.5, 0.8]), atol=1e-6
+    )
+
+
+def test_the_noise_coordinate_is_exactly_sigma_for_a_rectified_flow():
+    """The identity the whole design rests on. A flow model's forward process is
+    ``x_t = (1 - sigma) x_0 + sigma eps``, so ``SNR = ((1-sigma)/sigma)^2`` and
+    ``u = 1/(1+sqrt(SNR))`` collapses to sigma itself. That is what lets the
+    flow-matching branch read sigma straight off its own schedule while the
+    diffusion branch computes u from alphas_cumprod, and have the two mean the
+    same physical thing."""
+    sigma = torch.tensor([0.05, 0.2, 0.5, 0.8, 0.95])
+    snr = ((1.0 - sigma) / sigma) ** 2
+    u = 1.0 / (1.0 + snr.sqrt())
+    assert torch.allclose(u, sigma, atol=1e-6)
+
+
+def test_the_noise_coordinate_is_not_the_timestep_fraction():
+    """Why the band got its own coordinate instead of reusing
+    ``min_noising_strength``.
+
+    Timestep-index fraction is not comparable across model families. On SD 1.5's
+    scaled-linear schedule the tenth of the schedule nearest clean is already a
+    QUARTER noise by amplitude, while on a rectified flow t/N = 0.1 is sigma =
+    0.1 exactly. A band authored on one model and reused on the other would
+    silently cover a different noise range -- and nothing would report it.
+    """
+    betas = torch.linspace(0.00085 ** 0.5, 0.012 ** 0.5, 1000) ** 2
+    u = _u(torch.cumprod(1.0 - betas, dim=0))
+
+    assert 0.25 < u[100].item() < 0.27        # t/N = 0.1 -> u ~ 0.26, not 0.10
+    assert 0.75 < u[700].item() < 0.78        # t/N = 0.7 -> u ~ 0.77
+    # ...and monotone, so a band in u is still a contiguous range of timesteps.
+    assert torch.all(u[1:] >= u[:-1])
+
+
+def test_no_band_is_exactly_a_no_op():
+    """The default has to be provably inert, not merely gentle. A taper nobody
+    asked for would change every existing run's dose silently."""
+    u = torch.linspace(0.0, 1.0, 51)
+    assert torch.equal(noise_band_weight(u, 0.0, 1.0), torch.ones_like(u))
+
+
+def test_a_band_keeps_a_full_strength_plateau():
+    """Edges are a quarter of the width each and combined with `minimum`, so the
+    middle half of any band runs at full strength. A product of the two edges
+    would instead dip in the centre -- the one place the term should be
+    strongest."""
+    u = torch.linspace(0.0, 1.0, 1001)
+    for low, high in [(0.3, 0.7), (0.0, 0.5), (0.45, 0.55), (0.6, 1.0)]:
+        weight = noise_band_weight(u, low, high)
+        assert weight.max().item() == 1.0, (low, high)
+        mid = noise_band_weight(torch.tensor([(low + high) / 2.0]), low, high)
+        assert math.isclose(mid.item(), 1.0, abs_tol=1e-6), (low, high)
+
+
+def test_a_band_is_zero_outside_and_smooth_at_its_edges():
+    u = torch.linspace(0.0, 1.0, 1001)
+    weight = noise_band_weight(u, 0.3, 0.7)
+
+    assert weight[u < 0.3].max().item() == 0.0
+    assert weight[u > 0.7].max().item() == 0.0
+    # A raised cosine, so no step: the largest jump between adjacent samples is
+    # far below the 1.0 a hard cutoff would produce.
+    assert weight.diff().abs().max().item() < 0.02
+
+
+def test_an_open_lower_edge_does_not_taper_the_clean_end():
+    """`low = 0` means "no lower bound", so u = 0 must pass at full strength. An
+    edge applied unconditionally would zero out the cleanest latents -- the
+    opposite of what an open bound says."""
+    weight = noise_band_weight(torch.tensor([0.0, 0.1]), 0.0, 0.77)
+    assert torch.allclose(weight, torch.ones(2))
+
+
+def test_an_inverted_band_is_rejected():
+    u = torch.linspace(0.0, 1.0, 11)
+    for low, high in [(0.7, 0.3), (0.5, 0.5), (-0.1, 0.5), (0.2, 1.5)]:
+        try:
+            noise_band_weight(u, low, high)
+        except ValueError:
+            continue
+        raise AssertionError(f"({low}, {high}) should have been rejected")
+
+
+def test_beta_calibrates_on_the_rows_the_band_lets_through():
+    """|delta| varies strongly with noise level, so a band that mutes part of the
+    schedule also moves the delta scale the run optimizes. Calibrating beta on
+    rows the band removed would solve for a scale that never trains."""
+    # Realistic magnitudes: delta is a difference of element-mean distances, and
+    # a large one clamps against BETA_BOUNDS, hiding the effect under test.
+    delta = torch.tensor([0.001, 0.1])
+    in_band_only = torch.tensor([1.0, 0.0])
+
+    unbanded, banded = CounterexampleSchedule(), CounterexampleSchedule()
+    for _ in range(MIN_CALIBRATION_STEPS):
+        unbanded.observe(delta)
+        banded.observe(delta, in_band_only)
+
+    # mean|delta| is 0.0505 unbanded and 0.001 banded, and beta is
+    # logit/mean|delta| -- a factor of 50 in the objective's own scale.
+    assert banded.beta(0.0, 999, MIN_CALIBRATION_STEPS) > 40 * unbanded.beta(
+        0.0, 999, MIN_CALIBRATION_STEPS
+    )
+
+
+def test_a_step_muted_entirely_by_the_band_is_not_an_observation():
+    """Contributing a zero would drag the calibration mean toward zero and blow
+    the solved beta up; contributing nothing is the honest reading -- that step
+    trained on no counterexample at all."""
+    schedule = CounterexampleSchedule()
+    for _ in range(MIN_CALIBRATION_STEPS):
+        schedule.observe(torch.tensor([2.0]), torch.tensor([0.0]))
+    # Enough *calls* to close the window, but no observations behind them.
+    assert schedule.beta(0.0, 999, MIN_CALIBRATION_STEPS) == BOOTSTRAP_BETA
+
+    for _ in range(MIN_CALIBRATION_STEPS):
+        schedule.observe(torch.tensor([2.0]), torch.tensor([1.0]))
+    assert schedule.beta(0.0, 999, MIN_CALIBRATION_STEPS) != BOOTSTRAP_BETA
+
+
+def test_an_unbanded_run_reports_a_full_dose():
+    """`band_pass` is the dose. With no band every row passes, which is 1.0 per
+    row -- a default of 0 would report an ordinary run as having delivered
+    nothing."""
+    delta = torch.tensor([0.5, 0.5])
+    stats = counterexample_stats(delta, counterexample_losses(torch.zeros(2), delta, BETA), BETA)
+    assert stats.band_mean == 1.0
+
+
+# ---------------------------------------------------------------------------
 # routing through the real loss mixin
 # ---------------------------------------------------------------------------
 
@@ -443,6 +595,95 @@ def test_the_epsilon_prediction_path_routes_it_too():
     assert math.isclose(losses[0].item(), 1.0, rel_tol=1e-6)
     assert math.isclose(losses[1].item(), (2.0 / BETA) * math.log(2.0), rel_tol=1e-5)
     assert TELEMETRY.take().stats.rows == 1
+
+
+def test_the_band_mutes_a_counterexample_row_outside_it():
+    """Routing, on the flow branch: a row whose noise level falls outside the
+    band contributes nothing, while the positive beside it is untouched -- the
+    band is a counterexample knob, not a global loss weight."""
+    TELEMETRY.reset()
+    types_ = [ConceptType.STANDARD, ConceptType.COUNTEREXAMPLE]
+    batch, data = _batch_and_data(types_)
+    # sigma = (t+1)/1000, so index 949 is u = 0.95: nearly pure noise.
+    data["timestep"] = torch.tensor([949, 949])
+    config = _config(counterexample_band_low=0.0, counterexample_band_high=0.5)
+
+    losses = _Mixin()._flow_matching_losses(
+        batch, data, config, torch.device("cpu"), sigmas=torch.zeros(1000)
+    )
+
+    assert losses[1].item() == 0.0
+    assert math.isclose(losses[0].item(), 1.0, rel_tol=1e-6)
+    # ...and the readout says the dose was zero rather than reporting a healthy run.
+    stats = TELEMETRY.take().stats
+    assert stats.band_mean == 0.0
+    assert math.isclose(stats.noise_level_mean, 0.95, abs_tol=1e-6)
+
+
+def test_the_band_passes_a_counterexample_row_inside_it():
+    TELEMETRY.reset()
+    batch, data = _batch_and_data([ConceptType.COUNTEREXAMPLE])
+    data["timestep"] = torch.tensor([499])          # u = 0.5, mid-band
+    config = _config(
+        batch_size=1, counterexample_band_low=0.3, counterexample_band_high=0.7
+    )
+
+    losses = _Mixin()._flow_matching_losses(
+        batch, data, config, torch.device("cpu"), sigmas=torch.zeros(1000)
+    )
+    assert math.isclose(losses[0].item(), (2.0 / BETA) * math.log(2.0), rel_tol=1e-5)
+    assert TELEMETRY.take().stats.band_mean == 1.0
+
+
+def test_both_loss_branches_agree_on_the_noise_coordinate():
+    """The cross-family claim, made checkable: a variance-preserving latent and a
+    rectified-flow latent at *the same physical noise level* must get the same
+    band weight, even though one branch derives u from alphas_cumprod and the
+    other reads sigma straight off its schedule.
+
+    u = 0.8 corresponds to alphas_cumprod = 1/17 on a VP schedule and to
+    sigma = 0.8 on a flow -- numbers that look nothing alike, which is the point.
+    """
+    band = {"counterexample_band_low": 0.7, "counterexample_band_high": 0.9}
+    expected = (2.0 / BETA) * math.log(2.0)
+
+    TELEMETRY.reset()
+    batch, data = _batch_and_data([ConceptType.COUNTEREXAMPLE])
+    data["timestep"] = torch.tensor([799])          # sigma = 0.8
+    flow = _Mixin()._flow_matching_losses(
+        batch, data, _config(batch_size=1, **band), torch.device("cpu"),
+        sigmas=torch.zeros(1000),
+    )
+    flow_noise = TELEMETRY.take().stats.noise_level_mean
+
+    TELEMETRY.reset()
+    batch, data = _batch_and_data([ConceptType.COUNTEREXAMPLE])
+    data["timestep"] = torch.tensor([0])
+    diffusion = _Mixin()._diffusion_losses(
+        batch, data, _config(batch_size=1, **band), torch.device("cpu"),
+        alphas_cumprod_fun=lambda t, dim: torch.full(t.shape, 1.0 / 17.0),
+    )
+    diffusion_noise = TELEMETRY.take().stats.noise_level_mean
+
+    assert math.isclose(flow_noise, 0.8, abs_tol=1e-6)
+    assert math.isclose(diffusion_noise, 0.8, abs_tol=1e-6)
+    assert math.isclose(flow.item(), expected, rel_tol=1e-5)
+    assert math.isclose(diffusion.item(), expected, rel_tol=1e-5)
+
+
+def test_a_model_with_no_schedule_simply_gets_no_band():
+    """`loss_weight_fn = CONSTANT` with no betas and no alphas_cumprod_fun leaves
+    __snr nothing to read. That path has nothing to do with counterexamples and
+    must not start raising because one is in the batch."""
+    TELEMETRY.reset()
+    batch, data = _batch_and_data([ConceptType.COUNTEREXAMPLE])
+    data["timestep"] = torch.tensor([500])
+    config = _config(batch_size=1, counterexample_band_low=0.3, counterexample_band_high=0.4)
+
+    losses = _Mixin()._diffusion_losses(batch, data, config, torch.device("cpu"))
+
+    assert math.isclose(losses[0].item(), (2.0 / BETA) * math.log(2.0), rel_tol=1e-5)
+    assert TELEMETRY.take().stats.band_mean == 1.0
 
 
 def test_the_ramp_scales_the_counterexample_row_and_only_that_row():
