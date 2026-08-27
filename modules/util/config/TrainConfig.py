@@ -523,11 +523,40 @@ class TrainConfig(BaseConfig):
     masked_prior_preservation_weight: float
 
     # counterexample training (ConceptType.COUNTEREXAMPLE). beta sets the delta
-    # scale at which the bounded repulsion switches off; see
-    # modules/util/loss/counterexample_loss.py for why the useful range is
-    # hundreds-to-thousands, and read `counterexample/gate_mean` off a short run
-    # rather than guessing it twice.
+    # SCALE at which the bounded repulsion switches off -- it is not a strength
+    # knob (at delta == 0, where every cold LoRA starts, the slope is 1.0 for
+    # every beta). 0 means "solve it from this run's own delta", which is the
+    # default and the recommendation: a measured SD 1.5 LoRA wanted ~31,500, not
+    # the 1000 that Diffusion-DPO's convention suggests, and |delta| grows as
+    # training runs.
     counterexample_beta: float
+    # Timing, independent of the positives': the fraction of the run (or, above 1,
+    # the literal step count) over which the counterexample term eases from 0 to
+    # full strength on a raised cosine. 0 disables the ramp.
+    #
+    # Default 0.25 rather than 1.0, and the difference is a real trade, not a
+    # detail: a cosine ramp across the WHOLE run delivers half the total repulsion
+    # (mean strength 0.50 vs 0.87 at 0.25). That is the right shape for "strongest
+    # during the LR anneal", but as a *default* it would halve the treatment in an
+    # A/B and could report a real effect as a null. 0.25 removes the cold-start
+    # push -- repelling before the adapter has learned anything -- and still runs
+    # three quarters of training at full strength. Set 1.0 deliberately when the
+    # goal is to concentrate the correction into the anneal.
+    counterexample_ramp: float
+    # Where on the noise schedule the repulsion is allowed to act, as a band in
+    # the model-agnostic coordinate u = 1 / (1 + sqrt(SNR)): the fraction of the
+    # noised latent's amplitude that is noise. u = 0 is a clean latent, u = 1 is
+    # pure noise, and for a rectified-flow model u is exactly sigma. Deliberately
+    # NOT the timestep-index fraction that min_noising_strength uses -- on SD 1.5
+    # index 0.1 is u = 0.26, on a flow model it is u = 0.10, so a band authored
+    # once and reused would silently mean a different noise range per family.
+    #
+    # (0, 1) is "no band" and is exactly a no-op. Narrowing it concentrates the
+    # correction but also REDUCES THE DOSE in proportion to the fraction of rows
+    # it passes -- counterexample/band_pass reports that fraction, and an A/B
+    # that does not match it across arms is comparing two different treatments.
+    counterexample_band_low: float
+    counterexample_band_high: float
 
     # custom conditioning image
     custom_conditioning_image: bool
@@ -1229,7 +1258,10 @@ class TrainConfig(BaseConfig):
         data.append(("masked_prior_preservation_weight", 0.0, float, False))
 
         # counterexample training
-        data.append(("counterexample_beta", 1000.0, float, False))
+        data.append(("counterexample_beta", 0.0, float, False))
+        data.append(("counterexample_ramp", 0.25, float, False))
+        data.append(("counterexample_band_low", 0.0, float, False))
+        data.append(("counterexample_band_high", 1.0, float, False))
 
         data.append(("custom_conditioning_image", False, bool, False))
 

@@ -6,9 +6,16 @@ from modules.util.DiffusionScheduleCoefficients import DiffusionScheduleCoeffici
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.LossWeight import LossWeight
 from modules.util.loss.counterexample_loss import (
+    DOSE_SAMPLES,
+    SCHEDULE,
+    STARVED_DOSE,
     TELEMETRY,
+    band_dose,
     counterexample_losses,
     counterexample_stats,
+    counterexample_weight,
+    noise_band_weight,
+    noise_level_from_snr,
 )
 from modules.util.loss.masked_loss import masked_losses, masked_losses_with_prior
 from modules.util.loss.vb_loss import vb_losses
@@ -28,6 +35,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         self.__coefficients = None
         self.__alphas_cumprod_fun = None
         self.__sigmas = None
+        self.__band_forecast_done = False
 
     def __log_cosh_loss(
             self,
@@ -243,12 +251,14 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             data: dict,
             config: TrainConfig,
             losses: Tensor,
+            noise_level: Tensor | None = None,
     ) -> Tensor:
         """Replace every ``COUNTEREXAMPLE`` row's loss with the bounded repulsion.
 
         Substituted *before* the loss scaler and ``loss_weight``, so a
         counterexample concept's own weight still applies on top exactly as it
-        does for a positive concept.
+        does for a positive concept -- and the ramp's strength multiplier applies
+        under it, so the two compose rather than compete.
 
         Raises rather than degrading when the frozen reference is missing: a
         counterexample row whose repulsion silently did not apply is a row that
@@ -279,25 +289,178 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 "LoRA-only (see BaseModelSetup.prior_model) and is armed in GenericTrainer."
             )
 
-        beta = config.counterexample_beta
+        # `beta` may be auto-calibrated from this run's own delta, so it is asked
+        # for per step rather than read straight off the config -- see
+        # CounterexampleSchedule. An explicit positive beta is returned unchanged.
+        step = int(data.get("counterexample_step", 0))
+        total_steps = int(data.get("counterexample_total_steps", 0))
+        beta = SCHEDULE.beta(config.counterexample_beta, step, total_steps)
+
         index = torch.tensor(indices, device=losses.device, dtype=torch.long)
         distance = self._prediction_distance(batch, data, config, data["predicted"])
         reference_distance = self._prediction_distance(
             batch, data, config, data["prior_target"].detach()
         )
         repulsion = counterexample_losses(distance, reference_distance, beta)
+        delta = (reference_distance - distance)[index]
 
+        # The noise band restricts the repulsion to the part of the schedule
+        # where a close-but-wrong image actually differs from a right one. It is
+        # a *reweighting*, not a resampling, deliberately: the timestep is drawn
+        # per sample before concept type is ever consulted, so narrowing
+        # `min_noising_strength`/`max_noising_strength` instead would move the
+        # positives' schedule too.
+        row_noise = None if noise_level is None else noise_level.to(device=losses.device)[index]
+        band = (
+            None
+            if row_noise is None
+            else noise_band_weight(
+                row_noise, config.counterexample_band_low, config.counterexample_band_high
+            )
+        )
+        # Forecast the dose here rather than before the loop: this is the first
+        # moment the schedule AND the resolved timestep shift both exist. It costs
+        # one 50k draw, once, and only on a run that has both a band and a
+        # counterexample concept -- the only run it could tell anything.
+        if band is not None and not self.__band_forecast_done:
+            self.__band_forecast_done = True
+            if config.counterexample_band_low > 0.0 or config.counterexample_band_high < 1.0:
+                self.__forecast_band_dose(config, losses.device)
+        SCHEDULE.observe(delta, band)
+
+        # Recorded BEFORE the ramp weight, deliberately: `gate_mean` has to keep
+        # describing the objective's own state (is beta scaled for this run's
+        # delta?) and not get mixed up with how much of it is currently switched
+        # on. The weight is its own scalar instead.
+        weight = counterexample_weight(step, total_steps, config.counterexample_ramp)
         TELEMETRY.record(
             counterexample_stats(
-                delta=(reference_distance - distance)[index],
+                delta=delta,
                 losses=repulsion[index],
                 beta=beta,
-            )
+                noise_level=row_noise,
+                band_weight=band,
+            ),
+            weight=weight,
+            beta=beta,
         )
 
         losses = losses.clone()
-        losses[index] = repulsion[index]
+        # The band multiplies the repulsion rather than selecting rows: a muted
+        # row still takes part in the step, it just contributes ~nothing, which
+        # keeps the batch shape and the positives' loss untouched.
+        scaled = repulsion[index] if band is None else band * repulsion[index]
+        losses[index] = weight * scaled
         return losses
+
+    def __noise_level_from_snr(self, timesteps: Tensor, device: torch.device) -> Tensor:
+        """``u = 1 / (1 + sqrt(SNR))`` -- the fraction of the noised latent's
+        amplitude that is noise, in ``[0, 1]``.
+
+        The one coordinate in which a noise band means the same thing on every
+        model family. For a variance-preserving schedule
+        ``x_t = sqrt(a_bar) x_0 + sqrt(1 - a_bar) eps``, so this is exactly
+        ``sqrt(1 - a_bar) / (sqrt(a_bar) + sqrt(1 - a_bar))``. For a rectified
+        flow ``x_t = (1 - sigma) x_0 + sigma eps`` gives ``SNR = ((1-sigma)/sigma)^2``
+        and the same expression collapses to ``sigma`` itself -- which is why the
+        flow-matching branch can read sigma straight off its own schedule and be
+        speaking the same language.
+
+        Prediction type is deliberately not consulted: ``u`` describes ``x_t``,
+        not how the network is asked to parameterize it, so unlike
+        ``__min_snr_weight`` there is no v-prediction correction here.
+        """
+        return noise_level_from_snr(self.__snr(timesteps, device))
+
+    def __noise_level_for(self, timesteps: Tensor, device: torch.device) -> Tensor | None:
+        """``u`` for arbitrary timesteps, from whichever schedule this setup was
+        given.
+
+        Not a new branch: ``__sigmas`` is set only by ``_flow_matching_losses``
+        and ``__coefficients`` only by ``_diffusion_losses``, so "which one is
+        populated" *is* how the run already identifies its own family. Returns
+        ``None`` when neither is -- a continuous-timestep model (Wuerstchen
+        supplies an ``alphas_cumprod_fun`` and samples with
+        ``_get_timestep_continuous``) has no discrete schedule to sample over,
+        and a forecast built on a made-up one would be worse than no forecast.
+        """
+        if self.__sigmas is not None:
+            return self.__sigmas[timesteps].to(device=device)
+        if self.__coefficients is not None:
+            return self.__noise_level_from_snr(timesteps, device)
+        return None
+
+    def __forecast_band_dose(self, config: TrainConfig, device: torch.device) -> None:
+        """Say, once, how much of the repulsion this band will actually deliver.
+
+        The band is model-agnostic; **the dose is not**. ``timestep_shift`` skews
+        where samples land, so an identical band delivers 0.57 of the term on
+        SD 1.5 and 0.22 on a flow model at shift 7.51 -- a 3x spread that also
+        varies *within* a family with resolution, since
+        ``model.calculate_timestep_shift`` reads the training size. So this is
+        derived per run rather than tabulated per family, the same way that
+        method is.
+
+        Estimated by drawing through ``_get_timestep_discrete`` itself -- the run's
+        real sampler, with its real distribution and its real shift -- rather than
+        by modelling it. A model of the sampler would be a second implementation
+        of eight distribution branches, and it would go stale silently.
+        """
+        # A *discrete* schedule is what makes the forecast possible: it is what
+        # `_get_timestep_discrete` samples over. A model that has only an
+        # `alphas_cumprod_fun` (Wuerstchen) samples with
+        # `_get_timestep_continuous` instead, so there is nothing to draw from
+        # and no length to draw it over. The band itself still works there --
+        # `__noise_level_from_snr` handles that path fine -- only the forecast is
+        # skipped, and it is skipped rather than approximated.
+        if self.__sigmas is not None:
+            length = self.__sigmas.shape[0]
+        elif self.__coefficients is not None:
+            length = self.__coefficients.sqrt_alphas_cumprod.shape[0]
+        else:
+            return
+        # A FRESH generator, never the training one: drawing 50k samples from the
+        # run's own generator would advance its state and change every subsequent
+        # noise draw, so a diagnostic would silently make runs unreproducible.
+        generator = torch.Generator(device=device)
+        generator.manual_seed(0)
+        timesteps = self._get_timestep_discrete(
+            num_train_timesteps=length,
+            deterministic=False,
+            generator=generator,
+            batch_size=DOSE_SAMPLES,
+            config=config,
+            shift=self._last_timestep_shift,
+        )
+        noise_level = self.__noise_level_for(timesteps.long(), device)
+        if noise_level is None:
+            return
+
+        low, high = config.counterexample_band_low, config.counterexample_band_high
+        dose = band_dose(noise_level, low, high)
+        # Read AFTER the draw, not before: `_get_timestep_discrete` resolves
+        # `None` to the config's shift and records it, so this is the shift the
+        # sample was actually taken under.
+        shift = self._last_timestep_shift
+        print(
+            f"counterexample: band [{low:.2f}, {high:.2f}] in u, timestep_shift {shift:.2f}"
+            f" -> expected dose (band_pass) ~{dose:.2f}"
+        )
+        if dose <= 0.0:
+            print(
+                "counterexample: WARNING this band passes no timesteps at all -- the "
+                "repulsion will not train anything. Widen it."
+            )
+        elif dose < STARVED_DOSE:
+            print(
+                f"counterexample: WARNING a dose of {dose:.2f} is starvation -- the rows "
+                "that do pass will look perfectly healthy and the gate will not report it."
+            )
+        else:
+            print(
+                f"counterexample: to match an unbanded arm's dose, multiply the concept's "
+                f"loss_weight by {1.0 / dose:.2f}"
+            )
 
     def __snr(self, timesteps: Tensor, device: torch.device) -> Tensor:
         if self.__coefficients:
@@ -385,7 +548,18 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             else:
                 losses = self.__unmasked_losses(batch, data, config)
 
-            losses = self._apply_counterexample_losses(batch, data, config, losses)
+            # Guarded on the schedule, not just on the key: with
+            # `loss_weight_fn = CONSTANT` and no betas passed, __snr has nothing
+            # to read and neither source is guaranteed to exist. A model whose
+            # schedule is unavailable simply gets no band rather than a crash on
+            # a path that has nothing to do with counterexamples.
+            has_schedule = self.__coefficients is not None or self.__alphas_cumprod_fun is not None
+            noise_level = (
+                self.__noise_level_from_snr(data['timestep'], losses.device)
+                if 'timestep' in data and has_schedule
+                else None
+            )
+            losses = self._apply_counterexample_losses(batch, data, config, losses, noise_level)
 
         # Scale Losses by Batch and/or GA (if enabled)
         losses = losses * config.loss_scaler.get_scale(batch_size=config.batch_size, accumulation_steps=config.gradient_accumulation_steps)
@@ -431,7 +605,15 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             else:
                 losses = self.__unmasked_losses(batch, data, config)
 
-            losses = self._apply_counterexample_losses(batch, data, config, losses)
+            # A flow model's sigma *is* the noise coordinate `u` -- see
+            # __noise_level_from_snr, where the general expression collapses to
+            # exactly this for a rectified flow.
+            noise_level = (
+                self.__sigmas[data['timestep']].to(device=losses.device)
+                if 'timestep' in data and self.__sigmas is not None
+                else None
+            )
+            losses = self._apply_counterexample_losses(batch, data, config, losses, noise_level)
 
         # Scale Losses by Batch and/or GA (if enabled)
         losses = losses * config.loss_scaler.get_scale(config.batch_size, config.gradient_accumulation_steps)
