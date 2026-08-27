@@ -507,6 +507,15 @@ def capture_activations(
     """
     import tempfile
 
+    # OT's own bootstrap: puts the checkout root on sys.path so ``modules.*``
+    # resolves. Every upstream script that imports ``modules`` calls it, because
+    # running a file by path puts only *its own* directory on sys.path -- not the
+    # repo root, and not the cwd. Called here rather than at module scope so
+    # ``score`` and the tests still import without OneTrainer's dependency tree.
+    from import_util import script_imports
+
+    script_imports()
+
     from modules.model.AnimaModel import AnimaModel
     from modules.modelLoader.AnimaModelLoader import AnimaModelLoader
     from modules.modelSampler.AnimaSampler import AnimaSampler
