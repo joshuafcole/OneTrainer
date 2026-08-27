@@ -117,6 +117,19 @@ def test_rejects_degenerate_gradient():
     assert not module.init_from_gradient(torch.zeros(linear.out_features, linear.in_features))
 
 
+def test_rejects_non_finite_gradient_instead_of_raising():
+    # A NaN/Inf gradient must SKIP the layer, not abort the estimation pass.
+    # `torch.linalg.svd` raises on a non-finite input, so the old guard -- which
+    # tested `torch.isfinite(sigma)` *after* calling nearest_kron_factors -- could
+    # never fire: the exception had already left the function. Guarding `grad`
+    # before the call is what makes the skip reachable.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        linear, module = _make_module()
+        grad = _fake_gradient(module)
+        grad[0, 0] = bad
+        assert not module.init_from_gradient(grad), f"expected a skip for {bad}"
+
+
 def test_factor_replay_matches_gradient_init():
     # The returned Van Loan pair, replayed onto a fresh identically-configured
     # module via init_from_factors (the cache-hit path), must produce the same
