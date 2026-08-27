@@ -752,6 +752,13 @@ class GenericTrainer(BaseTrainer):
                 )
 
             current_epoch_length = self.data_loader.get_data_set().approximate_length()
+            # Same arithmetic create_lr_scheduler uses for `total_steps`, so the
+            # counterexample ramp and the LR schedule agree on where "the end" is
+            # -- the whole point of the fraction form is to land full strength
+            # while the LR is annealing.
+            counterexample_total_steps = int(
+                current_epoch_length * self.config.epochs / self.config.gradient_accumulation_steps
+            )
 
             if multi.is_master():
                 batches = step_tqdm = tqdm(self.data_loader.get_data_loader(), desc="step", total=current_epoch_length,
@@ -828,6 +835,11 @@ class GenericTrainer(BaseTrainer):
                         prior_model_prediction = prior_model_output_data['predicted'].to(dtype=model_output_data['target'].dtype)
                         model_output_data['target'][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
                         model_output_data['prior_target'] = prior_model_prediction
+                        # The counterexample ramp and its beta calibration need a
+                        # clock. `calculate_loss` takes no TrainProgress, so it
+                        # rides the same dict `prior_target` does.
+                        model_output_data['counterexample_step'] = train_progress.global_step
+                        model_output_data['counterexample_total_steps'] = counterexample_total_steps
                     else:
                         model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
@@ -848,7 +860,8 @@ class GenericTrainer(BaseTrainer):
                         # Drained on every rank, not just the logging one, so a
                         # non-master's accumulator never carries a previous
                         # window's rows into the next.
-                        counterexample = counterexample_telemetry.take()
+                        window = counterexample_telemetry.take()
+                        counterexample = window.stats
                         if self.config.fused_gradient_reduce:
                             multi.finish_async(self.config.gradient_reduce_precision)
                         else:
@@ -898,6 +911,12 @@ class GenericTrainer(BaseTrainer):
                                     ("counterexample/gate_mean", counterexample.gate_mean),
                                     ("counterexample/saturated_fraction", counterexample.saturated_fraction),
                                     ("counterexample/loss_mean", counterexample.loss_mean),
+                                    # The ramp's current strength, and the beta in
+                                    # force -- which is not necessarily the
+                                    # configured one, since `counterexample_beta = 0`
+                                    # means "solve it from this run's delta".
+                                    ("counterexample/weight", window.weight),
+                                    ("counterexample/beta", window.beta),
                                 ):
                                     self.tensorboard.add_scalar(tag, value, train_progress.global_step)
 

@@ -870,14 +870,28 @@ class BaseTrainingTabView(ABC):
 
         # Counterexample Beta
         self.components.label(frame, row, 0, "Counterexample Beta",
-                              tooltip="The delta SCALE at which the bounded repulsion applied to COUNTEREXAMPLE "
-                                      "concepts switches off -- not a strength knob: at delta == 0, where every cold "
-                                      "LoRA starts, the slope is 1.0 for every beta. Read counterexample/gate_mean "
-                                      "off a short run: ~1.0 means beta is too small to ever switch off. No effect "
-                                      "unless a concept has type COUNTEREXAMPLE.",
+                              tooltip="0 = solve it from this run's own delta (recommended, and the default). "
+                                      "Otherwise, the delta SCALE at which the bounded repulsion applied to "
+                                      "COUNTEREXAMPLE concepts switches off -- not a strength knob: at delta == 0, "
+                                      "where every cold LoRA starts, the slope is 1.0 for every beta. Use "
+                                      "Counterexample Ramp to start gentle. No effect unless a concept has type "
+                                      "COUNTEREXAMPLE.",
                               wide_tooltip=True)
         self.components.entry(frame, row, 1, ui_state, "counterexample_beta",
-                              extra_validate=check_range(lower=1e-6, message="Counterexample beta must be positive"))
+                              extra_validate=check_range(lower=0.0, message="Counterexample beta must be 0 (auto) or positive"))
+        row += 1
+
+        # Counterexample Ramp
+        self.components.label(frame, row, 0, "Counterexample Ramp",
+                              tooltip="How long the counterexample term takes to reach full strength, independent "
+                                      "of the positives. A fraction of the run (0-1) or a literal step count (>1); "
+                                      "0 disables it. 1.0 arrives at full strength on the last step, so the term is "
+                                      "weakest while the adapter still knows nothing and strongest during the LR "
+                                      "anneal -- but a cosine across the whole run delivers only half the total "
+                                      "repulsion, which is why the default is 0.25.",
+                              wide_tooltip=True)
+        self.components.entry(frame, row, 1, ui_state, "counterexample_ramp",
+                              extra_validate=check_range(lower=0.0, message="Counterexample ramp must be >= 0"))
         row += 1
 
     def __create_layer_frame(self, master, row, controller, ui_state):
