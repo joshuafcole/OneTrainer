@@ -23,6 +23,7 @@ from modules.util.enum.LossWeight import LossWeight
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.Optimizer import Optimizer
+from modules.util.enum.PeftInitMode import PeftInitMode
 from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -557,6 +558,15 @@ class TrainConfig(BaseConfig):
     lokr_full_matrix: bool
     lokr_vec_trick: bool
 
+    # gradient-aligned (GA) init -- shared by peft_type LORA and LOKR;
+    # GenericTrainer's GA pass dispatches on peft_type. Not applicable to
+    # DoRA, which is initialized to the identity, so leaving it on Default
+    # there is the safe no-op.
+    peft_init_mode: PeftInitMode
+    peft_init_steps: int
+    peft_init_gain: float
+    peft_init_offload: bool
+
     # optimizer
     optimizer: TrainOptimizerConfig
     optimizer_defaults: dict[str, TrainOptimizerConfig]
@@ -572,6 +582,7 @@ class TrainConfig(BaseConfig):
     sample_audio_format: AudioFormat
     samples_to_tensorboard: bool
     non_ema_sampling: bool
+    sample_on_train_end: bool
 
     # cloud settings
     cloud: CloudConfig
@@ -585,6 +596,7 @@ class TrainConfig(BaseConfig):
     save_every: int
     save_every_unit: TimeUnit
     save_skip_first: int
+    save_on_train_end: bool
     save_filename_prefix: str
 
     # secrets - not saved into config file
@@ -1251,6 +1263,12 @@ class TrainConfig(BaseConfig):
         data.append(("lokr_full_matrix", False, bool, False))
         data.append(("lokr_vec_trick", True, bool, False))
 
+        # gradient-aligned (GA) init
+        data.append(("peft_init_mode", PeftInitMode.DEFAULT, PeftInitMode, False))
+        data.append(("peft_init_steps", 64, int, False))
+        data.append(("peft_init_gain", 1.0, float, False))
+        data.append(("peft_init_offload", False, bool, False))
+
         # optimizer
         data.append(("optimizer", TrainOptimizerConfig.default_values(), TrainOptimizerConfig, False))
         data.append(("optimizer_defaults", {}, dict[str, TrainOptimizerConfig], False))
@@ -1266,6 +1284,7 @@ class TrainConfig(BaseConfig):
         data.append(("sample_audio_format", AudioFormat.MP3, AudioFormat, False))
         data.append(("samples_to_tensorboard", True, bool, False))
         data.append(("non_ema_sampling", True, bool, False))
+        data.append(("sample_on_train_end", True, bool, False))
 
         # backup settings
         data.append(("backup_after", 30, int, False))
@@ -1276,6 +1295,7 @@ class TrainConfig(BaseConfig):
         data.append(("save_every", 0, int, False))
         data.append(("save_every_unit", TimeUnit.NEVER, TimeUnit, False))
         data.append(("save_skip_first", 0, int, False))
+        data.append(("save_on_train_end", False, bool, False))
         data.append(("save_filename_prefix", "", str, False))
 
         # secrets

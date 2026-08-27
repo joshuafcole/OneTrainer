@@ -10,7 +10,7 @@ from modules.module.oft_utils import OFTRotationModule
 from modules.module.quantized.LinearSVD import BaseLinearSVD
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import PeftType
-from modules.util.lokr_utils import factorization, make_kron, rebuild_tucker
+from modules.util.lokr_utils import factorization, make_kron, nearest_kron_factors, rebuild_tucker
 from modules.util.ModuleFilter import ModuleFilter
 from modules.util.quantization_util import get_unquantized_weight, get_weight_shape
 
@@ -29,6 +29,7 @@ class PeftBase(nn.Module):
     prefix: str
     layer_kwargs: dict  # Applied during the forward op() call.
     _initialized: bool  # Tracks whether we've created the layers or not.
+    multiplier: float  # Signed scale on the adapter delta (the "slider" knob).
 
     def __init__(self, prefix: str, orig_module: nn.Module | None):
         super().__init__()
@@ -37,6 +38,11 @@ class PeftBase(nn.Module):
         self.is_applied = False
         self.layer_kwargs = {}
         self._initialized = False
+        # Runtime scale applied to the adapter's *delta* contribution only
+        # (orig_forward(x) is never scaled). 1.0 is a no-op so normal
+        # training/inference is unchanged. 0.0 gives a frozen-base pass, and
+        # negative values invert the delta -- the "slider" use case.
+        self.multiplier = 1.0
 
         if orig_module is not None:
             match orig_module:
@@ -78,6 +84,18 @@ class PeftBase(nn.Module):
     def _wrap_eval(self):
         self.orig_eval()
         self.eval()
+
+    def set_multiplier(self, multiplier: float):
+        """Set the signed scale applied to this adapter's delta contribution.
+
+        Additive PEFT types (LoRA, LoHa, LoKr without weight-decompose) honour
+        any real multiplier, including negatives. Non-additive types
+        (DoRA / OFT / SVD-merged, and weight-decomposed LoKr) raise on a
+        non-default multiplier in their forward, since a signed delta scale
+        isn't well-defined there -- silently applying one would mean something
+        different per adapter type, so refusing is the safer default.
+        """
+        self.multiplier = float(multiplier)
 
     def make_weight(self, A: Tensor, B: Tensor):
         """Layer-type-independent way of creating a weight matrix from LoRA A/B.
@@ -286,7 +304,7 @@ class LoHaModule(PeftBase):
                               self.dropout(self.hada_w1_a))
         W2 = self.make_weight(self.dropout(self.hada_w2_b),
                               self.dropout(self.hada_w2_a))
-        W = (W1 * W2) * (self.alpha / self.rank)
+        W = (W1 * W2) * (self.alpha / self.rank) * self.multiplier
         return self.op(x, W, bias=None, **self.layer_kwargs)
 
     def apply_to_module(self):
@@ -444,6 +462,73 @@ class LoKrModule(PeftBase):
         if self.use_w1 and self.use_w2:
             self.alpha.fill_(lokr_dim)
 
+    def init_from_gradient(self, grad: Tensor, gain: float = 1.0) -> tuple[Tensor, Tensor] | None:
+        """Gradient-aligned (Kron-GA) initialization, in the spirit of LoRA-GA.
+
+        Replaces the random directions of the nonzero factors with the
+        principal Kronecker factors of the estimated weight gradient
+        (Van Loan-Pitsianis), norm-matched to the existing init so only the
+        subspace changes. The zero factor (lokr_w2_b or lokr_w2) is left
+        untouched, so the adapter output remains exactly zero and the base
+        weights never need to be modified.
+
+        Returns the Van Loan factor pair (w1_t, w2_t) so it can be cached and
+        replayed via init_from_factors, or None if the layer was skipped.
+        """
+        if not isinstance(self.orig_module, nn.Linear):
+            return None
+
+        device = self.train_device if self.train_device is not None else grad.device
+        grad = grad.to(device=device, dtype=torch.float32)
+        w1_t, w2_t, sigma = nearest_kron_factors(grad, self.out_l, self.out_k, self.in_m, self.in_n)
+        if not torch.isfinite(sigma) or sigma == 0:
+            return None
+
+        return (w1_t, w2_t) if self.init_from_factors(w1_t, w2_t, gain) else None
+
+    def init_from_factors(self, w1_t: Tensor, w2_t: Tensor, gain: float = 1.0) -> bool:
+        """Applies a Van Loan factor pair -- fresh from init_from_gradient or
+        loaded from a cache. Shape-checked so a stale cache (different
+        decompose factor or model) is rejected instead of misapplied."""
+        if not isinstance(self.orig_module, nn.Linear):
+            return False
+        if w1_t.shape != (self.out_l, self.in_m) or w2_t.shape != (self.out_k, self.in_n):
+            return False
+
+        device = self.train_device if self.train_device is not None else w1_t.device
+        w1_t = w1_t.to(device=device, dtype=torch.float32)
+        w2_t = w2_t.to(device=device, dtype=torch.float32)
+
+        with torch.no_grad():
+            if self.use_w1:
+                target_norm = self.lokr_w1.detach().float().norm()
+                new_w1 = w1_t * (gain * target_norm / w1_t.norm())
+                self.lokr_w1.copy_(new_w1.to(self.lokr_w1.dtype))
+            else:
+                u, s, vh = torch.linalg.svd(w1_t, full_matrices=False)
+                k = min(self.dim, s.shape[0])
+                sqrt_s = s[:k].sqrt()
+                a = u[:, :k] * sqrt_s
+                b = sqrt_s.unsqueeze(1) * vh[:k, :]
+                target_norm = (self.lokr_w1_a.detach().float() @ self.lokr_w1_b.detach().float()).norm()
+                factor_scale = (gain * target_norm / (a @ b).norm()).sqrt()
+                self.lokr_w1_a[:, :k].copy_((a * factor_scale).to(self.lokr_w1_a.dtype))
+                self.lokr_w1_b[:k, :].copy_((b * factor_scale).to(self.lokr_w1_b.dtype))
+
+            # The w2 side: align the column space of w2_a with the gradient's
+            # second Kronecker factor. lokr_w2_b (or the full lokr_w2) stays
+            # zero, which keeps the adapter's output delta at exactly zero.
+            if not self.use_w2 and not self.tucker:
+                u2 = torch.linalg.svd(w2_t, full_matrices=False)[0]
+                k = min(self.dim, u2.shape[1])
+                target_norm = self.lokr_w2_a.detach().float().norm()
+                new_a = self.lokr_w2_a.detach().float().to(device).clone()
+                new_a[:, :k] = u2[:, :k]
+                new_a *= gain * target_norm / new_a.norm()
+                self.lokr_w2_a.copy_(new_a.to(self.lokr_w2_a.dtype))
+
+        return True
+
     def _get_factors(self):
         """Returns the two kronecker components W1 and W2."""
         # If using DoRA (weight_decompose), we want clean weights here so we can
@@ -479,6 +564,10 @@ class LoKrModule(PeftBase):
 
         # DoRA for LoKr
         if self.weight_decompose:
+            if self.multiplier != 1.0:
+                raise NotImplementedError(
+                    "Signed multiplier is not supported for weight-decomposed (DoRA) LoKr."
+                )
 
             if isinstance(self.orig_module, nn.Linear):
                 orig_weight = get_unquantized_weight(self.orig_module, torch.float, self.train_device)
@@ -515,12 +604,12 @@ class LoKrModule(PeftBase):
                 )
 
                 # Reshape back to [Batch, ..., Out_Features]
-                delta_output = delta_output.reshape(*x_shape[:-1], -1) * scale
+                delta_output = delta_output.reshape(*x_shape[:-1], -1) * scale * self.multiplier
 
                 return self.orig_forward(x) + delta_output
             else:
                 # Fallback for Conv2d layers or when lokr_vec_trick is disabled
-                w = self.get_weight() * scale
+                w = self.get_weight() * scale * self.multiplier
                 return self.orig_forward(x) + self.op(x, w.to(x.dtype), bias=None, **self.layer_kwargs)
 
     def apply_to_module(self):
@@ -568,9 +657,68 @@ class LoRAModule(PeftBase):
         assert self.lora_down is not None
         assert self.lora_up is not None
 
+    def init_from_gradient(self, grad: Tensor, gain: float = 1.0) -> Tensor | None:
+        """Gradient-aligned (LoRA-GA) initialization -- the LoRA analogue of
+        LoKrModule.init_from_gradient.
+
+        Sets lora_down to the top-rank right singular vectors of the estimated
+        weight gradient (norm-matched to the kaiming init) and leaves lora_up at
+        zero, so the adapter output stays exactly zero. The first optimizer step
+        then drives the delta toward the rank-r truncation of the gradient: with
+        A = lora_down = Vr^T and B = lora_up = 0, dL/dB is proportional to
+        G @ A^T = Ur * Sr, so after one step B @ A is proportional to -Gr -- the
+        LoRA-GA first-step property. For slider training the estimated gradient
+        is itself the guidance-difference direction, so this pre-orients the
+        slider along what it must learn.
+
+        Returns the top-rank right singular vectors (shape (r, in_features)) so
+        they can be cached and replayed via init_from_factors, or None if the
+        layer is unsupported or the gradient is degenerate. (Only the top r rows
+        are kept, so the cache stays small for wide DiT layers; the cache key
+        therefore carries lora_rank.)
+        """
+        if not isinstance(self.orig_module, nn.Linear):
+            return None
+        device = self.lora_down.weight.device
+        g = grad.to(device=device, dtype=torch.float32)
+        try:
+            _, s, vh = torch.linalg.svd(g, full_matrices=False)
+        except Exception:  # noqa: BLE001 -- a non-converging SVD just skips the layer
+            return None
+        if s.numel() == 0 or not torch.isfinite(s[0]) or s[0] == 0:
+            return None
+        vh_r = vh[: self.rank, :].contiguous()
+        return vh_r if self.init_from_factors(vh_r, gain) else None
+
+    def init_from_factors(self, vh: Tensor, gain: float = 1.0) -> bool:
+        """Applies a fresh-or-cached right-singular matrix (rows are the
+        input-space directions of the gradient) to lora_down -- truncated to
+        rank, norm-matched to the existing init. lora_up stays zero so the
+        adapter output remains exactly zero. Shape-checked so a stale cache is
+        rejected rather than misapplied."""
+        if not isinstance(self.orig_module, nn.Linear):
+            return False
+        in_features = self.lora_down.weight.shape[1]
+        if vh.dim() != 2 or vh.shape[1] != in_features:
+            return False
+        r = min(self.rank, vh.shape[0])
+        device = self.lora_down.weight.device
+        vh = vh.to(device=device, dtype=torch.float32)
+        with torch.no_grad():
+            target_norm = self.lora_down.weight.detach().float().norm()
+            new_down = self.lora_down.weight.detach().float().clone()
+            new_down[:r, :] = vh[:r, :]
+            new_down *= gain * target_norm / new_down.norm().clamp_min(1e-12)
+            self.lora_down.weight.copy_(new_down.to(self.lora_down.weight.dtype))
+        return True
+
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
         if isinstance(self.orig_module, BaseLinearSVD):
+            if self.multiplier != 1.0:
+                raise NotImplementedError(
+                    "Signed multiplier is not supported for SVD-merged linears (forward_with_lora)."
+                )
             return self.orig_module.forward_with_lora(x, self.lora_down, self.lora_up, self.dropout, self.alpha)
 
         return self.orig_forward(x) + self.delta_forward(x, *args, **kwargs)
@@ -578,7 +726,7 @@ class LoRAModule(PeftBase):
     def delta_forward(self, x, *args, **kwargs) -> Tensor | None:
         self.check_initialized()
         ld = self.lora_up(self.dropout(self.lora_down(x)))
-        return ld * (self.alpha / self.rank)
+        return ld * (self.alpha / self.rank) * self.multiplier
 
     def apply_to_module(self):
         # TODO
@@ -679,6 +827,11 @@ class OFTModule(PeftBase):
 
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
+
+        if self.multiplier != 1.0:
+            raise NotImplementedError(
+                "Signed multiplier is not supported for OFT (orthogonal rotation has no signed delta scale)."
+            )
 
         # For Linear layers, rotating the input is mathematically equivalent to rotating the weights.
         if isinstance(self.orig_module, nn.Linear):
@@ -783,6 +936,10 @@ class DoRAModule(LoRAModule):
 
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
+        if self.multiplier != 1.0:
+            raise NotImplementedError(
+                "Signed multiplier is not supported for DoRA (magnitude/direction split has no signed delta scale)."
+            )
         A = self.lora_down.weight
         B = self.lora_up.weight
 
@@ -835,8 +992,11 @@ class LoRAModuleWrapper:
     rank: int
     alpha: float
     module_filters: list[ModuleFilter]
+    target_modules: dict[str, nn.Module]
 
     lora_modules: dict[str, PeftBase]
+    frozen_lora_modules: dict[str, PeftBase]
+    dummy_lora_modules: dict[str, PeftBase]
     lokr_dim: int
 
     def __init__(
@@ -865,6 +1025,10 @@ class LoRAModuleWrapper:
         # selects fused/split only via `fuse`. When `fuse` is left None it defaults to fusing iff a spec
         # was given.
         self.fuse = (fusion_spec is not None) if fuse is None else fuse
+        # every Linear/Conv2d in the base model, keyed by its (unprefixed) name -- lets a narrower
+        # resume tell "outside the current filter" apart from "not in the model at all" (see
+        # __load_remaining_state).
+        self.target_modules = self.__collect_target_modules(orig_module)
 
         self.module_filters = [
             ModuleFilter(pattern, use_regex=config.layer_filter_regex)
@@ -918,6 +1082,82 @@ class LoRAModuleWrapper:
             }
         self.fused_groups = []
         self.lora_modules = self.__create_modules(orig_module, config)
+        # populated by load_state_dict, when a resumed checkpoint has keys outside the current filter
+        # (see __load_remaining_state).
+        self.frozen_lora_modules = {}
+        self.dummy_lora_modules = {}
+
+    def __collect_target_modules(self, orig_module: nn.Module | None) -> dict[str, nn.Module]:
+        if orig_module is None:
+            return {}
+
+        target_modules = {}
+        for name, child_module in orig_module.named_modules():
+            name = name.replace(".checkpoint.", ".")
+            if isinstance(child_module, Linear | Conv2d):
+                target_modules[name] = child_module
+
+        return target_modules
+
+    def __full_prefix(self, short_name: str) -> str:
+        return (self.prefix + "." + short_name) if self.prefix != "" else short_name
+
+    def __iter_real_modules(self):
+        """Modules that are actually hooked to the base model: trainable + frozen inherited."""
+        yield from self.lora_modules.values()
+        yield from self.frozen_lora_modules.values()
+
+    def __iter_stateful_modules(self):
+        """Every module that must round-trip through state_dict(): real + save-only dummies."""
+        yield from self.__iter_real_modules()
+        yield from self.dummy_lora_modules.values()
+
+    def __find_target_prefix(self, state_key: str) -> str | None:
+        """Find the longest target-module prefix that `state_key` belongs to, if any.
+
+        Longest match matters because one target module's name can be a strict prefix of
+        another's (e.g. a module that itself is a Linear with a Linear submodule).
+        """
+        matches = [
+            self.__full_prefix(short_name)
+            for short_name in self.target_modules
+            if state_key.startswith(self.__full_prefix(short_name) + ".")
+        ]
+        if not matches:
+            return None
+        return max(matches, key=len)
+
+    def __load_remaining_state(self, state_dict: dict[str, Tensor], remaining_names: set[str]):
+        """Bucket checkpoint keys left over after the trainable population loaded.
+
+        A leftover key that still resolves to a real target module in the current base model
+        becomes a frozen module: loaded, hooked, and applied, but never trained. A leftover key
+        that resolves to nothing (the base model has no such module -- e.g. a stale or foreign
+        checkpoint key) becomes a dummy: preserved only so it round-trips through state_dict().
+        """
+        remaining_prefixes: dict[str, set[str]] = defaultdict(set)
+
+        for name in remaining_names:
+            resolved_prefix = self.__find_target_prefix(name)
+            if resolved_prefix is not None:
+                remaining_prefixes[resolved_prefix].add(name)
+            else:
+                remaining_prefixes[name.rsplit(".", 1)[0]].add(name)
+
+        for full_prefix in sorted(remaining_prefixes):
+            short_name = full_prefix.removeprefix(self.prefix + ".") if self.prefix else full_prefix
+
+            if short_name in self.target_modules and short_name not in self.lora_modules:
+                module = self.klass(
+                    full_prefix, self.target_modules[short_name], *self.additional_args, **self.additional_kwargs
+                )
+                module.load_state_dict(state_dict)
+                module.requires_grad_(False)
+                self.frozen_lora_modules[short_name] = module
+            else:
+                module = self.dummy_klass(full_prefix, None, *self.additional_args, **self.additional_kwargs)
+                module.load_state_dict(state_dict)
+                self.dummy_lora_modules[full_prefix] = module
 
     def __create_modules(self, orig_module: nn.Module | None, config: TrainConfig) -> dict[str, PeftBase]:
         if orig_module is None:
@@ -1001,6 +1241,92 @@ class LoRAModuleWrapper:
     def requires_grad_(self, requires_grad: bool):
         for module in self.lora_modules.values():
             module.requires_grad_(requires_grad)
+        # frozen inherited modules are never trainable, regardless of what's requested here.
+        for module in self.frozen_lora_modules.values():
+            module.requires_grad_(False)
+
+    def set_multiplier(self, multiplier: float):
+        """Set the signed adapter-delta scale on every module in this wrapper.
+
+        This is the "slider" knob: 0.0 disables the adapter (frozen-base pass),
+        +/- values steer the concept, and it doubles as inference-time strength.
+        Non-additive PEFT types raise (at forward time) for a non-default value.
+
+        Applies to every *real* (hooked) module -- trainable and frozen inherited alike.
+        A frozen module still contributes to the forward pass exactly like a trainable
+        one; excluding it here would mean 0.0 doesn't actually give the frozen-base pass
+        the docstring promises, and a strength slider that only scaled the newest layer
+        filter would visibly desync from the rest of the adapter's effect. Dummy modules
+        are never hooked, so setting a multiplier on them would be a no-op either way.
+        """
+        for module in self.__iter_real_modules():
+            module.set_multiplier(multiplier)
+
+    def init_from_gradients(
+            self, grads: Mapping[str, Tensor], gain: float = 1.0,
+    ) -> tuple[int, int, dict[str, tuple[Tensor, ...]]]:
+        """Gradient-aligned init for every trainable adapter module that supports
+        it: Kron-GA for LoKr, LoRA-GA for LoRA. DoRA is skipped (its
+        magnitude/direction split has no clean gradient-aligned init -- it
+        initializes to the identity, so leaving it on Default is the safe no-op).
+
+        Only ``lora_modules`` (the trainable population) is visited -- never
+        ``frozen_lora_modules`` (weights loaded from a resumed checkpoint, which
+        this must not discard) or ``dummy_lora_modules`` (no real weights to
+        initialize at all).
+
+        grads maps lora_modules short names to estimated dL/dW of the original
+        weights. Returns (applied, skipped, factors); factors caches each
+        applied layer's replayable tensors on CPU -- a 2-tuple (Van Loan pair)
+        for LoKr, a 1-tuple (right-singular matrix) for LoRA -- for
+        init_from_factors.
+        """
+        applied = 0
+        skipped = 0
+        factors: dict[str, tuple[Tensor, ...]] = {}
+        for name, module in self.lora_modules.items():
+            grad = grads.get(name)
+            cached: tuple[Tensor, ...] | None = None
+            if grad is not None:
+                if isinstance(module, DoRAModule):
+                    cached = None  # unsupported -- skip (DoRAModule subclasses LoRAModule)
+                elif isinstance(module, LoKrModule):
+                    pair = module.init_from_gradient(grad, gain)
+                    if pair is not None:
+                        cached = (pair[0].detach().cpu(), pair[1].detach().cpu())
+                elif isinstance(module, LoRAModule):
+                    vh = module.init_from_gradient(grad, gain)
+                    if vh is not None:
+                        cached = (vh.detach().cpu(),)
+            if cached is not None:
+                factors[name] = cached
+                applied += 1
+            else:
+                skipped += 1
+        return applied, skipped, factors
+
+    def init_from_factors(
+            self, factors: Mapping[str, tuple[Tensor, ...]], gain: float = 1.0,
+    ) -> tuple[int, int]:
+        """Replays cached gradient-aligned factors (see init_from_gradients) onto
+        LoKr (2-tuple) and LoRA (1-tuple) modules of the trainable population
+        only. Returns (applied, skipped). Type/shape/arity mismatches are
+        skipped, not misapplied."""
+        applied = 0
+        skipped = 0
+        for name, module in self.lora_modules.items():
+            f = factors.get(name)
+            ok = False
+            if f is not None and not isinstance(module, DoRAModule):
+                if isinstance(module, LoKrModule) and len(f) == 2:
+                    ok = module.init_from_factors(f[0], f[1], gain)
+                elif isinstance(module, LoRAModule) and len(f) == 1:
+                    ok = module.init_from_factors(f[0], gain)
+            if ok:
+                applied += 1
+            else:
+                skipped += 1
+        return applied, skipped
 
     def parameters(self) -> list[Parameter]:
         parameters = []
@@ -1009,7 +1335,7 @@ class LoRAModuleWrapper:
         return parameters
 
     def to(self, device: torch.device = None, dtype: torch.dtype = None) -> 'LoRAModuleWrapper':
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             module.to(device, dtype)
         return self
 
@@ -1023,7 +1349,10 @@ class LoRAModuleWrapper:
 
         rank_keys = {
             PeftType.LORA: ".lora_down.weight",
-            PeftType.LOHA: ".hada_w1_a",
+            # hada_w1_b is the down projection ([rank, in]); hada_w1_a is the up
+            # projection ([out, rank]). Reading shape[0] of the latter yields the
+            # output width, not the rank.
+            PeftType.LOHA: ".hada_w1_b",
             PeftType.LOKR: ".lokr_w1_a",
         }
         key_suffix = rank_keys.get(self.peft_type)
@@ -1051,80 +1380,99 @@ class LoRAModuleWrapper:
         state_dict = {k: v for (k, v) in state_dict.items() if k.startswith(prefix)}
 
         check_fusion_match(state_dict.keys(), self.fuse, self.fusion_spec)
-        # FIXME: disabled rank check, false positive on Flux2 LoHA loading
-        # self._check_rank_matches(state_dict)
+        self._check_rank_matches(state_dict)
+
+        freshly_initialized = []
 
         try:
             for module in self.lora_modules.values():
-                module.load_state_dict(state_dict, strict=strict)
+                # A module the *current* filter selects but the checkpoint has no keys for is a
+                # layer newly added by a wider filter -- leave it at its fresh init rather than
+                # strict-loading an empty dict into it (which nn.Module.load_state_dict rejects as
+                # missing keys). A module that does have some keys still loads strictly, so a
+                # genuinely incomplete/corrupt entry for an existing module still raises.
+                #
+                # The test deliberately mirrors PeftBase.load_state_dict's own prefix filter --
+                # startswith(prefix), no trailing dot -- so this guard can never disagree with the
+                # load it guards. Making it stricter would skip modules the loader would have fed.
+                if any(k.startswith(module.prefix) for k in state_dict):
+                    module.load_state_dict(state_dict, strict=strict)
+                else:
+                    freshly_initialized.append(module.prefix)
         except RuntimeError as e:
             raise RuntimeError(f"Error during loading of module key \"{module.prefix}\"") from e
+
+        # Say so. A wider filter legitimately adds layers the checkpoint never had, but a
+        # truncated or mismatched checkpoint reaches this same branch and would otherwise be
+        # indistinguishable from it -- silently, at fresh init, for the rest of the run.
+        if freshly_initialized:
+            print(
+                f"{len(freshly_initialized)} layer(s) selected by the current filter had no weights "
+                f"in the checkpoint and start from a fresh initialization: "
+                f"{sorted(freshly_initialized)}"
+            )
 
         # Temporarily re-create the state dict, so we can see what keys were left.
         remaining_names = set(state_dict) - set(self.state_dict())
 
-        # create dummy modules for the remaining keys
-        for name in remaining_names:
-            if name.endswith(".alpha"):
-                prefix = name.removesuffix(".alpha")
-                module = self.dummy_klass(prefix, None, *self.additional_args, **self.additional_kwargs)
-                module.load_state_dict(state_dict)
-                self.lora_modules[prefix] = module
+        self.__load_remaining_state(state_dict, remaining_names)
 
     def state_dict(self) -> dict:
         """
-        Returns the state dict
+        Returns the state dict. Includes trainable, frozen, and dummy modules, so a save after a
+        narrower-filter resume preserves the inherited (frozen) and unmatched (dummy) weights too.
         """
         state_dict = {}
 
-        for module in self.lora_modules.values():
+        for module in self.__iter_stateful_modules():
             state_dict |= module.state_dict(prefix=module.prefix)
 
         return state_dict
 
     def modules(self) -> list[nn.Module]:
         """
-        Returns a list of all modules
+        Returns a list of all modules that are actually part of the model (trainable + frozen).
         """
         modules = []
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             modules += module.modules()
 
         return modules
 
     def hook_to_module(self):
         """
-        Hooks the LoRA into the module without changing its weights
+        Hooks the LoRA into the module without changing its weights. Dummy modules are never
+        hooked -- they hold no target module to hook into.
         """
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             module.hook_to_module()
 
     def remove_hook_from_module(self):
         """
         Removes the LoRA hook from the module without changing its weights
         """
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             module.remove_hook_from_module()
 
     def apply_to_module(self):
         """
         Applys the LoRA to the module, changing its weights
         """
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             module.apply_to_module()
 
     def extract_from_module(self, base_module: nn.Module):
         """
         Creates a LoRA from the difference between the base_module and the orig_module
         """
-        for module in self.lora_modules.values():
+        for module in self.__iter_real_modules():
             module.extract_from_module(base_module)
 
     def prune(self):
         """
         Removes all dummy modules
         """
-        self.lora_modules = {k: v for (k, v) in self.lora_modules.items() if not isinstance(v, self.dummy_klass)}
+        self.dummy_lora_modules = {}
 
     def set_dropout(self, dropout_probability: float):
         """
