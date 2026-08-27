@@ -58,7 +58,31 @@ So do not guess it at all: leave ``counterexample_beta`` at its default of ``0``
 and :class:`CounterexampleSchedule` measures ``|delta|`` over the calibration
 window, solves for the beta that puts *this* run's delta at
 :data:`CALIBRATION_TARGET_GATE`, and freezes it. The window pays for itself
-twice -- it is both the gentle start and the calibration sample.
+twice -- it is both the gentle start and the calibration sample. It is a fixed
+number of steps, **not** a fraction of the run: see
+:meth:`CounterexampleSchedule.calibration_steps` for why, and for the measured
+6.1x -> 1.00x that change buys.
+
+**What the gate does after the window closes.** ``|delta|`` keeps growing after
+beta freezes, so ``beta * delta`` leaves the sigmoid's useful range and the gate
+stops being graded: rows resolve to ~1 (still overfitting the counterexample) or
+~0 (already driven past the reference) by the *sign* of ``delta`` alone. The soft
+bound is a transient of the early run, and for most of a long run this term is a
+hard sign test with slope 2.
+
+**This is accepted behaviour, not a bug** (user ruling, 2026-08-26). The safety
+property is the slope bound ``|dL/d(d)| <= 2``, and that holds everywhere --
+saturation is bounded-slope repulsion applied to exactly the rows still getting
+the wrong answer, which is a defensible objective. What is *not* preserved is the
+grading between "overfitting a little" and "overfitting a lot".
+
+Two things follow. First, do not read ``gate_mean ~ 1.0`` as "beta is too small";
+it is the expected steady state. Second,
+:attr:`CounterexampleStats.graded_fraction` exists to make the choice
+reviewable -- it reports how much of each batch the soft bound is still shaping.
+If that is near zero for the whole of a run whose outcome disappoints, the
+frozen scale is the thing to revisit, and ``CounterexampleSchedule``'s docstring
+explains why naive tracking is not the answer.
 
 **Reading the gate.** :data:`TELEMETRY` reports ``gate_mean`` -- the mean of
 ``sigmoid(beta * delta)``, i.e. the fraction of full strength the term is
@@ -67,7 +91,10 @@ actually running at.
 ``~1.0`` does **not** mean beta is too small. A gate near 1 requires
 ``beta * delta >= 2.197``, so it *proves* the bound engaged; what it says is that
 ``delta`` stayed positive and the term has not yet won. (Beta too small is a gate
-pinned at ``0.5`` -- the constant-rate regime that never switches off.)
+pinned at ``0.5`` -- the constant-rate regime that never switches off.) On a long
+run a gate near 1 or 0 is the *normal* late state, for the reason given under
+"What the gate does after the window closes" -- pair it with ``graded_fraction``
+before concluding anything about beta.
 
 ``~0.0`` means the term is not currently pushing, and that has **two opposite
 causes** which the number alone cannot tell apart: the adapter has already been
@@ -94,21 +121,30 @@ CALIBRATION_TARGET_GATE = 0.9
 # Used only before the calibration window closes -- step 0 has delta == 0 exactly,
 # so there is nothing to solve from yet and the ramp weight is ~0 anyway.
 BOOTSTRAP_BETA = 1000.0
-# Calibration window when the run's length is unknown. Enough optimizer steps
-# carrying counterexample rows for the mean to mean something, small against any
-# real run.
+# The calibration window, in optimizer steps. ABSOLUTE, not a fraction of the
+# run -- see `calibration_steps`. Enough steps carrying counterexample rows for
+# the mean to mean something, small against any real run.
 DEFAULT_CALIBRATION_STEPS = 32
-# Fraction of the run beta is calibrated over. Deliberately NOT "the ramp window":
-# at `counterexample_ramp = 1.0` that would only close on the last step, so beta
-# would calibrate exactly when the run ends -- useless. At the 0.25 ramp default
-# the two coincide anyway.
-CALIBRATION_FRACTION = 0.25
+# ...but the window must still CLOSE with training left to use the result, so on
+# a run shorter than 2x the window it is capped to half the run.
+MAX_CALIBRATION_RUN_FRACTION = 0.5
 # Floor on the calibration window, so a very short ramp cannot freeze beta off a
 # single observation.
 MIN_CALIBRATION_STEPS = 8
 # A solved beta is clamped into this range: |delta| can be denormal-small on the
 # first steps after zero, and 1/tiny is not a hyperparameter.
 BETA_BOUNDS = (1.0, 1.0e9)
+# A gate strictly inside this band is one the soft bound is actually grading;
+# outside it the row is effectively decided by the sign of `delta` alone. Only
+# telemetry reads this -- nothing in the objective branches on it.
+#
+# Not (0.1, 0.9): CALIBRATION_TARGET_GATE *is* 0.9, so a strict upper edge there
+# would score a perfectly calibrated row as ungraded -- the one row we know is at
+# the scale beta solved for. The edges are the point where `beta * |delta|` is
+# ~3.9 and the sigmoid has effectively decided, comfortably outside the target.
+GRADED_BAND = (0.02, 0.98)
+assert GRADED_BAND[0] < 1.0 - CALIBRATION_TARGET_GATE, "band must contain the calibration target"
+assert GRADED_BAND[1] > CALIBRATION_TARGET_GATE, "band must contain the calibration target"
 # Each edge of the noise band is a raised cosine this fraction of the band's
 # width. A quarter on each side leaves the middle half of the band at full
 # strength, so a band always has a plateau and never degenerates into a spike.
@@ -300,10 +336,39 @@ class CounterexampleSchedule:
         self._observed_steps += 1
 
     def calibration_steps(self, total_steps: int) -> int:
-        """How many *training* steps beta is measured over before it freezes."""
+        """How many *training* steps beta is measured over before it freezes.
+
+        **Absolute, not a fraction of the run.** A fraction makes beta depend on
+        run length, because ``|delta|`` grows steeply while the window is open:
+        a longer window averages in larger deltas, so it solves a *smaller* beta.
+        The same model on the same data with a different epoch count then trains
+        against a different objective, which is not a knob anyone asked for.
+
+        Measured, against a saturating growth curve fitted to this module's own
+        "21x within one 48-step run" (`scratch: window_sim`), and cross-checked
+        against G2's two real runs, which differed 6.4x:
+
+        ============================  =============  ==================
+        rule                          spread, all    spread, runs >= 64
+        ============================  =============  ==================
+        fraction of run (was)         6.1x           2.65x
+        absolute window (is)          2.0x           **1.00x**
+        ============================  =============  ==================
+
+        Every run of at least ``2 * DEFAULT_CALIBRATION_STEPS`` steps now solves
+        the *same* beta. Below that the window is capped to half the run so it
+        still closes with training left to use the result, and runs of different
+        (short) lengths do still differ -- irreducibly, since a 24-step run
+        cannot observe 32 steps.
+
+        A tail statistic (mean over the last quarter of the window instead of
+        all of it) was measured too and moved neither number; it was dropped
+        rather than carried for the ring buffer it costs.
+        """
         if total_steps <= 0:
             return DEFAULT_CALIBRATION_STEPS
-        return max(int(CALIBRATION_FRACTION * total_steps), MIN_CALIBRATION_STEPS)
+        capped = int(MAX_CALIBRATION_RUN_FRACTION * total_steps)
+        return min(DEFAULT_CALIBRATION_STEPS, max(MIN_CALIBRATION_STEPS, capped))
 
     def beta(self, configured: float, step: int, total_steps: int) -> float:
         """The beta to use this step: ``configured`` when > 0, else the solved one.
@@ -379,6 +444,13 @@ class CounterexampleStats:
     gate_sum: float
     saturated: int
     loss_sum: float
+    graded: int = 0
+    """Rows whose gate is strictly inside :data:`GRADED_BAND` -- the fraction of
+    the batch the *soft* bound is actually shaping, as opposed to passing through
+    a hard sign test on ``delta``. See the module docstring's "What the gate does
+    after the window closes". This is the number to look at when revisiting
+    whether the frozen scale should track ``|delta|``; it is expected to fall
+    toward 0 as a run proceeds, and that is currently by design."""
     noise_level_sum: float = 0.0
     """Sum of the rows' noise coordinates ``u``, so the mean says *where on the
     schedule* the term was operating -- the number a band is set against."""
@@ -400,6 +472,10 @@ class CounterexampleStats:
         return self.saturated / self.rows if self.rows else 0.0
 
     @property
+    def graded_fraction(self) -> float:
+        return self.graded / self.rows if self.rows else 0.0
+
+    @property
     def loss_mean(self) -> float:
         return self.loss_sum / self.rows if self.rows else 0.0
 
@@ -418,6 +494,7 @@ class CounterexampleStats:
             gate_sum=self.gate_sum + other.gate_sum,
             saturated=self.saturated + other.saturated,
             loss_sum=self.loss_sum + other.loss_sum,
+            graded=self.graded + other.graded,
             noise_level_sum=self.noise_level_sum + other.noise_level_sum,
             band_sum=self.band_sum + other.band_sum,
         )
@@ -438,12 +515,14 @@ def counterexample_stats(
     if delta.numel() == 0:
         return EMPTY_STATS
     detached = delta.detach().to(dtype=torch.float32)
+    gates = torch.sigmoid(beta * detached)
     rows = int(detached.numel())
     return CounterexampleStats(
         rows=rows,
         delta_sum=float(detached.sum().item()),
-        gate_sum=float(torch.sigmoid(beta * detached).sum().item()),
+        gate_sum=float(gates.sum().item()),
         saturated=int((detached < 0).sum().item()),
+        graded=int(((gates > GRADED_BAND[0]) & (gates < GRADED_BAND[1])).sum().item()),
         loss_sum=float(losses.detach().to(dtype=torch.float32).sum().item()),
         noise_level_sum=(
             float(noise_level.detach().to(dtype=torch.float32).sum().item())

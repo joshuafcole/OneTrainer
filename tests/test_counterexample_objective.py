@@ -37,6 +37,7 @@ from modules.util.loss.counterexample_loss import (  # noqa: E402
     BOOTSTRAP_BETA,
     CALIBRATION_TARGET_GATE,
     DEFAULT_CALIBRATION_STEPS,
+    GRADED_BAND,
     MIN_CALIBRATION_STEPS,
     SCHEDULE,
     TELEMETRY,
@@ -53,6 +54,8 @@ from modules.util.loss.counterexample_loss import (  # noqa: E402
 
 import torch  # noqa: E402
 from torch import nn  # noqa: E402
+
+import pytest  # noqa: E402
 
 BETA = 4.0
 
@@ -364,13 +367,52 @@ def test_beta_is_stable_through_the_calibration_window():
 def test_the_calibration_window_does_not_follow_a_long_ramp():
     """Tying beta's window to the ramp degenerates at `counterexample_ramp = 1.0`:
     it would close on the last step, calibrating beta exactly as the run ends. So
-    the window is its own fraction of the run -- which at the 0.25 ramp default
-    happens to coincide anyway -- and floored for short runs."""
+    the window is not the ramp's -- it is its own, absolute, and capped on short
+    runs so it still closes with training left to use the result."""
     schedule = CounterexampleSchedule()
 
-    assert schedule.calibration_steps(total_steps=1000) == 250   # 25% of the run
+    assert schedule.calibration_steps(total_steps=1000) == DEFAULT_CALIBRATION_STEPS
     assert schedule.calibration_steps(total_steps=4) == MIN_CALIBRATION_STEPS
     assert schedule.calibration_steps(total_steps=0) == DEFAULT_CALIBRATION_STEPS
+    # capped to half the run, so a 40-step run still gets 20 steps of training
+    # after beta freezes rather than freezing it on the finish line
+    assert schedule.calibration_steps(total_steps=40) == 20
+
+
+def test_beta_does_not_depend_on_how_long_the_run_is():
+    """The defect G2 measured: two runs, same model and data, 24 vs 96 steps,
+    froze beta 6.4x apart (11,018,508 vs 1,713,595).
+
+    Cause: the window was 25% of the run and `|delta|` grows steeply while it is
+    open, so a longer window averaged in larger deltas and solved a *smaller*
+    beta. Run length is a scheduling choice; it must not silently rescale the
+    objective. Any run long enough to complete the window now solves the same
+    beta from the same deltas.
+    """
+    def freeze_beta(total_steps, deltas):
+        schedule = CounterexampleSchedule()
+        window = schedule.calibration_steps(total_steps)
+        for step in range(total_steps):
+            schedule.observe(torch.tensor([deltas(step)]))
+            beta = schedule.beta(configured=0.0, step=step, total_steps=total_steps)
+            if schedule._frozen_beta is not None:
+                return window, beta
+        return window, None
+
+    # |delta| growing the way a real run's does, identical across both runs
+    def growth(step):
+        return 1.0e-7 * 21.0 * (1.0 - math.exp(-(step + 1.0) / 25.0))
+
+    long_runs = [freeze_beta(t, growth)[1] for t in (64, 96, 200, 1000, 5000)]
+    assert all(b is not None for b in long_runs), "the window must close on every real run"
+    assert max(long_runs) - min(long_runs) < 1e-6 * max(long_runs), (
+        f"run length changed the objective: {long_runs}")
+
+    # Below 2x the window the cap bites and runs of different lengths still
+    # differ -- irreducibly, a 24-step run cannot observe 32 steps. Bounded, not
+    # eliminated: the old rule spanned 6.1x across this whole range.
+    short = [freeze_beta(t, growth)[1] for t in (24, 40, 48)]
+    assert max(short) / min(short) < 2.5
 
 
 def test_the_window_closes_on_training_steps_not_observed_ones():
@@ -1016,3 +1058,69 @@ def test_the_bounded_term_stops_where_gradient_ascent_does_not():
     # And the bounded one settled somewhere finite and only modestly past the
     # reference -- "worse than base on the bad image", not "destroyed".
     assert d_ref < bounded < 20 * d_ref
+
+
+def test_graded_fraction_separates_a_shaped_batch_from_a_sign_test():
+    """The number that makes the frozen-scale decision reviewable later.
+
+    Once `|delta|` outgrows the frozen beta the gate stops grading and resolves
+    by the sign of `delta` alone -- accepted behaviour, but invisible in
+    `gate_mean`, which reads ~0.5 both for a batch genuinely being shaped and for
+    a half-and-half batch of saturated rows. `graded_fraction` tells them apart.
+    """
+    # deltas straddling zero at a scale beta actually grades
+    delta = torch.tensor([-2.0, -0.5, 0.0, 0.5, 2.0])
+
+    shaped = counterexample_stats(delta, torch.zeros(5), beta=1.0)
+    sign_test = counterexample_stats(delta, torch.zeros(5), beta=1_000.0)
+
+    # gate_mean cannot distinguish them: symmetric deltas average to 0.5 either way
+    assert shaped.gate_mean == pytest.approx(0.5, abs=1e-6)
+    assert sign_test.gate_mean == pytest.approx(0.5, abs=1e-6)
+
+    # graded_fraction can
+    assert shaped.graded_fraction > 0.5, "a batch at beta's own scale is being shaped"
+    assert sign_test.graded_fraction == pytest.approx(0.2), (
+        "only the delta == 0 row (gate exactly 0.5) is still inside the band")
+
+
+def test_the_graded_band_contains_the_gate_calibration_aims_for():
+    """A row sitting exactly where beta was solved to put it is, by definition,
+    a row the bound is grading. An upper edge at CALIBRATION_TARGET_GATE would
+    score it as saturated -- found by mutating the band's comparison from `<` to
+    `<=` and watching nothing fail."""
+    assert GRADED_BAND[1] > CALIBRATION_TARGET_GATE
+    assert GRADED_BAND[0] < 1.0 - CALIBRATION_TARGET_GATE
+
+    # a row exactly at the calibration target, built the way the solver does
+    beta = 1000.0
+    delta = math.log(CALIBRATION_TARGET_GATE / (1.0 - CALIBRATION_TARGET_GATE)) / beta
+    at_target = counterexample_stats(
+        torch.tensor([delta]), torch.zeros(1), beta=beta)
+    assert at_target.gate_mean == pytest.approx(CALIBRATION_TARGET_GATE, abs=1e-6)
+    assert at_target.graded_fraction == 1.0, "the calibration target must count as graded"
+
+
+def test_graded_survives_merging_two_batches():
+    """`__add__` accumulates per-step stats into TELEMETRY. A field left out of
+    it reads plausibly -- just always low -- rather than failing."""
+    a = counterexample_stats(torch.tensor([0.0, 0.0]), torch.zeros(2), beta=1.0)
+    b = counterexample_stats(torch.tensor([0.0, 0.0]), torch.zeros(2), beta=1.0)
+    assert a.graded == 2 and b.graded == 2
+    assert (a + b).graded == 4, "graded must accumulate like every other counter"
+    assert (a + b).graded_fraction == 1.0
+
+
+def test_graded_fraction_is_telemetry_only():
+    """GRADED_BAND must never reach the objective. If a future edit branches the
+    loss on it, the band stops being an observation and becomes a third regime
+    nobody specified."""
+    delta = torch.linspace(-1.0, 1.0, 32)
+    for beta in (1.0, 1_000.0, 1_000_000.0):
+        losses = counterexample_losses(
+            distance=torch.zeros(32), reference_distance=delta, beta=beta)
+        expected = (2.0 / beta) * torch.nn.functional.softplus(beta * delta)
+        assert torch.allclose(losses, expected, atol=1e-6), (
+            f"the loss at beta={beta} is not the published formula")
+
+    assert GRADED_BAND == (0.02, 0.98)
