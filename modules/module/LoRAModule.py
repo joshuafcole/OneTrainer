@@ -43,6 +43,10 @@ class PeftBase(nn.Module):
         # training/inference is unchanged. 0.0 gives a frozen-base pass, and
         # negative values invert the delta -- the "slider" use case.
         self.multiplier = 1.0
+        # Device-resident mirror of `multiplier`, for the *arithmetic* only --
+        # see `_delta_scale`. A plain attribute, deliberately NOT a buffer: a
+        # buffer would enter the state_dict and change the saved adapter format.
+        self._multiplier_tensor: Tensor | None = None
 
         if orig_module is not None:
             match orig_module:
@@ -96,6 +100,52 @@ class PeftBase(nn.Module):
         different per adapter type, so refusing is the safer default.
         """
         self.multiplier = float(multiplier)
+        # Build the device-resident scale HERE, outside any compiled forward:
+        #   * a fresh tensor (never `fill_`) because the slider accumulates the
+        #     +pole and -pole losses and backprops once, so the +pole's tensor is
+        #     still saved for backward when the -pole sets the next value --
+        #     mutating it in place trips autograd's version counter;
+        #   * outside `forward` because assigning a module attribute *inside* a
+        #     compiled region is a side effect dynamo refuses.
+        dev = self._delta_scale_device()
+        self._multiplier_tensor = (
+            None if dev is None else torch.tensor(self.multiplier, device=dev, dtype=torch.float32)
+        )
+
+    def _delta_scale_device(self) -> torch.device | None:
+        """The device the adapter's delta lands on, or None if not yet known."""
+        mod = self._orig_module[0] if self._orig_module else None
+        weight = getattr(mod, "weight", None)
+        return None if weight is None else weight.device
+
+    def _delta_scale(self, ref: Tensor) -> Tensor | float:
+        """The multiplier, in a form that is safe inside a compiled graph.
+
+        A **Python float that changes between calls** is not specialized by
+        dynamo -- it is lifted into a graph *input*, and a lifted Python float
+        arrives as a 0-dim ``float64`` tensor **on the CPU** (Python floats are
+        doubles and live on the host). Inductor then has to schedule that node
+        on its CPU backend, which on Windows shells out to MSVC and raises
+        ``Compiler: cl is not found`` -- and on a box that *has* a host compiler
+        it silently keeps a host-resident scalar in an otherwise-GPU graph, once
+        per adapted layer per step.
+
+        Sliders mutate the multiplier every step (0.0 / +s / -s / rest), so hold
+        it in a device tensor and fill it in place instead. ``1.0`` is returned
+        as a literal so the ordinary LoRA path -- where the multiplier is set
+        once and never moves -- keeps folding it away entirely.
+        """
+        if self.multiplier == 1.0:
+            return 1.0
+        t = self._multiplier_tensor
+        if t is None or t.device != ref.device:
+            # No cached tensor (module not hooked to a weight yet, or it moved
+            # device since). Fall back to the plain float: correct everywhere,
+            # and only the *compiled slider* path pays the CPU-scalar cost.
+            return self.multiplier
+        # `.to` matches what a Python float did -- `bf16 * 0.35` computes in
+        # bf16 rather than promoting -- and is a no-op when dtypes already agree.
+        return t.to(dtype=ref.dtype)
 
     def make_weight(self, A: Tensor, B: Tensor):
         """Layer-type-independent way of creating a weight matrix from LoRA A/B.
@@ -304,7 +354,7 @@ class LoHaModule(PeftBase):
                               self.dropout(self.hada_w1_a))
         W2 = self.make_weight(self.dropout(self.hada_w2_b),
                               self.dropout(self.hada_w2_a))
-        W = (W1 * W2) * (self.alpha / self.rank) * self.multiplier
+        W = (W1 * W2) * (self.alpha / self.rank) * self._delta_scale(W1)
         return self.op(x, W, bias=None, **self.layer_kwargs)
 
     def apply_to_module(self):
@@ -604,12 +654,13 @@ class LoKrModule(PeftBase):
                 )
 
                 # Reshape back to [Batch, ..., Out_Features]
-                delta_output = delta_output.reshape(*x_shape[:-1], -1) * scale * self.multiplier
+                delta_output = delta_output.reshape(*x_shape[:-1], -1) * scale * self._delta_scale(delta_output)
 
                 return self.orig_forward(x) + delta_output
             else:
                 # Fallback for Conv2d layers or when lokr_vec_trick is disabled
-                w = self.get_weight() * scale * self.multiplier
+                w0 = self.get_weight()
+                w = w0 * scale * self._delta_scale(w0)
                 return self.orig_forward(x) + self.op(x, w.to(x.dtype), bias=None, **self.layer_kwargs)
 
     def apply_to_module(self):
@@ -726,7 +777,7 @@ class LoRAModule(PeftBase):
     def delta_forward(self, x, *args, **kwargs) -> Tensor | None:
         self.check_initialized()
         ld = self.lora_up(self.dropout(self.lora_down(x)))
-        return ld * (self.alpha / self.rank) * self.multiplier
+        return ld * (self.alpha / self.rank) * self._delta_scale(ld)
 
     def apply_to_module(self):
         # TODO
