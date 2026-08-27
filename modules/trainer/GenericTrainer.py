@@ -31,6 +31,7 @@ from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import PeftType
 from modules.util.enum.PeftInitMode import PeftInitMode
+from modules.util.enum.SliderRegime import SliderRegime
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.grad_estimation import WeightGradientEstimator
@@ -811,7 +812,17 @@ class GenericTrainer(BaseTrainer):
                 # the adapter's own factors is healthy and in fact exactly 2x the
                 # asymmetric case, because there the multiplier's sign flips too.
                 # It is only GA's estimand that vanishes.
-                if config.slider_symmetric:
+                if config.slider_regime == SliderRegime.IMAGE:
+                    # A third reason, and the cancellation argument above is NOT it:
+                    # a coordinate slider fits one residual per real image, so its
+                    # base-weight gradient is an ordinary reconstruction gradient
+                    # and does not cancel at any coordinate spread (measured 1e+00
+                    # against the symmetric prompt-pair slider's 1e-07, in
+                    # test_a_coordinate_slider_has_a_real_base_weight_gradient).
+                    # There is something to align to here; it has simply never been
+                    # run, and saying otherwise would close off a real fast-follow.
+                    print("GA init: skipping, not wired up for coordinate image sliders yet.")
+                elif config.slider_symmetric:
                     print(
                         "GA init: skipping, a symmetric slider's base-weight gradient "
                         "cancels to zero -- there is no direction to align to."

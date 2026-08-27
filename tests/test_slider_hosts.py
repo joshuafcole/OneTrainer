@@ -343,18 +343,40 @@ class _FakeAnimaTransformer:
 
 
 class _FakeAnimaModel:
+    LATENT_SCALE = 3.0
+
     def __init__(self, in_channels=16):
         self.transformer = _FakeAnimaTransformer(in_channels)
         self.transformer_lora = _FakeWrapper()
         self.train_dtype = _FakeDataType()
         self.autocast_context = nullcontext()
         self.encoded = []
+        self.encode_calls = []
 
-    def encode_text(self, train_device=None, text=None):
-        # exactly the AnimaModel.encode_text keywords this host uses
-        self.encoded.append(text)
-        torch.manual_seed(abs(hash(text)) % (2 ** 31))
-        return torch.randn(1, 8, 4, requires_grad=True)
+    def encode_text(
+            self, train_device=None, batch_size=1, rand=None, text=None,
+            tokens=None, tokens_mask=None, t5_tokens=None, t5_tokens_mask=None,
+            text_encoder_output=None, text_encoder_dropout_probability=None,
+    ):
+        # exactly the AnimaModel.encode_text keywords the two hosts use between
+        # them -- prompt-pair passes `text`, the image regime passes the batch's
+        # cached tokens. A keyword renamed upstream is a TypeError here.
+        self.encode_calls.append({
+            "batch_size": batch_size, "tokens": tokens, "tokens_mask": tokens_mask,
+            "t5_tokens": t5_tokens, "t5_tokens_mask": t5_tokens_mask,
+            "text_encoder_output": text_encoder_output,
+            "text_encoder_dropout_probability": text_encoder_dropout_probability,
+        })
+        if text is not None:
+            self.encoded.append(text)
+            torch.manual_seed(abs(hash(text)) % (2 ** 31))
+            return torch.randn(1, 8, 4, requires_grad=True)
+        torch.manual_seed(5)
+        return torch.randn(batch_size, 8, 4, requires_grad=True)
+
+    def scale_latents(self, latents):
+        # a scale the tests can see, so "the host forgot to scale" is a failure
+        return latents * self.LATENT_SCALE
 
 
 class _FakeUnetOutput:
@@ -881,3 +903,214 @@ def test_the_ordinary_anima_loader_adds_nothing():
     check that it changed nothing for every other Anima training method."""
     loader = object.__new__(AnimaBaseDataLoader)
     assert loader._additional_split_names(_config(model_type=ModelType.ANIMA)) == []
+
+
+# ---------------------------------------------------------------------------
+# the IMAGE-regime step
+#
+# predict() is driven for real against a fake AnimaModel that records every call,
+# so what is asserted is the sequence of multipliers the host set, the tensors it
+# built, and the exact upstream API it called -- not values a test handed it.
+# ---------------------------------------------------------------------------
+
+def _image_config(coords_axis="distance", gain_k=1.0, **overrides):
+    values = {
+        "model_type": ModelType.ANIMA,
+        "slider_regime": SliderRegime.IMAGE,
+        "slider_axes": [_axis(coords_axis, gain_k=gain_k)],
+        "slider_sigma_min": 0.2,
+        "slider_sigma_max": 0.8,
+    }
+    values.update(overrides)
+    config = _config(**values)
+    # Anima builds no text-encoder adapter, so a slider run leaves this off and
+    # the text cache is live. (With it on, train_text_encoder_or_embedding()
+    # disables the cache and Qwen3 runs every step for nothing -- which is
+    # upstream's behaviour for an Anima LoRA too, and not this slice's to change.)
+    config.text_encoder.train = False
+    return config
+
+
+def _image_batch(coords, in_channels=16, latent_hw=8, seq=4):
+    n = len(coords)
+    torch.manual_seed(3)
+    return {
+        "latent_image": torch.randn(n, in_channels, 1, latent_hw, latent_hw),
+        "slider_coordinate": torch.tensor(coords, dtype=torch.float32).reshape(n, 1),
+        "tokens": torch.zeros(n, seq, dtype=torch.long),
+        "tokens_mask": torch.ones(n, seq, dtype=torch.long),
+        "t5_tokens": torch.zeros(n, seq, dtype=torch.long),
+        "t5_tokens_mask": torch.ones(n, seq, dtype=torch.long),
+        "text_encoder_hidden_state": torch.randn(n, 8, 4),
+    }
+
+
+def test_anima_image_predict_runs_the_coordinate_objective():
+    setup = _bare(AnimaSliderSetup)
+    model = _FakeAnimaModel()
+    batch = _image_batch([-2.0, 1.0])
+
+    data = setup.predict(model, batch, _image_config(), _Progress())
+    loss = setup.calculate_loss(model, batch, data, _image_config())
+    assert loss.ndim == 0 and torch.isfinite(loss) and loss.requires_grad
+
+    # one forward per distinct multiplier, then back to the resting multiplier.
+    # No frozen-base pass and no 0.0 anywhere: this objective has no base target.
+    assert model.transformer_lora.history == [-2.0, 1.0, 1.0]
+    assert len(model.transformer.calls) == 2
+
+    call = model.transformer.calls[0]
+    assert call["hidden_states"].shape == (1, 16, 1, 8, 8), "5D (B,C,T,H,W) latent"
+    assert call["padding_mask"].shape == (1, 1, 64, 64), "the padding mask is pixel-space"
+    assert call["timestep"].shape == (1,)
+
+
+def test_anima_image_step_groups_the_poles_into_one_forward_each():
+    """The binary-pole case, which is what an explicit image-pair regime would
+    have been: a batch of eight is two forwards, not eight."""
+    setup = _bare(AnimaSliderSetup)
+    model = _FakeAnimaModel()
+    batch = _image_batch([1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0])
+
+    setup.predict(model, batch, _image_config(), _Progress())
+
+    assert model.transformer_lora.history == [1.0, -1.0, 1.0]
+    assert len(model.transformer.calls) == 2
+    assert model.transformer.calls[0]["hidden_states"].shape[0] == 4
+    assert model.transformer.calls[1]["hidden_states"].shape[0] == 4
+
+
+def test_anima_image_applies_the_gain_at_step_time():
+    """gain_k lives outside the cache, so this is where it has to be read. The
+    coordinates are as authored; only the multiplier is scaled."""
+    setup = _bare(AnimaSliderSetup)
+    model = _FakeAnimaModel()
+    batch = _image_batch([-2.0, 2.0])
+
+    setup.predict(model, batch, _image_config(gain_k=0.25), _Progress())
+    assert model.transformer_lora.history == [-0.5, 0.5, 1.0]
+
+
+def test_anima_image_step_feeds_the_cached_conditioning_and_does_not_drop_it():
+    """Two things at once. The batch's cached conditioner output is passed
+    through (no live Qwen3 forward per step), and caption dropout is off -- this
+    regime rests on the caption explaining everything the axis does not, so
+    dropping it would leave the whole image as the residual for the adapter to
+    absorb."""
+    setup = _bare(AnimaSliderSetup)
+    model = _FakeAnimaModel()
+    batch = _image_batch([1.0, -1.0])
+
+    setup.predict(model, batch, _image_config(), _Progress())
+
+    assert len(model.encode_calls) == 1, "one encode for the whole batch"
+    call = model.encode_calls[0]
+    assert call["batch_size"] == 2
+    assert call["text_encoder_output"] is batch["text_encoder_hidden_state"]
+    assert call["tokens"] is batch["tokens"]
+    assert call["t5_tokens"] is batch["t5_tokens"]
+    assert call["text_encoder_dropout_probability"] is None
+
+
+def test_anima_image_x_t_is_the_real_image_latent_scaled():
+    """At sigma 0 the flow forward is the identity, so x_t must be exactly the
+    scaled latent. That pins two things a plausible-looking step gets wrong:
+    training on noise instead of the image, and forgetting that the dataloader
+    caches the UNSCALED VAE mean."""
+    setup = _bare(AnimaSliderSetup)
+    model = _FakeAnimaModel()
+    batch = _image_batch([1.0])
+    config = _image_config(slider_sigma_min=0.0, slider_sigma_max=0.0)
+
+    setup.predict(model, batch, config, _Progress())
+
+    x_t = model.transformer.calls[0]["hidden_states"]
+    assert torch.allclose(x_t, batch["latent_image"] * _FakeAnimaModel.LATENT_SCALE, atol=1e-6)
+    assert torch.allclose(model.transformer.calls[0]["timestep"], torch.zeros(1))
+
+
+def test_anima_image_draws_a_noise_level_per_image_not_per_batch():
+    """Rows are grouped by multiplier, so one sigma for the whole batch would tie
+    the noise level to the coordinate and let the adapter learn the wrong one."""
+    setup = _bare(AnimaSliderSetup)
+    model = _FakeAnimaModel()
+    setup.predict(model, _image_batch([1.0] * 6), _image_config(), _Progress())
+
+    timesteps = model.transformer.calls[0]["timestep"]
+    assert timesteps.shape == (6,)
+    assert len(set(timesteps.tolist())) == 6, f"all rows share a sigma: {timesteps}"
+    assert all(0.2 <= t <= 0.8 for t in timesteps.tolist())
+
+
+def test_anima_image_batch_with_no_coordinates_is_refused_by_name():
+    """End to end: the mistyped-axis case reaches the user as an error about the
+    axis name, not as a silently untrained run."""
+    setup = _bare(AnimaSliderSetup)
+    model = _FakeAnimaModel()
+    with pytest.raises(RuntimeError, match="axis name"):
+        setup.predict(model, _image_batch([0.0, 0.0]), _image_config(), _Progress())
+
+
+def test_the_image_regime_is_reached_only_from_its_own_regime():
+    """The prompt-pair step must not be handed an image batch, or vice versa: the
+    two read entirely different keys off it."""
+    setup = _bare(AnimaSliderSetup)
+    model = _FakeAnimaModel()
+    config = _slider_config(model_type=ModelType.ANIMA)
+    setup.predict(model, {}, config, _Progress())
+    assert model.transformer_lora.history[0] == 0.0, "prompt-pair still runs the frozen base"
+
+
+def test_setup_model_refuses_an_unusable_axis_set_before_building_the_adapter():
+    """Same bar as the PEFT-type check beside it: a config mistake should not cost
+    a model load and a dataset cache to discover."""
+    setup = _bare(AnimaSliderSetup)
+    config = _image_config()
+    config.slider_axes = [_axis("distance"), _axis("age")]
+
+    # model=None: reaching AnimaLoRASetup.setup_model at all would be an
+    # AttributeError, so a RuntimeError proves the refusal came first.
+    with pytest.raises(RuntimeError, match="Exactly one slider axis"):
+        setup.setup_model(model=None, config=config)
+
+
+class _Part:
+    def __init__(self):
+        self.mode = None
+
+    def eval(self):
+        self.mode = "eval"
+
+    def train(self):
+        self.mode = "train"
+
+
+class _ResidencyModel:
+    def __init__(self):
+        self.transformer = _Part()
+        self.text_encoder = _Part()
+        self.text_conditioner = _Part()
+        self.vae = _Part()
+        self.materialized = None
+
+    def materialize_only(self, *parts):
+        self.materialized = parts
+
+
+@pytest.mark.parametrize("regime,expected", [
+    (SliderRegime.PROMPT_PAIR, ("transformer", "text_encoder", "vae")),
+    (SliderRegime.IMAGE, ("transformer",)),
+])
+def test_the_image_regime_keeps_the_ordinary_lora_residency(regime, expected):
+    """Not cosmetic: a prompt-pair slider has to keep Qwen3 resident because it
+    encodes its prompts live, and pinning that on a coordinate slider -- which
+    caches its text like any dataset run -- would hold a text encoder and a VAE on
+    the train device for a whole run that never calls them."""
+    setup = _bare(AnimaSliderSetup)
+    model = _ResidencyModel()
+    config = _image_config(slider_regime=regime, latent_caching=True)
+    config.transformer.train = True
+    config.text_encoder.train = False
+
+    setup.setup_train_device(model, config)
+    assert model.materialized == expected

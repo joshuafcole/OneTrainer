@@ -1,4 +1,4 @@
-"""Prompt-pair Concept-Sliders training for Anima.
+"""Concept-Sliders training for Anima, in both regimes.
 
 A slider is a plain LoRA/LoKr adapter whose signed multiplier is the control
 knob, so this reuses AnimaLoRASetup's adapter construction wholesale and replaces
@@ -12,9 +12,14 @@ so predict() generates an on-manifold x_t by partial flow-matching denoising
 under the neutral target conditioning, then hands the multi-forward orchestration
 to ModelSetupSliderMixin.
 
-predict() returns the loss directly: the objective needs several forwards with
-the adapter toggled, which does not fit the single-forward predict/calculate_loss
-split. calculate_loss just unwraps it.
+The IMAGE regime is the other half of this file. There the dataset is real, so
+there is nothing to generate: each image already has an x_t, a flow target, and
+-- from its caption -- a coordinate that says which multiplier the adapter must
+reconstruct it at. See _predict_coordinate.
+
+predict() returns the loss directly in both regimes: the objective needs several
+forwards with the adapter toggled, which does not fit the single-forward
+predict/calculate_loss split. calculate_loss just unwraps it.
 """
 
 from random import Random
@@ -29,6 +34,7 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.SliderRegime import SliderRegime
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.slider_caption_util import resolve_target_axis
 from modules.util.slider_util import alias_lora_persistence_to_slider
 from modules.util.TrainProgress import TrainProgress
 
@@ -60,6 +66,12 @@ class AnimaSliderSetup(
         # PEFT type has a multiplier to slide -- setup_model is the first per-run
         # hook a setup gets, so this is as early as the check can land.
         self._check_slider_peft_type(config)
+        if config.slider_regime == SliderRegime.IMAGE:
+            # Same argument as the PEFT check above: an unusable axis set is a
+            # config mistake, and discovering it at the first step means paying for
+            # a model load and a dataset cache to be told the axis name is blank.
+            # (The data loader resolves the axes too, and either may run first.)
+            resolve_target_axis(config.slider_axes)
         super().setup_model(model, config)
 
     def setup_train_device(
@@ -67,6 +79,13 @@ class AnimaSliderSetup(
             model: AnimaModel,
             config: TrainConfig,
     ):
+        if config.slider_regime == SliderRegime.IMAGE:
+            # A real dataset, cached the ordinary way, so the ordinary LoRA
+            # residency rules apply -- including evicting the text encoder once
+            # the text cache is built, which the branch below cannot do.
+            super().setup_train_device(model, config)
+            return
+
         # A prompt-pair slider encodes its prompts live (then caches them in
         # process), so the text encoder must be resident regardless of the
         # latent_caching flag -- unlike AnimaLoRASetup, which can evict it once the
@@ -136,6 +155,8 @@ class AnimaSliderSetup(
         *,
         deterministic: bool = False,
     ) -> dict:
+        if config.slider_regime == SliderRegime.IMAGE:
+            return self._predict_coordinate(model, batch, config, train_progress, deterministic)
         if config.slider_regime != SliderRegime.PROMPT_PAIR:
             raise NotImplementedError(f"slider regime {config.slider_regime} is not implemented")
 
@@ -192,6 +213,114 @@ class AnimaSliderSetup(
                 strength=float(config.slider_strength),
                 symmetric=bool(config.slider_symmetric),
             )
+
+        return {"loss": loss}
+
+    # ---- coordinate-labeled image step --------------------------------------
+
+    @staticmethod
+    def _make_flow_target(x0: Tensor, sigma: float, dtype, gen) -> tuple[Tensor, Tensor]:
+        """One rectified-flow sample: x_t = (1-sigma)*x0 + sigma*noise, target
+        velocity noise - x0. The same forward BaseAnimaSetup trains against, at a
+        continuous sigma instead of a scheduler timestep.
+
+        Plain Gaussian noise, deliberately: offset noise and the other noising
+        knobs perturb the target, and here the target is the supervision itself.
+        The prompt-pair path is plain for the same reason.
+        """
+        noise = torch.randn(x0.shape, generator=gen).to(device=x0.device, dtype=x0.dtype)
+        x_t = ((1.0 - sigma) * x0 + sigma * noise).to(dtype=dtype)
+        return x_t, (noise - x0).detach().to(dtype=dtype)
+
+    def _predict_coordinate(
+        self,
+        model: AnimaModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        deterministic: bool,
+    ) -> dict:
+        """The IMAGE-regime step: reconstruct each image at the multiplier its
+        caption asked for.
+
+        No frozen-base pass and no eta, unlike the prompt-pair step. There the
+        base has to invent a target because there is no image; here the image IS
+        the target. What makes it a slider rather than a fine-tune is that the
+        multiplier varies per row: the adapter can only satisfy every coordinate
+        at once by having an effect that scales with the multiplier, which is
+        exactly the knob the user turns afterwards.
+        """
+        gain = float(resolve_target_axis(config.slider_axes).gain_k)
+        wrapper = model.transformer_lora
+        dtype = model.train_dtype.torch_dtype()
+
+        with model.autocast_context:
+            seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
+            rand = Random(seed)
+            gen = torch.Generator(device="cpu").manual_seed(seed)
+
+            latent_image = batch["latent_image"]
+            batch_size = latent_image.shape[0]
+
+            encoder_hidden_states = model.encode_text(
+                train_device=self.train_device,
+                batch_size=batch_size,
+                rand=rand,
+                tokens=batch.get("tokens"),
+                tokens_mask=batch.get("tokens_mask"),
+                t5_tokens=batch.get("t5_tokens"),
+                t5_tokens_mask=batch.get("t5_tokens_mask"),
+                text_encoder_output=batch["text_encoder_hidden_state"]
+                if "text_encoder_hidden_state" in batch and not config.train_text_encoder_or_embedding()
+                else None,
+                # No caption dropout, unlike the ordinary Anima step, and this is
+                # not an oversight. The regime rests on the caption describing
+                # everything about the image EXCEPT the axis, which is what leaves
+                # the axis as the only residual for the adapter to fit. Drop the
+                # caption and the residual becomes the whole image, and the adapter
+                # starts absorbing content unconditionally.
+                text_encoder_dropout_probability=None,
+            )
+
+            # The dataloader caches the unscaled VAE mean; scaling at step time is
+            # what BaseAnimaSetup does, and keeps the cache independent of it.
+            scaled = model.scale_latents(latent_image)
+
+            # gain applied here, not in the loader, so retuning it does not
+            # invalidate the latent cache.
+            multipliers = [gain * float(c) for c in batch["slider_coordinate"].reshape(-1).tolist()]
+
+            padding_mask = scaled.new_zeros(
+                1, 1,
+                scaled.shape[-2] * VAE_SCALE_FACTOR,
+                scaled.shape[-1] * VAE_SCALE_FACTOR,
+            ).to(dtype=dtype)
+
+            # One noise level per image, not one per batch: rows are grouped by
+            # multiplier below, so a shared sigma would correlate the noise level
+            # with the coordinate and the adapter could learn the wrong one of the
+            # two.
+            x_ts, targets, sigmas = [], [], []
+            for i in range(batch_size):
+                sigma = self._slider_sample_noise_level(config, rand)
+                x_t, target = self._make_flow_target(scaled[i:i + 1], sigma, dtype, gen)
+                x_ts.append(x_t)
+                targets.append(target)
+                sigmas.append(sigma)
+
+            def run_velocity(indices) -> Tensor:
+                return model.transformer(
+                    hidden_states=torch.cat([x_ts[i] for i in indices], dim=0),
+                    timestep=torch.tensor(
+                        [sigmas[i] for i in indices], device=self.train_device, dtype=dtype),
+                    encoder_hidden_states=torch.cat(
+                        [encoder_hidden_states[i:i + 1] for i in indices], dim=0).to(dtype=dtype),
+                    padding_mask=padding_mask,
+                    return_dict=False,
+                )[0]
+
+            loss = self._slider_coordinate_loss(
+                run_velocity, wrapper.set_multiplier, targets, multipliers)
 
         return {"loss": loss}
 
