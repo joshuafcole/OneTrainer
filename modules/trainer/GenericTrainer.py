@@ -42,6 +42,8 @@ from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
+from mgds.perf_probe import perf
+
 import torch
 from torch import Tensor, nn
 from torch.nn import Parameter
@@ -56,6 +58,40 @@ from tqdm import tqdm
 _DEBUG_PROFILES = os.environ.get("OT_DEBUG_PROFILES") == "1"
 _MEMORY_PROFILE_STEPS = (0, 1) if _DEBUG_PROFILES else ()
 _PROFILE_STEPS = (10, 11, 40, 41) if _DEBUG_PROFILES else ()
+
+
+def _latent_tokens(batch: dict) -> int | None:
+    """Latent spatial token count (h_lat * w_lat) for this step's batch.
+
+    This is the sequence length the transformer's self-attention sees, so it is the
+    x-axis of every resolution-scaling question OT_PERF exists to answer: a step row
+    is only comparable to another step row at the same token count. Best-effort --
+    None when the batch carries no recognisable latent, which costs the row nothing
+    but its bucketing.
+    """
+    latent = batch.get("latent_image") if isinstance(batch, dict) else None
+    if latent is None or getattr(latent, "ndim", 0) < 2:
+        return None
+    return int(latent.shape[-2]) * int(latent.shape[-1])
+
+
+def _profile_enabled(global_step: int, batch: dict) -> bool:
+    """Whether this step should capture a chrome trace.
+
+    OT_DEBUG_PROFILES keeps its fixed step list untouched. OT_PERF adds a second,
+    independent trigger (OT_PROFILE_STEP / OT_PROFILE_MIN_TOKENS) that latches on the
+    first step whose latent token count reaches a threshold -- because a
+    VRAM-saturating high-res run can be ~0.01 it/s, where waiting for a fixed late
+    step index is hours and the step you want is not the step you can name up front.
+
+    The probe is only consulted behind ``perf.enabled``: with OT_PERF unset this is a
+    tuple membership test and an attribute load, and nothing else.
+    """
+    if global_step in _PROFILE_STEPS:
+        return True
+    if perf.enabled:
+        return perf.should_profile(global_step, tokens=_latent_tokens(batch))
+    return False
 
 
 class GenericTrainer(BaseTrainer):
@@ -1050,9 +1086,18 @@ class GenericTrainer(BaseTrainer):
 
                 self.callbacks.on_update_status("Training ...")
 
+                # Every perf hook is guarded at the *call site*, not inside the probe.
+                # Python evaluates arguments eagerly, so an unguarded call pays for its
+                # arguments even when the probe returns immediately; guarding here makes
+                # the disabled path one attribute load per site.
+                if perf.enabled:
+                    perf.step_begin(train_progress.global_step)
+                    perf.note("latent_tokens", _latent_tokens(batch))
+                    perf.note("batch_size", self.config.batch_size)
+
                 with (
                     TorchMemoryRecorder(enabled=multi.is_master() and train_progress.global_step in _MEMORY_PROFILE_STEPS, filename=f"memory-step{train_progress.global_step}-{get_string_timestamp()}.pickle"),
-                    TorchProfiler      (enabled=multi.is_master() and train_progress.global_step in _PROFILE_STEPS, filename=f"profile-step{train_progress.global_step}-{get_string_timestamp()}.json"),
+                    TorchProfiler      (enabled=multi.is_master() and _profile_enabled(train_progress.global_step, batch), filename=f"profile-step{train_progress.global_step}-{get_string_timestamp()}.json"),
                 ):
                     step_seed = train_progress.global_step
                     bf16_stochastic_rounding_set_seed(step_seed, train_device)
@@ -1070,11 +1115,18 @@ class GenericTrainer(BaseTrainer):
                             or (self.config.masked_training
                                 and self.config.masked_prior_preservation_weight > 0
                                 and self.config.training_method == TrainingMethod.LORA):
+                        if perf.enabled:
+                            perf.tic("prior_predict")
                         with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
                             #do NOT create a subbatch using the indices, even though it would be more efficient:
                             #different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
                             prior_model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                        if perf.enabled:
+                            perf.toc("prior_predict")
+                            perf.tic("predict")
                         model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                        if perf.enabled:
+                            perf.toc("predict")
                         prior_model_prediction = prior_model_output_data['predicted'].to(dtype=model_output_data['target'].dtype)
                         model_output_data['target'][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
                         model_output_data['prior_target'] = prior_model_prediction
@@ -1084,15 +1136,23 @@ class GenericTrainer(BaseTrainer):
                         model_output_data['counterexample_step'] = train_progress.global_step
                         model_output_data['counterexample_total_steps'] = counterexample_total_steps
                     else:
+                        if perf.enabled:
+                            perf.tic("predict")
                         model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                        if perf.enabled:
+                            perf.toc("predict")
 
                     loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
 
                     loss = loss / self.config.gradient_accumulation_steps
+                    if perf.enabled:
+                        perf.tic("backward")
                     if scaler:
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    if perf.enabled:
+                        perf.toc("backward")
 
                     has_gradient = True
                     detached_loss = loss.detach()
@@ -1105,6 +1165,8 @@ class GenericTrainer(BaseTrainer):
                         # window's rows into the next.
                         window = counterexample_telemetry.take()
                         counterexample = window.stats
+                        if perf.enabled:
+                            perf.tic("optimizer")
                         if self.config.fused_gradient_reduce:
                             multi.finish_async(self.config.gradient_reduce_precision)
                         else:
@@ -1127,6 +1189,8 @@ class GenericTrainer(BaseTrainer):
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
                         self.model.optimizer.zero_grad(set_to_none=True)
                         has_gradient = False
+                        if perf.enabled:
+                            perf.toc("optimizer")
 
                         if multi.is_master():
                             self.model_setup.report_to_tensorboard(
@@ -1197,6 +1261,9 @@ class GenericTrainer(BaseTrainer):
                             )
 
                         self.one_step_trained = True
+
+                if perf.enabled:
+                    perf.step_end()
 
                 if self.config.validation and multi.is_master():
                     self.__validate(train_progress)
