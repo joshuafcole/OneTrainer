@@ -193,6 +193,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 from modules.util.lokr_utils import make_kron, rebuild_tucker  # noqa: E402
 
+# Sibling module: the same directory the block_* scripts put at the head of sys.path before importing this
+# one. Added here too so ``lora_soup`` is importable on its own (454's greedy walk does exactly that).
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+import lora_namespace  # noqa: E402
+
 DOWN_SUFFIX = ".lora_down.weight"
 UP_SUFFIX = ".lora_up.weight"
 ALPHA_SUFFIX = ".alpha"
@@ -787,6 +795,15 @@ def load_lora(
         header = dict(f.metadata() or {})
         for key in f.keys():  # noqa: SIM118 -- safe_open is not a Mapping
             tensors[key] = f.get_tensor(key)
+
+    # Bring the file to the canonical namespace BEFORE anything reads a key. A layer is identified here by
+    # its key prefix, and which prefix (and which value suffix) a save carries is a choice the training
+    # config made -- so without this, two saves of the same run in two output formats are two unrelated
+    # adapters, and a merge or a Gram over them is a comparison of nothing.
+    try:
+        tensors = lora_namespace.canonicalize(tensors, header, path)
+    except lora_namespace.NamespaceError as exc:
+        raise SoupError(str(exc)) from exc
 
     layers: dict[str, AdapterLayer] = {}
     bundle: dict[str, Tensor] = {}

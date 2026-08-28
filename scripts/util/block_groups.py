@@ -66,6 +66,13 @@ from pathlib import Path
 
 from safetensors import safe_open
 
+# Sibling module: the namespace canonicalization every reader of an on-disk adapter has to go through.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+import lora_namespace  # noqa: E402
+
 DOWN_SUFFIX = ".lora_down.weight"
 UP_SUFFIX = ".lora_up.weight"
 ALPHA_SUFFIX = ".alpha"
@@ -319,9 +326,20 @@ def _layer_prefixes_from_keys(keys: Iterable[str]) -> list[str]:
 
 def read_layer_prefixes(path: str | Path) -> list[str]:
     """The layer-prefix set of a ``.safetensors`` LoRA/LoKr file, read from its
-    key set only -- ``safe_open`` never materializes a tensor for this."""
+    key set only -- ``safe_open`` never materializes a tensor for this.
+
+    Canonicalized first: the taxonomy this module fits is written in the
+    canonical namespace (``block_prefix``, and every naming rule in
+    ``block_groups.json``), so a file saved in one of the other output formats
+    has to be spelled that way before its prefixes mean anything here. Names
+    only -- no tensor is read to do it."""
     with safe_open(str(path), framework="pt") as f:
-        return _layer_prefixes_from_keys(f.keys())  # noqa: SIM118 -- safe_open is not a Mapping
+        keys = lora_namespace.canonicalize_keys(
+            f.keys(),  # noqa: SIM118 -- safe_open is not a Mapping
+            dict(f.metadata() or {}),
+            path,
+        )
+    return _layer_prefixes_from_keys(keys)
 
 
 def _print_report(fitted: FittedGroups) -> None:
