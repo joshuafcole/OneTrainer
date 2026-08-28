@@ -291,3 +291,60 @@ class TestNativizeWritesWhatTheSaverWouldHaveWritten:
         with pytest.raises(lora_namespace.NamespaceError, match="kohya"):
             lora_namespace.nativize(state, ANIMA_HEADER, "<kohya>")
 
+
+
+class TestTheOfflineModelDeclaresWhatItCannotLoad:
+    """The gate this family reads its tables through.
+
+    ``lora_text_encoders`` is documented as the model's only LoRA-namespace
+    declaration, and every implementation of it gates on the live module being
+    loaded -- right for a loader, wrong for a weightless model built to be read
+    as a declaration. The consequence is not cosmetic: ``lora_original_conversion``
+    appends the ``bundle_emb`` passthrough only for a model that declares a text
+    encoder and runs strict, so a model that declares none refuses a file the
+    saver itself wrote. No model reachable from ``ARCHITECTURE_MODELS`` declares
+    a text encoder yet, so what is checked here is the mechanism.
+    """
+
+    class _Model:
+        """The attribute shapes a model uses, and the neighbours that merely look like them."""
+
+        def __init__(self):
+            self.text_encoder = None
+            self.text_encoder_1 = None
+            self.text_encoder_2 = "already loaded"
+            self.text_encoder_3 = None
+            self.text_encoder_embedding = None
+            self.text_encoder_train_dtype = None
+            self.text_encoder_offload_conductor = None
+            self.transformer = None
+
+    def test_every_unloaded_text_encoder_is_declared(self):
+        model = lora_namespace._declare_text_encoders(self._Model())
+        declared = [n for n in vars(model)
+                    if isinstance(getattr(model, n), lora_namespace._DeclaredTextEncoder)]
+        assert sorted(declared) == ["text_encoder", "text_encoder_1", "text_encoder_3"]
+
+    def test_a_loaded_encoder_is_left_as_it_was(self):
+        model = lora_namespace._declare_text_encoders(self._Model())
+        assert model.text_encoder_2 == "already loaded"
+
+    def test_a_neighbour_that_starts_the_same_way_is_not_an_encoder(self):
+        # ``text_encoder_embedding`` / ``_train_dtype`` / ``_offload_conductor``
+        # are not encoders; the anchored pattern is the only thing keeping them
+        # out, and a model attribute quietly replaced by a marker is a worse bug
+        # than the one this fixes.
+        model = lora_namespace._declare_text_encoders(self._Model())
+        assert model.text_encoder_embedding is None
+        assert model.text_encoder_train_dtype is None
+        assert model.text_encoder_offload_conductor is None
+        assert model.transformer is None
+
+    def test_the_model_this_family_builds_comes_back_declared(self):
+        model = lora_namespace._model_for(ANIMA_HEADER, "<probe>")
+        assert isinstance(model.text_encoder, lora_namespace._DeclaredTextEncoder)
+
+    def test_the_marker_says_what_it_is(self):
+        # It travels out through ``lora_text_encoders()`` as the "live module"
+        # half of a declaration; anything that prints one should say so.
+        assert "not loaded" in repr(lora_namespace._DeclaredTextEncoder())
