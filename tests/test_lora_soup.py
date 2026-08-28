@@ -1246,3 +1246,102 @@ def test_input_block_scale_specs_parse(spec, expected):
 def test_malformed_input_block_scale_specs_are_refused(spec):
     with pytest.raises(SoupError):
         lora_soup.parse_input_block_scale(spec)
+
+
+# --- --scale-file: the same scales, without the command-line ceiling ---------
+#
+# A fitted group's patterns are its member prefixes, one per layer. So a
+# coefficient on one coarse group is ~36 arguments and a per-input grid
+# multiplies that by the inputs; three adapters over six groups is ~52 KB of
+# command line against Windows' 32,767-character limit. The file route exists so
+# the natural use of that grid does not fail at spawn. What these pin is that it
+# is the *same* scales — a file and the equivalent flags must be one merge.
+
+def _scale_file(tmp_path, payload, name="scales.json"):
+    path = tmp_path / name
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_a_scale_file_parses_both_kinds(tmp_path):
+    path = _scale_file(tmp_path, {
+        "block_scales": [{"pattern": "*attn1*", "coefficient": 0.5}],
+        "input_block_scales": [
+            {"save_index": 1, "pattern": "*attn2*", "coefficient": 0.25},
+        ],
+    })
+    block_scales, indexed = lora_soup.parse_scale_file(path)
+
+    assert block_scales == [("*attn1*", 0.5)]
+    assert indexed == [(1, "*attn2*", 0.25)]
+
+
+def test_either_key_may_be_absent(tmp_path):
+    """A caller sending only a uniform table should not have to send an empty
+    grid to say it has no grid."""
+    assert lora_soup.parse_scale_file(_scale_file(tmp_path, {})) == ([], [])
+    only_flat = _scale_file(tmp_path, {"block_scales": [{"pattern": "*", "coefficient": 2.0}]})
+    assert lora_soup.parse_scale_file(only_flat) == ([("*", 2.0)], [])
+
+
+def test_a_pattern_may_hold_the_characters_the_grammar_reserves(tmp_path):
+    """``PATTERN=COEFF`` splits on ``=`` and ``INDEX:PATTERN=COEFF`` on ``:``, so
+    neither can appear in a pattern passed as an argument. The file has no
+    grammar, and this is the one behaviour it does not merely scale up."""
+    path = _scale_file(tmp_path, {
+        "block_scales": [{"pattern": "*a=b:c*", "coefficient": 0.5}],
+    })
+    assert lora_soup.parse_scale_file(path) == ([("*a=b:c*", 0.5)], [])
+
+
+def test_a_misspelled_key_is_refused_rather_than_ignored(tmp_path):
+    """The failure this prevents: a table of coefficients that silently did
+    nothing, on a merge that reported success."""
+    path = _scale_file(tmp_path, {"blockScales": [{"pattern": "*", "coefficient": 0.5}]})
+    with pytest.raises(lora_soup.SoupError, match="unknown key"):
+        lora_soup.parse_scale_file(path)
+
+
+@pytest.mark.parametrize("entry,expected", [
+    ({"coefficient": 0.5}, "no 'pattern'"),
+    ({"pattern": "", "coefficient": 0.5}, "no 'pattern'"),
+    ({"pattern": "*"}, "not a number"),
+    ({"pattern": "*", "coefficient": "0.5"}, "not a number"),
+    ({"pattern": "*", "coefficient": True}, "not a number"),
+])
+def test_a_malformed_entry_names_its_index(tmp_path, entry, expected):
+    """``bool`` is an ``int`` in Python, so ``true`` would read as a coefficient
+    of 1.0 — a no-op scale the caller believes it set."""
+    path = _scale_file(tmp_path, {"block_scales": [entry]})
+    with pytest.raises(lora_soup.SoupError, match=expected):
+        lora_soup.parse_scale_file(path)
+
+
+def test_a_save_index_must_be_an_integer(tmp_path):
+    path = _scale_file(tmp_path, {
+        "input_block_scales": [{"save_index": 1.5, "pattern": "*", "coefficient": 0.5}],
+    })
+    with pytest.raises(lora_soup.SoupError, match="'save_index' is not an integer"):
+        lora_soup.parse_scale_file(path)
+
+
+def test_a_file_and_the_equivalent_flags_produce_the_same_merge(tmp_path):
+    """The property the whole route rests on. If these ever diverge, a UI that
+    sent a file would be running a different experiment than the same table
+    typed by hand."""
+    pa, pb = _two_input_files(tmp_path)
+    by_flag, _ = _merged(tmp_path, [(pa, 1.0), (pb, 1.0)], rank=4,
+                         block_scales=[(_P, 3.0)], input_block_scales=[[(_P, 0.5)], []])
+
+    path = _scale_file(tmp_path, {
+        "block_scales": [{"pattern": _P, "coefficient": 3.0}],
+        "input_block_scales": [{"save_index": 0, "pattern": _P, "coefficient": 0.5}],
+    })
+    flat, indexed = lora_soup.parse_scale_file(path)
+    per_input = [[] for _ in range(2)]
+    for index, pattern, coefficient in indexed:
+        per_input[index].append((pattern, coefficient))
+    by_file, _ = _merged(tmp_path, [(pa, 1.0), (pb, 1.0)], rank=4,
+                         block_scales=flat, input_block_scales=per_input)
+
+    assert rel_err(delta_of(by_file, _P), delta_of(by_flag, _P)) < FP32_REL_TOL

@@ -5,6 +5,13 @@ in a payload small enough to leave the machine: twelve numbers instead of a few
 hundred megabytes. That asymmetry is the point — the weights stay on the box
 that trained them and only the summary travels.
 
+Each group also carries the ``--block-scale`` patterns that select it, so a
+reader of the summary can *act* on a group without re-deriving how to address
+it. That is the group's membership spelled out, one escaped prefix per layer,
+and it is the largest thing here: a 224-layer adapter ships ~224 patterns. Still
+four orders of magnitude under the weights, and it is what lets a caller that
+has never seen this architecture scale a coordinate it only just learned about.
+
 It is deliberately a *reader*, not a merger. It composes what already exists:
 ``lora_soup.load_lora`` (which understands LoRA and LoKr alike, and refuses
 anything without a closed-form additive delta) and ``block_groups.fit`` (which
@@ -88,6 +95,15 @@ def summarize(
             "frobenius_norm": sq ** 0.5,
             # Of *squared* norm: energy is what is additive over disjoint layers.
             "share": (sq / total) if total > 0 else 0.0,
+            # What makes the group actuatable rather than merely readable: the
+            # exact ``--block-scale`` patterns that select these members and
+            # nothing else. Emitted rather than left to the caller because the
+            # fit is what knows the membership -- a consumer that rebuilt a glob
+            # from ``band``/``part`` would be re-deriving the taxonomy this
+            # module exists to stop deriving, and a pattern that looks right
+            # while selecting the wrong layers is the whole failure mode
+            # (``FittedGroups.patterns_for``).
+            "patterns": fitted.patterns_for(group),
         })
 
     return {
