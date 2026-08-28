@@ -67,6 +67,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from modules.util.convert_lora_util import (  # noqa: E402
+    convert_lora_suffix_ab,
+    lora_original_conversion,
+)
+from modules.util.convert_util import convert  # noqa: E402
 from modules.util.enum.ModelFormat import ModelFormat  # noqa: E402
 from modules.util.enum.ModelType import ModelType  # noqa: E402
 from modules.util.load_lora_util import (  # noqa: E402
@@ -218,6 +223,61 @@ def canonicalize(
     if found == "comfy":
         return reverse_comfy(state_dict, *_comfy_arguments(_model_for(header, source)))
     raise _refuse("kohya-flattened" if found == "kohya_flat" else "an unrecognized", source)
+
+
+def nativize(
+        state_dict: dict[str, Tensor],
+        header: dict[str, str],
+        source: Path | str,
+) -> dict[str, Tensor]:
+    """``state_dict`` in the COMFY namespace, whatever it arrived in.
+
+    :func:`canonicalize`'s mirror image, and the reason it can be written at all
+    is that the tables are declarations: ``lora_diffusers_to_comfy`` and
+    ``lora_text_encoders`` are the same two the saver reads, so running them
+    forward here reproduces ``LoRASaverMixin._save_comfy`` rather than
+    re-deriving it. A conversion that re-derived the table would be a second
+    naming authority, and the first thing it would do is drift.
+
+    This exists because a save in DIFFUSERS naming is not loadable by ComfyUI,
+    and until now the only thing that could fix one was a fork-only script that
+    upstream #1563 deleted when it made the output format selectable. The
+    documented replacement -- ``scripts/convert_model.py --output-model-format
+    COMFY_LORA`` -- loads the *base model* to do it, which for a pure key rename
+    means finding a base path on the box, several GB of I/O and a GPU. The names
+    are the whole job; nothing here reads a weight.
+
+    Refuses on the same condition the saver refuses on: a trained text encoder
+    with no Comfy-native name would be **silently dropped** by ComfyUI on load,
+    and half a LoRA that loads without error is worse than one that does not.
+    """
+    state_dict = canonicalize(state_dict, header, source)
+    model = _model_for(header, source)
+    component = model.model_type.denoising_model_part()
+
+    state_dict = convert(
+        state_dict, lora_original_conversion(model, model.lora_diffusers_to_comfy()), strict=True
+    )
+    te_prefixes = {
+        names[ModelFormat.DIFFUSERS_LORA]: names[ModelFormat.COMFY_LORA]
+        for _module, names in model.lora_text_encoders()
+        if ModelFormat.COMFY_LORA in names
+    }
+    present = {key.split(".", 1)[0] for key in state_dict} - {component} - PASSTHROUGH_SEGMENTS
+    missing = present - te_prefixes.keys()
+    if missing:
+        raise NamespaceError(
+            f"{source}: the COMFY namespace has no Comfy-native text-encoder name for "
+            f"{', '.join(sorted(missing))} on this model, so ComfyUI would drop those keys on "
+            "load without saying so. Refusing to write a half-readable adapter."
+        )
+    # The denoising component takes Comfy's prefix; the text encoders take their
+    # own; ``bundle_emb.`` passes through. strict=False on both, for that reason.
+    state_dict = convert(state_dict, [(component, COMFY_PREFIX.rstrip("."))], strict=False)
+    if te_prefixes:
+        state_dict = convert(state_dict, list(te_prefixes.items()), strict=False)
+    # COMFY's value suffix is lora_A/lora_B, and it honours alpha and dora_scale.
+    return convert_lora_suffix_ab(state_dict, peft_convention=False)
 
 
 def canonicalize_keys(

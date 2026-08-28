@@ -220,3 +220,74 @@ class TestTheKeyOnlyPathAgreesWithTheTensorPath:
         for name, state in (("lora", lora_state(canonical_prefixes())), ("lokr", lokr_state(canonical_prefixes()))):
             path = write(tmp_path, f"{name}.safetensors", as_comfy(state))
             assert block_groups.read_layer_prefixes(path) == sorted(lora_soup.load_lora(path, 1.0).layers)
+
+
+class TestNativizeWritesWhatTheSaverWouldHaveWritten:
+    """The forward direction, checked against the saver rather than against
+    itself.
+
+    ``as_comfy`` is built from ``AnimaModel``'s own tables through
+    ``LoRASaverMixin._save_comfy``'s steps, so agreeing with it is the only
+    claim worth making: a nativize that agreed only with ``canonicalize`` would
+    be self-consistent and could still be writing names ComfyUI has never seen.
+    """
+
+    def test_a_diffusers_lora_becomes_exactly_the_comfy_save(self):
+        src = lora_state(canonical_prefixes(), seed=3)
+        mine = lora_namespace.nativize(dict(src), ANIMA_HEADER, "<lora>")
+        theirs = as_comfy(dict(src))
+        assert set(mine) == set(theirs)
+        for key in mine:
+            assert torch.allclose(mine[key], theirs[key], atol=1e-5)
+
+    def test_a_lokr_too(self):
+        # LoKr is the case a suffix-only conversion silently gets wrong: its
+        # factors have no ``lora_up`` sibling, so the A/B rename never fires on
+        # them and only the *namespace* half of the work is visible.
+        src = lokr_state(canonical_prefixes(), seed=4)
+        mine = lora_namespace.nativize(dict(src), ANIMA_HEADER, "<lokr>")
+        theirs = as_comfy(dict(src))
+        assert set(mine) == set(theirs)
+        for key in mine:
+            assert torch.allclose(mine[key], theirs[key], atol=1e-5)
+
+    def test_every_denoising_key_carries_the_prefix_comfy_matches(self):
+        # The whole point of the conversion: ComfyUI matches by name, and a file
+        # whose keys it cannot match loads zero of them without erroring.
+        out = lora_namespace.nativize(
+            lora_state(canonical_prefixes()), ANIMA_HEADER, "<lora>"
+        )
+        assert out
+        assert all(key.startswith("diffusion_model.") for key in out)
+        assert not any("transformer_blocks." in key for key in out)
+
+    def test_nativize_then_canonicalize_is_the_identity_on_names_and_values(self):
+        src = lora_state(canonical_prefixes(), seed=5)
+        native = lora_namespace.nativize(dict(src), ANIMA_HEADER, "<lora>")
+        there_and_back = lora_namespace.canonicalize(dict(native), ANIMA_HEADER, "<lora>")
+        straight = lora_namespace.canonicalize(dict(src), ANIMA_HEADER, "<lora>")
+        assert set(there_and_back) == set(straight)
+        for key in straight:
+            assert torch.allclose(there_and_back[key], straight[key], atol=1e-5)
+
+    def test_a_file_already_native_survives_a_second_pass(self):
+        # The failure the fork converter had: it prefixed an already-native key a
+        # second time (``diffusion_model.diffusion_model.blocks.…``), matched
+        # nothing, and exited 0. Going through canonical first is what makes this
+        # idempotent rather than merely lucky.
+        native = as_comfy(lora_state(canonical_prefixes(), seed=6))
+        again = lora_namespace.nativize(dict(native), ANIMA_HEADER, "<lora>")
+        assert set(again) == set(native)
+        assert not any(key.startswith("diffusion_model.diffusion_model.") for key in again)
+
+    def test_a_header_that_names_no_model_is_refused_by_name(self):
+        with pytest.raises(lora_namespace.NamespaceError, match="which model it was trained for"):
+            lora_namespace.nativize(
+                lora_state(canonical_prefixes()), {}, "<no header>"
+            )
+
+    def test_a_kohya_file_is_refused_rather_than_guessed_at(self):
+        state = {"lora_unet_blocks_0_attn_q.lora_down.weight": torch.zeros(2, 2)}
+        with pytest.raises(lora_namespace.NamespaceError, match="kohya"):
+            lora_namespace.nativize(state, ANIMA_HEADER, "<kohya>")
+

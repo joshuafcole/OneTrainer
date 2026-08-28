@@ -1,2 +1,13 @@
-# per-machine last-session state, regenerated every run, never meant to be shared
+# Built-in presets are the `#`-prefixed ones, and those are tracked. Everything
+# else this directory holds is the user's own: `TopBarController.save_to_file`
+# writes a saved preset straight in here under whatever name was typed, and
+# `#.json` is the per-machine last-session state, rewritten every run. Neither
+# was ever meant to be shared, and both showed up as untracked noise in every
+# `git status` on a machine that had been used.
+#
+# Last match wins, so the order is the rule: ignore the JSON, take the built-ins
+# back, then drop the session state again. `#` is escaped because a leading one
+# would otherwise start a comment.
+*.json
+!\#*.json
 \#.json
