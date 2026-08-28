@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -142,6 +143,59 @@ def family(keys: Iterable[str]) -> str:
     return "foreign"
 
 
+class _DeclaredTextEncoder:
+    """Presence marker for a text encoder this script has no weights for.
+
+    ``lora_text_encoders()`` is documented as the model's *only* LoRA-namespace
+    declaration, but every implementation gates its entries on the live module
+    being loaded -- ``StableDiffusion3Model``'s says so outright ("any can be
+    absent, so only the TEs actually present are declared"). That is the right
+    rule for a loader, which needs the module to read its parameter names from,
+    and the wrong one here: :func:`_model_for` builds the model with every field
+    ``None``, so a weightless model declares **no** text encoders and the
+    namespace tables come back short.
+
+    Short in a way that matters. ``lora_original_conversion`` appends the
+    ``bundle_emb`` passthrough *only when the model declares a text encoder*
+    (bundled embeddings live in that namespace), and runs its ``convert`` with
+    ``strict=True``. So a LoRA carrying a bundled TI vector died here with
+    ``No conversion found for key bundle_emb.<placeholder>.qwen`` -- a file the
+    saver had just written, refused by the saver's own table read one field
+    short.
+
+    Offline, presence is the file's to decide, not a loaded model's: a
+    ``bundle_emb.`` key is in the file precisely because a saver with a live
+    encoder put it there. So the gates are opened, the declaration is read
+    whole, and the key set decides which parts of it fire (an overdefined
+    conversion whose source component is absent never does).
+
+    Deliberately not an ``nn.Module``: nothing reads this object today --
+    ``lora_text_encoders`` hands the module straight through and only the name
+    dict is used -- and if some future declaration does read it, an
+    ``AttributeError`` naming the attribute is a better answer than a silently
+    empty text-encoder list.
+    """
+
+    def __repr__(self) -> str:
+        return "<text encoder declared, weights not loaded>"
+
+
+#: Instance attributes that hold a text encoder, by the naming every model uses
+#: (``text_encoder``, ``text_encoder_1`` ...). Anchored, so the neighbours that
+#: merely start the same way -- ``text_encoder_embedding``,
+#: ``text_encoder_train_dtype``, ``text_encoder_offload_conductor`` -- are left
+#: alone.
+_TEXT_ENCODER_ATTR = re.compile(r"text_encoder(_\d+)?$")
+
+
+def _declare_text_encoders(model):
+    """Open ``model``'s text-encoder declaration gates. See :class:`_DeclaredTextEncoder`."""
+    for name in list(vars(model)):
+        if _TEXT_ENCODER_ATTR.fullmatch(name) and getattr(model, name) is None:
+            setattr(model, name, _DeclaredTextEncoder())
+    return model
+
+
 def _model_for(header: dict[str, str], source: Path | str):
     """The model whose namespace tables describe ``source``, built without weights.
 
@@ -149,7 +203,9 @@ def _model_for(header: dict[str, str], source: Path | str):
     ``ot_config`` block a OneTrainer save carries when
     ``include_train_config`` is on (it names the ``model_type`` outright), then
     the sai ``modelspec.architecture``. The model is constructed with every
-    field ``None`` -- the conversion tables are declarations and read nothing.
+    field ``None`` -- the conversion tables are declarations and read no
+    weights -- and then handed to :func:`_declare_text_encoders`, because one of
+    them does read a field: ``lora_text_encoders`` gates on the live module.
     """
     config = header.get("ot_config")
     if config is not None:
@@ -160,7 +216,9 @@ def _model_for(header: dict[str, str], source: Path | str):
         if model_type_name is not None:
             for model_type, module_name, class_name in ARCHITECTURE_MODELS.values():
                 if model_type.name == model_type_name:
-                    return getattr(importlib.import_module(module_name), class_name)(model_type)
+                    return _declare_text_encoders(
+                        getattr(importlib.import_module(module_name), class_name)(model_type)
+                    )
 
     architecture = header.get("modelspec.architecture", "")
     stem = architecture.split("/", 1)[0].strip().lower()
@@ -173,7 +231,7 @@ def _model_for(header: dict[str, str], source: Path | str):
             f"(modelspec.architecture={architecture!r}). Known: {known}."
         )
     model_type, module_name, class_name = entry
-    return getattr(importlib.import_module(module_name), class_name)(model_type)
+    return _declare_text_encoders(getattr(importlib.import_module(module_name), class_name)(model_type))
 
 
 def _comfy_arguments(model) -> tuple[str, list | None, list[str], dict[str, str]]:
@@ -181,8 +239,9 @@ def _comfy_arguments(model) -> tuple[str, list | None, list[str], dict[str, str]
 
     The denoising body is the very list ``_save_comfy`` applied forward; the
     text-encoder prefixes come from ``lora_text_encoders()``, whose live-module
-    half is deliberately not touched (it is ``None`` on a weightless model, and
-    only the names are wanted).
+    half is deliberately not touched -- only the names are wanted. It is a
+    :class:`_DeclaredTextEncoder` here rather than a real encoder, which is what
+    makes the declaration readable at all without weights.
     """
     text_encoders = model.lora_text_encoders()
     return (
