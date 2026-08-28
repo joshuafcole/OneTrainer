@@ -526,7 +526,7 @@ def capture_activations(
     from modules.modelLoader.AnimaModelLoader import AnimaModelLoader
     from modules.modelSampler.AnimaSampler import AnimaSampler
     from modules.util.config.SampleConfig import SampleConfig
-    from modules.util.config.TrainConfig import QuantizationConfig
+    from modules.util.config.TrainConfig import QuantizationConfig, TrainConfig
     from modules.util.enum.DataType import DataType
     from modules.util.enum.ImageFormat import ImageFormat
     from modules.util.enum.ModelType import ModelType
@@ -552,9 +552,25 @@ def capture_activations(
     model.train_dtype = DataType.BFLOAT_16
 
     train_device = torch.device(device)
+    temp_device = torch.device("cpu")
+
+    # The sampler does its own device management through upstream's
+    # materialize/evict API (#1617): each phase materializes the one part it
+    # needs and evicts the rest. Both devices are read off the *model's*
+    # ``train_config``, which ``BaseModel.__init__`` leaves at ``None`` -- so a
+    # sampling-only consumer that never sets one dies on the first phase switch
+    # with ``'NoneType' object has no attribute 'temp_device'``, after having
+    # paid the full base-model load. ``scripts/sample.py`` sets it for exactly
+    # this reason and is the shape copied here; nothing else about a train
+    # config is consulted on this path, because no training is set up.
+    train_config = TrainConfig.default_values()
+    train_config.train_device = str(train_device)
+    train_config.temp_device = str(temp_device)
+    model.train_config = train_config
+
     sampler = AnimaSampler(
         train_device=train_device,
-        temp_device=train_device,
+        temp_device=temp_device,
         model=model,
         model_type=ModelType.ANIMA,
     )

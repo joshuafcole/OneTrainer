@@ -722,3 +722,57 @@ def test_a_script_that_imports_modules_puts_the_repo_root_on_sys_path():
         "these scripts import modules.* but never put the checkout root on sys.path, so "
         f"they raise ModuleNotFoundError when run by path: {offenders}"
     )
+
+
+def test_capture_sets_train_config_before_building_the_sampler():
+    """A sampling-only consumer must set ``model.train_config``, and set it first.
+
+    Upstream's materialize/evict API (#1617) is how the sampler places each
+    model part: every phase materializes the one it needs and evicts the rest.
+    Both devices come off the *model's* ``train_config``, which
+    ``BaseModel.__init__`` leaves at ``None``. Miss it and the sampler's first
+    phase switch raises ``'NoneType' object has no attribute 'temp_device'`` --
+    but only after the base model has finished loading, so the cost of finding
+    out is the whole expensive half of a capture. ``scripts/sample.py`` sets it
+    for the same reason.
+
+    Checked by AST rather than by running the thing: as this module's docstring
+    says, the capture half needs Anima and a box. What is provable here is the
+    order of two statements, which is exactly what was wrong.
+    """
+    import ast as _ast
+    import pathlib as _pathlib
+
+    source = _pathlib.Path(_here, "../scripts/util/block_contribution.py").read_text(
+        encoding="utf-8"
+    )
+    fn = next(
+        n
+        for n in _ast.walk(_ast.parse(source))
+        if isinstance(n, _ast.FunctionDef) and n.name == "capture_activations"
+    )
+
+    assigns = [
+        n.lineno
+        for n in _ast.walk(fn)
+        if isinstance(n, _ast.Assign)
+        for t in n.targets
+        if isinstance(t, _ast.Attribute) and t.attr == "train_config"
+    ]
+    samplers = [
+        n.lineno
+        for n in _ast.walk(fn)
+        if isinstance(n, _ast.Call)
+        and isinstance(n.func, _ast.Name)
+        and n.func.id == "AnimaSampler"
+    ]
+
+    assert assigns, (
+        "capture_activations never assigns model.train_config -- the sampler reads "
+        "its devices from it and BaseModel defaults it to None"
+    )
+    assert samplers, "expected capture_activations to construct an AnimaSampler"
+    assert min(assigns) < min(samplers), (
+        "model.train_config is assigned after the sampler is built; the sampler "
+        "resolves devices through the model, so it must be set first"
+    )
