@@ -98,14 +98,19 @@ have made" (same phrase, same intent, as ``block_gram``'s docstring).
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
-import torch
-from torch import Tensor
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import result_channel  # noqa: E402
+
+# Before torch: the CUDA support libraries it loads write banners to fd 1 from
+# C, and this script's stdout is its result. See ``result_channel``.
+result_channel.claim()
+
+import torch  # noqa: E402
+from torch import Tensor  # noqa: E402
 
 import block_groups  # noqa: E402
 import lora_soup  # noqa: E402
@@ -367,8 +372,7 @@ def main() -> int:
         out = kron_spectrum(specs, args.config, args.granularity)
     except (KronSpectrumError, lora_soup.SoupError, block_groups.BlockGroupError) as e:
         sys.exit(f"block_kron_spectrum: {e}")
-    json.dump(out, sys.stdout, indent=None)
-    sys.stdout.write("\n")
+    result_channel.emit_json(out)
     return 0
 
 
