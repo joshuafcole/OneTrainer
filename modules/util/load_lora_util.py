@@ -64,15 +64,21 @@ def _reject_unsupported_algorithms(state_dict: dict[str, Tensor]) -> None:
             f"LoRA, DoRA, LoHa, LoKr and OFT adapters are supported.")
 
 
+def normalize_key_names(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    # the rename-only half of normalize_various: container -> suffix. Split out so a caller that holds key
+    # *names* and no tensors (the offline analysis scripts, which read a safetensors key set without
+    # materializing it) can apply the passes that move a key without the ones that read or add one.
+    # drop _aux.* bookkeeping tensors first (content-hash-named, appended by some slider tools): not an
+    # adapter param or embedding, nothing downstream can use them, so remove before any conversion sees them.
+    state_dict = {k: v for k, v in state_dict.items() if not k.startswith("_aux.")}
+    return _normalize_suffix(_strip_container(state_dict))
+
+
 def normalize_various(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
     # apply the model-independent dimensions in order: container -> suffix -> dora-name -> alpha.
     # Every step is strict=False: keys that don't match a rule (already-native suffixes, bundle_emb,
     # LyCORIS hada_*/lokr_*/oft_* params) pass through untouched.
-    # drop _aux.* bookkeeping tensors first (content-hash-named, appended by some slider tools): not an
-    # adapter param or embedding, nothing downstream can use them, so remove before any conversion sees them.
-    state_dict = {k: v for k, v in state_dict.items() if not k.startswith("_aux.")}
-    state_dict = _strip_container(state_dict)
-    state_dict = _normalize_suffix(state_dict)
+    state_dict = normalize_key_names(state_dict)
     state_dict = _normalize_dora_name(state_dict)
     _reject_unsupported_algorithms(state_dict)
 
