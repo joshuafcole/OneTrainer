@@ -53,14 +53,19 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from math import prod
 from pathlib import Path
 
-import torch
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import result_channel  # noqa: E402
+
+# Before torch: the CUDA support libraries it loads write banners to fd 1 from
+# C, and this script's stdout is its result. See ``result_channel``.
+result_channel.claim()
+
+import torch  # noqa: E402
 
 import block_groups  # noqa: E402
 import lora_soup  # noqa: E402
@@ -265,8 +270,7 @@ def main() -> int:
         )
     except (SubspaceError, lora_soup.SoupError, block_groups.BlockGroupError) as e:
         sys.exit(f"block_subspace: {e}")
-    json.dump(out, sys.stdout, indent=None)
-    sys.stdout.write("\n")
+    result_channel.emit_json(out)
     return 0
 
 

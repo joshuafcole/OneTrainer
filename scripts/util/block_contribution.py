@@ -77,9 +77,15 @@ import sys
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
-import torch
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import result_channel  # noqa: E402
+
+# Before torch: the CUDA support libraries it loads write banners to fd 1 from
+# C, and this script's stdout is its result. See ``result_channel``.
+result_channel.claim()
+
+import torch  # noqa: E402
 
 import block_groups  # noqa: E402
 import lora_soup  # noqa: E402
@@ -875,7 +881,7 @@ def main() -> int:
             # JSON on stdout here too, so a caller that pre-warms a capture and
             # a caller that scores one read the same channel. Deliberately not
             # a truncated score result: it has no adapters in it.
-            json.dump(
+            result_channel.emit_json(
                 {
                     "cache_key": wanted_key,
                     "path": str(cache),
@@ -883,11 +889,8 @@ def main() -> int:
                     "prompt_labels": list(activations),
                     "layer_count": len(next(iter(activations.values()))),
                     "capture": meta,
-                },
-                sys.stdout,
-                indent=None,
+                }
             )
-            sys.stdout.write("\n")
             return 0
 
         out = score(
@@ -901,8 +904,7 @@ def main() -> int:
         )
     except (ContributionError, lora_soup.SoupError, block_groups.BlockGroupError) as e:
         sys.exit(f"block_contribution: {e}")
-    json.dump(out, sys.stdout, indent=None)
-    sys.stdout.write("\n")
+    result_channel.emit_json(out)
     return 0
 
 
