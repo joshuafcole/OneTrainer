@@ -85,6 +85,15 @@ def lokr_state(prefixes, seed=0, factor=4, dim=2):
     return state
 
 
+def bundled(state, placeholder="pov tongue"):
+    """``state`` plus the bundled TI vector ``AnimaLoRASaver`` writes beside it.
+
+    The placeholder carries a space because the one that broke this in the field
+    did (``bundle_emb.pov tongue.qwen``) -- these keys are named by the user, so
+    a table that split on anything but the first dot would find out here."""
+    return dict(state) | {f"bundle_emb.{placeholder}.qwen": torch.randn(DIM)}
+
+
 def as_comfy(state):
     """``state`` through the COMFY save path, from the saver's own conversion.
 
@@ -97,6 +106,12 @@ def as_comfy(state):
     from modules.util.enum.ModelType import ModelType
 
     model = AnimaModel(model_type=ModelType.ANIMA)
+    # The saver runs against a *loaded* model, and AnimaModel gates its
+    # text-encoder declaration on the encoder being there -- which is where the
+    # bundle_emb passthrough comes from. Set directly rather than through the
+    # gate-opener under test, so this fixture stays an independent statement of
+    # what a real save does.
+    model.text_encoder = object()
     component = model.model_type.denoising_model_part()
     state = convert(state, lora_original_conversion(model, model.lora_diffusers_to_comfy()), strict=True)
     state = convert(state, [(component, "diffusion_model")], strict=False)
@@ -280,6 +295,27 @@ class TestNativizeWritesWhatTheSaverWouldHaveWritten:
         assert set(again) == set(native)
         assert not any(key.startswith("diffusion_model.diffusion_model.") for key in again)
 
+    def test_a_bundled_embedding_rides_along_untouched(self):
+        # The field failure: promoting a LoRA that bundles a TI vector died with
+        # "No conversion found for key bundle_emb.pov tongue.qwen" -- the saver's
+        # own table, read one field short. bundle_emb belongs to no namespace, so
+        # the only correct thing to do with it is nothing.
+        src = bundled(lora_state(canonical_prefixes(), seed=7))
+        mine = lora_namespace.nativize(dict(src), ANIMA_HEADER, "<bundled>")
+        theirs = as_comfy(dict(src))
+        assert set(mine) == set(theirs)
+        assert "bundle_emb.pov tongue.qwen" in mine
+        for key in mine:
+            assert torch.allclose(mine[key], theirs[key], atol=1e-5)
+
+    def test_a_bundled_embedding_survives_the_round_trip(self):
+        src = bundled(lora_state(canonical_prefixes(), seed=8))
+        native = lora_namespace.nativize(dict(src), ANIMA_HEADER, "<bundled>")
+        back = lora_namespace.canonicalize(dict(native), ANIMA_HEADER, "<bundled>")
+        assert set(back) == set(src)
+        for key in src:
+            assert torch.allclose(back[key], src[key], atol=1e-5)
+
     def test_a_header_that_names_no_model_is_refused_by_name(self):
         with pytest.raises(lora_namespace.NamespaceError, match="which model it was trained for"):
             lora_namespace.nativize(
@@ -348,3 +384,19 @@ class TestTheOfflineModelDeclaresWhatItCannotLoad:
         # It travels out through ``lora_text_encoders()`` as the "live module"
         # half of a declaration; anything that prints one should say so.
         assert "not loaded" in repr(lora_namespace._DeclaredTextEncoder())
+
+    def test_anima_declares_its_encoder_once_the_gate_is_open(self):
+        # The declaration AnimaModel gates: no COMFY_LORA name on purpose (nothing
+        # has ever written a Comfy-native Anima TE key), but a DIFFUSERS_LORA one,
+        # which is what the bundle_emb passthrough is keyed off.
+        from modules.util.enum.ModelFormat import ModelFormat
+
+        declared = lora_namespace._model_for(ANIMA_HEADER, "<probe>").lora_text_encoders()
+        assert [names[ModelFormat.DIFFUSERS_LORA] for _module, names in declared] == ["text_encoder"]
+
+    def test_the_conversion_the_saver_builds_carries_the_bundle_passthrough(self):
+        from modules.util.convert_lora_util import lora_original_conversion
+
+        model = lora_namespace._model_for(ANIMA_HEADER, "<probe>")
+        conversion = lora_original_conversion(model, model.lora_diffusers_to_comfy())
+        assert any("bundle_emb" in str(rule) for rule in conversion)
